@@ -3,52 +3,95 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GitHub 雷达 · 示意图（假数据）</title>
+<title>GitHub 雷达 · 示意图 v2（假数据）</title>
 <!--
-  阶段③ S 档示意图：主栈（服务端渲染语义）+ 假数据。
-  用途：确认页面结构、信息密度与卡片字段，非最终视觉稿；UI 细节已授权 AI（共识文档 §9）。
-  附图：文末 mermaid 业务流程图（S 档流程说明以附图形式随件确认，不单独成文）。
+  阶段③ S 档示意图 v2（2026-08-09）：严格按已确认《交互流程说明》v1 绘制。
+  - 五层信息层级：元信息行 → 我的关注 → 锚点导航 → 榜单区 → 项目行
+  - 项目条目：紧凑单行 + 点击就地展开（手风琴，D1/D3 已定）
+  - 单长页 + 锚点 chip 导航（D2 已定）；我的关注置顶（D4 已定）
+  - 演示状态：新关注"——"态、dead 灰显、AI 降级（无推荐语行）、榜单不足 30
+  流程图与分支异常表见 docs/sop/交互流程说明.md（已确认），本文件不再重复。
 -->
 <style>
-  :root { --ink:#1f2328; --sub:#6a737d; --line:#e1e4e8; --bg:#f6f8fa; --card:#fff; --accent:#0969da; }
+  :root { --ink:#1f2328; --sub:#6a737d; --line:#e1e4e8; --bg:#f6f8fa; --card:#fff; --accent:#0969da; --green:#1a7f37; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--ink); line-height: 1.55; }
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 16px 48px; }
-  header.top { background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; }
-  header.top .wrap { display: flex; align-items: center; gap: 20px; padding: 10px 16px; flex-wrap: wrap; }
-  .logo { font-size: 18px; font-weight: 700; }
-  nav.tabs a { color: var(--sub); text-decoration: none; padding: 6px 10px; border-radius: 6px; font-size: 14px; }
+  html { scroll-behavior: smooth; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--ink); line-height: 1.5; font-size: 14px; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px 48px; }
+
+  header.top { background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+  header.top .wrap { display: flex; align-items: center; gap: 18px; padding: 9px 16px; flex-wrap: wrap; }
+  .logo { font-size: 17px; font-weight: 700; }
+  nav.tabs a { color: var(--sub); text-decoration: none; padding: 5px 10px; border-radius: 6px; font-size: 14px; }
   nav.tabs a.active { color: var(--ink); background: var(--bg); font-weight: 600; }
   .week-switch { margin-left: auto; font-size: 13px; color: var(--sub); }
-  .week-switch b { color: var(--ink); }
-  .meta-note { font-size: 12px; color: var(--sub); padding: 8px 0 0; }
-  section { margin-top: 24px; }
-  h2.sec { font-size: 16px; border-left: 4px solid var(--accent); padding-left: 8px; margin-bottom: 12px; }
+  .week-switch a { color: var(--accent); text-decoration: none; }
+  .week-switch b { color: var(--ink); margin: 0 6px; }
+  .week-switch .off { color: #b0b7bd; cursor: not-allowed; }
+
+  .meta { font-size: 12px; color: var(--sub); padding: 10px 2px 0; }
+  section { margin-top: 20px; scroll-margin-top: 64px; }
+  h2.sec { font-size: 15px; border-left: 4px solid var(--accent); padding-left: 8px; margin-bottom: 10px; }
+
+  /* 我的关注 */
   .follow-row { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
-  .follow-card { min-width: 220px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
-  .follow-card .delta { color: #1a7f37; font-weight: 700; }
-  .boards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
-  .board { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
-  .board h3 { font-size: 14px; margin-bottom: 8px; display: flex; justify-content: space-between; }
-  .board h3 .n { color: var(--sub); font-weight: 400; font-size: 12px; }
-  .item { border-top: 1px dashed var(--line); padding: 8px 0; font-size: 13px; }
-  .item .l1 { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-  .item .rank { color: var(--sub); font-size: 12px; }
-  .item .repo { font-weight: 600; color: var(--accent); text-decoration: none; }
-  .badge { font-size: 11px; border: 1px solid var(--line); border-radius: 10px; padding: 0 7px; color: var(--sub); }
-  .stats { margin-left: auto; font-size: 12px; color: var(--sub); white-space: nowrap; }
-  .stats .up { color: #1a7f37; font-weight: 700; }
-  .desc-en { color: var(--sub); font-size: 12px; }
-  .desc-zh { font-size: 13px; }
-  .reason { font-size: 12px; background: #fff8e6; border-radius: 6px; padding: 4px 8px; margin-top: 4px; color: #6b5600; }
-  .tags { margin-top: 4px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  .tag { font-size: 11px; background: #ddf4ff; color: #0550ae; border-radius: 10px; padding: 0 8px; }
-  .follow-btn { font-size: 12px; color: var(--sub); cursor: pointer; margin-left: auto; }
-  footer.note { margin-top: 32px; font-size: 12px; color: var(--sub); border-top: 1px solid var(--line); padding-top: 12px; }
-  .mermaid-wrap { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-top: 12px; overflow-x: auto; }
+  .fcard { min-width: 230px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font-size: 13px; }
+  .fcard .delta { color: var(--green); font-weight: 700; }
+  .fcard.dead { opacity: .55; }
+  .fcard .dead-tag { font-size: 11px; border: 1px solid var(--sub); border-radius: 8px; padding: 0 6px; color: var(--sub); margin-left: 4px; }
+
+  /* 锚点导航 */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .chips .grp { font-size: 12px; color: var(--sub); margin-right: 2px; align-self: center; }
+  .chip { font-size: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 2px 10px; color: var(--accent); text-decoration: none; }
+  .chip:hover { border-color: var(--accent); }
+  .chip i { font-style: normal; color: var(--sub); margin-left: 3px; }
+
+  /* 榜单 */
+  .boards { display: flex; flex-direction: column; gap: 12px; }
+  .board { background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; scroll-margin-top: 64px; }
+  .board > h3 { font-size: 13.5px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: #fbfcfd; display: flex; align-items: baseline; gap: 8px; }
+  .board > h3 .n { color: var(--sub); font-weight: 400; font-size: 12px; }
+  .board > h3 .top { margin-left: auto; font-size: 12px; color: var(--sub); font-weight: 400; }
+
+  /* 紧凑项目行 */
+  .row { display: flex; align-items: center; gap: 10px; padding: 6px 14px; border-top: 1px dashed var(--line); cursor: pointer; }
+  .row:first-of-type { border-top: none; }
+  .row:hover { background: #f6f8fa; }
+  .row .rank { color: var(--sub); font-size: 12px; width: 20px; text-align: right; }
+  .row .repo { font-weight: 600; color: var(--accent); }
+  .badge { font-size: 11px; border: 1px solid var(--line); border-radius: 9px; padding: 0 7px; color: var(--sub); white-space: nowrap; }
+  .row .stats { margin-left: auto; font-size: 12px; color: var(--sub); white-space: nowrap; }
+  .row .stats .up { color: var(--green); font-weight: 700; }
+  .star { font-size: 15px; color: #b0b7bd; width: 22px; text-align: center; }
+  .star.on { color: #e3b341; }
+
+  /* 展开详情面板 */
+  .panel { display: none; border-top: 1px dashed var(--line); background: #fbfcfd; padding: 10px 14px 12px 44px; }
+  .panel.open { display: block; }
+  .panel .desc-en { color: var(--sub); font-size: 12.5px; }
+  .panel .desc-zh { font-size: 13.5px; margin-top: 2px; }
+  .panel .reason { font-size: 12.5px; background: #fff8e6; border-radius: 6px; padding: 5px 9px; margin-top: 6px; color: #6b5600; }
+  .panel .acts { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .panel .gh { font-size: 12.5px; color: var(--accent); text-decoration: none; border: 1px solid var(--line); border-radius: 6px; padding: 2px 10px; background: #fff; }
+  .tag { font-size: 11.5px; background: #ddf4ff; color: #0550ae; border-radius: 10px; padding: 1px 8px; border: none; cursor: default; }
+  .tag b { cursor: pointer; margin-left: 4px; font-weight: 400; opacity: .6; }
+  .tag b:hover { opacity: 1; }
+  .tag-add { font-size: 12px; color: var(--sub); border: 1px dashed var(--line); border-radius: 10px; padding: 1px 9px; background: none; cursor: pointer; }
+  .tag-input { font-size: 12px; border: 1px solid var(--accent); border-radius: 6px; padding: 2px 8px; width: 140px; outline: none; }
+  .row.expanded { background: #f0f6ff; }
+  .row.expanded .repo::after { content: " ▾"; color: var(--sub); }
+  .row .repo::after { content: " ▸"; color: #b0b7bd; font-size: 11px; }
+
+  /* toast */
+  #toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  .toast { background: #24292f; color: #fff; font-size: 13px; border-radius: 8px; padding: 8px 14px; box-shadow: 0 4px 14px rgba(0,0,0,.18); animation: tin .2s ease; }
+  @keyframes tin { from { transform: translateY(8px); opacity: 0; } }
+
+  footer.note { margin-top: 28px; font-size: 12px; color: var(--sub); border-top: 1px solid var(--line); padding-top: 10px; }
 </style>
 </head>
-<body>
+<body id="top">
 <header class="top">
   <div class="wrap">
     <div class="logo">📡 GitHub 雷达</div>
@@ -56,107 +99,229 @@
       <a href="#" class="active">本周报告</a>
       <a href="#">季度回顾</a>
       <a href="#">总星榜</a>
-      <a href="#">标签筛选</a>
+      <a href="#">标签</a>
     </nav>
-    <div class="week-switch">‹ 上一周 · <b>2026-W32</b> · 下一周 ›</div>
+    <div class="week-switch">
+      <a href="#">‹ 上一周</a><b>2026-W32</b><span class="off" title="已是最新一期">下一周 ›</span>
+    </div>
   </div>
 </header>
 
 <div class="wrap">
-  <p class="meta-note">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库</p>
+  <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库 · 增量 = 两端快照差</p>
 
   <section>
     <h2 class="sec">我的关注（3）</h2>
     <div class="follow-row">
-      <div class="follow-card"><b>ollama/ollama</b><br><span class="delta">+1,847</span> 本周 · ★ 152.3k</div>
-      <div class="follow-card"><b>asteroid-shooter/tiny</b><br><span class="delta">——</span> 本周（新关注，下周起有增量） · ★ 386</div>
-      <div class="follow-card"><b>rust-lang/rust</b><br><span class="delta">+312</span> 本周 · ★ 106.1k</div>
+      <div class="fcard"><b>ollama/ollama</b><br><span class="delta">+1,847</span> 本周 · ★ 152.3k</div>
+      <div class="fcard"><b>asteroid-shooter/tiny</b><br><span class="delta">——</span> <span style="color:var(--sub)">下周起有数据</span> · ★ 386</div>
+      <div class="fcard dead"><b>old/dead-repo</b><span class="dead-tag">已失效</span><br><span class="delta">+12</span> 本周 · ★ 4.2k</div>
     </div>
   </section>
 
   <section>
-    <h2 class="sec">语言榜单（Top 30 / 榜，示意图每榜仅示 2 条）</h2>
+    <h2 class="sec">榜单直达</h2>
+    <div class="chips" id="chips"></div>
+  </section>
+
+  <section>
+    <h2 class="sec">语言榜单</h2>
     <div class="boards" id="lang-boards"></div>
   </section>
 
   <section>
-    <h2 class="sec">主题榜单（Top 30 / 榜，示意图每榜仅示 2 条）</h2>
+    <h2 class="sec">主题榜单</h2>
     <div class="boards" id="topic-boards"></div>
   </section>
 
-  <section>
-    <h2 class="sec">附图：业务流程图（mermaid，随示意图一并确认）</h2>
-    <div class="mermaid-wrap">
-<pre class="mermaid">
-flowchart LR
-  A[打开首页<br>通过 Basic Auth] --> B[浏览本周榜单<br>17 分类 × Top 30]
-  B --> C{看到感兴趣的项目}
-  C -->|点关注| D[进入"我的关注"区<br>未入池仓库即时抓基线]
-  C -->|打标签| E[标签存入<br>随时按标签筛选]
-  D --> F[下周周报顶部<br>直接看到当周增量]
-  E --> G[标签筛选页<br>回溯已标项目]
-  B --> H[切换历史周次 / 季度回顾 / 总星榜]
-</pre>
-    </div>
-  </section>
-
   <footer class="note">
-    数据来源：GitHub 官方 API（每日 UTC 00:00 快照） · 增量 = 本周日快照 − 7 天前快照 · 新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成，仅供参考
+    示意图每榜仅渲染 4~5 行（实际 Top 30，不足按实际数）。· 新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成（失败时该行无推荐语块，见"安全"榜末行演示） · 数据：GitHub 官方 API 每日 UTC 00:00 快照
   </footer>
 </div>
 
+<div id="toasts"></div>
+
 <script>
-// ===== 假数据 =====
-const FAKE = {
-  lang: [
-    ["JavaScript", [["microsoft/vscode","+2,431","★ 178.2k"],["facebook/react","+1,102","★ 238.5k"]]],
-    ["TypeScript", [["n8n-io/n8n","+3,905","★ 118.4k"],["cline/cline","+2,567","★ 47.2k"]]],
-    ["Python", [["openai/whisper","+1,203","★ 88.9k"],["langchain-ai/langchain","+987","★ 115.0k"]]],
-    ["Go", [["ollama/ollama","+1,847","★ 152.3k"],["kubernetes/kubernetes","+402","★ 116.8k"]]],
-    ["Rust", [["rust-lang/rust","+312","★ 106.1k"],["zed-industries/zed","+1,455","★ 66.3k"]]],
-    ["Java", [["spring-projects/spring-boot","+289","★ 78.4k"],["elastic/elasticsearch","+198","★ 73.1k"]]],
-    ["其它语言", [["ocornut/imgui","+356","★ 68.2k","C++"],["godotengine/godot","+733","★ 100.5k","C++"]]]
-  ],
-  topic: [
-    ["AI与智能", [["n8n-io/n8n","+3,905","★ 118.4k"],["modelcontextprotocol/servers","+2,012","★ 61.7k"]]],
-    ["前端/UI", [["facebook/react","+1,102","★ 238.5k"],["tailwindlabs/tailwindcss","+445","★ 90.3k"]]],
-    ["后端/云原生", [["kubernetes/kubernetes","+402","★ 116.8k"],["traefik/traefik","+233","★ 56.4k"]]],
-    ["数据库与数据工程", [["duckdb/duckdb","+512","★ 32.6k"],["apache/spark","+156","★ 41.2k"]]],
-    ["DevOps/监控", [["prometheus/prometheus","+244","★ 60.8k"],["grafana/grafana","+301","★ 69.5k"]]],
-    ["开发者工具", [["zed-industries/zed","+1,455","★ 66.3k"],["cli/cli","+388","★ 40.1k"]]],
-    ["安全", [["hashcat/hashcat","+121","★ 23.4k"],["signalapp/Signal-Android","+98","★ 27.9k"]]],
-    ["游戏/图形", [["godotengine/godot","+733","★ 100.5k"],["ocornut/imgui","+356","★ 68.2k"]]],
-    ["自动化/脚本", [["n8n-io/n8n","+3,905","★ 118.4k"],["home-assistant/core","+367","★ 81.2k"]]],
-    ["其他", [["freeCodeCamp/freeCodeCamp","+1,655","★ 428.3k"],["996icu/996.ICU","+55","★ 274.6k"]]]
-  ]
-};
 const DESC = {
-  en: "Workflow automation tool with native AI capabilities, 400+ integrations.",
-  zh: "工作流自动化工具，原生集成 AI 能力，支持 400 多个服务互联。",
-  reason: "推荐理由：本周增星 3.9k 领跑全站，AI Agent 编排场景热度持续走高；低代码自动化是近期值得跟踪的选型方向。"
+  en: "Workflow automation tool with native AI capabilities, 400+ integrations, fair-code license.",
+  zh: "工作流自动化工具，原生集成 AI 能力，支持 400 多个服务互联，fair-code 许可。"
 };
-// ===== 渲染 =====
-function card(rank, [repo, delta, stars, lang]) {
-  return `<div class="item">
-    <div class="l1">
-      <span class="rank">${rank}</span>
-      <a class="repo" href="#">${repo}</a>
-      <span class="badge">${lang || "Python"}</span>
-      <span class="stats"><span class="up">${delta}</span> 本周 · ${stars}</span>
-    </div>
-    <div class="desc-en">${DESC.en}</div>
+const REASON = "推荐理由：本周增星领跑分类，AI Agent 编排场景热度持续走高；低代码自动化是近期值得跟踪的选型方向。";
+// item: [repo, 语言徽标, 本周增量, 总星, {f:已关注, nr:无推荐语, tags:[...]}]
+const B = [
+ {id:"l1", sec:"lang", name:"JavaScript", n:30, items:[
+   ["microsoft/vscode","JavaScript","+2,431","★ 178.2k",{}],
+   ["facebook/react","JavaScript","+1,102","★ 238.5k",{tags:["选型观察"]}],
+   ["nodejs/node","JavaScript","+486","★ 109.3k",{}],
+   ["vercel/next.js","JavaScript","+455","★ 134.7k",{}]]},
+ {id:"l2", sec:"lang", name:"TypeScript", n:30, items:[
+   ["n8n-io/n8n","TypeScript","+3,905","★ 118.4k",{tags:["选型观察","AI"]}],
+   ["cline/cline","TypeScript","+2,567","★ 47.2k",{}],
+   ["sveltejs/svelte","TypeScript","+388","★ 84.1k",{}],
+   ["denoland/deno","TypeScript","+301","★ 104.6k",{}]]},
+ {id:"l3", sec:"lang", name:"Python", n:30, items:[
+   ["openai/whisper","Python","+1,203","★ 88.9k",{}],
+   ["langchain-ai/langchain","Python","+987","★ 115.0k",{tags:["AI"]}],
+   ["pytorch/pytorch","Python","+542","★ 92.4k",{}],
+   ["fastapi/fastapi","Python","+356","★ 89.2k",{}]]},
+ {id:"l4", sec:"lang", name:"Go", n:30, items:[
+   ["ollama/ollama","Go","+1,847","★ 152.3k",{f:1,tags:["AI"]}],
+   ["kubernetes/kubernetes","Go","+402","★ 116.8k",{}],
+   ["golang/go","Go","+355","★ 130.2k",{}],
+   ["gin-gonic/gin","Go","+188","★ 84.5k",{}]]},
+ {id:"l5", sec:"lang", name:"Rust", n:30, items:[
+   ["zed-industries/zed","Rust","+1,455","★ 66.3k",{}],
+   ["rust-lang/rust","Rust","+312","★ 106.1k",{}],
+   ["sharkdp/bat","Rust","+176","★ 54.0k",{}],
+   ["BurntSushi/ripgrep","Rust","+154","★ 53.1k",{}]]},
+ {id:"l6", sec:"lang", name:"Java", n:24, items:[
+   ["spring-projects/spring-boot","Java","+289","★ 78.4k",{}],
+   ["elastic/elasticsearch","Java","+198","★ 73.1k",{}],
+   ["apache/kafka","Java","+122","★ 30.0k",{}],
+   ["netty/netty","Java","+45","★ 34.2k",{}]]},
+ {id:"l7", sec:"lang", name:"其它语言", n:30, items:[
+   ["godotengine/godot","C++","+733","★ 100.5k",{}],
+   ["ocornut/imgui","C++","+356","★ 68.2k",{}],
+   ["ziglang/zig","Zig","+201","★ 41.3k",{}],
+   ["rails/rails","Ruby","+88","★ 57.6k",{}]]},
+ {id:"t1", sec:"topic", name:"AI与智能", n:30, items:[
+   ["n8n-io/n8n","TypeScript","+3,905","★ 118.4k",{tags:["选型观察","AI"]}],
+   ["modelcontextprotocol/servers","TypeScript","+2,012","★ 61.7k",{tags:["AI"]}],
+   ["ollama/ollama","Go","+1,847","★ 152.3k",{f:1,tags:["AI"]}],
+   ["openai/whisper","Python","+1,203","★ 88.9k",{}]]},
+ {id:"t2", sec:"topic", name:"前端/UI", n:30, items:[
+   ["facebook/react","JavaScript","+1,102","★ 238.5k",{tags:["选型观察"]}],
+   ["vercel/next.js","JavaScript","+455","★ 134.7k",{}],
+   ["tailwindlabs/tailwindcss","CSS","+445","★ 90.3k",{}],
+   ["sveltejs/svelte","TypeScript","+388","★ 84.1k",{}]]},
+ {id:"t3", sec:"topic", name:"后端/云原生", n:30, items:[
+   ["kubernetes/kubernetes","Go","+402","★ 116.8k",{}],
+   ["traefik/traefik","Go","+233","★ 56.4k",{}],
+   ["spring-projects/spring-boot","Java","+289","★ 78.4k",{}],
+   ["grpc/grpc","C++","+98","★ 44.0k",{}]]},
+ {id:"t4", sec:"topic", name:"数据库与数据工程", n:30, items:[
+   ["duckdb/duckdb","C++","+512","★ 32.6k",{}],
+   ["redis/redis","C","+176","★ 70.8k",{}],
+   ["apache/spark","Scala","+156","★ 41.2k",{}],
+   ["elastic/elasticsearch","Java","+198","★ 73.1k",{}]]},
+ {id:"t5", sec:"topic", name:"DevOps/监控", n:30, items:[
+   ["grafana/grafana","TypeScript","+301","★ 69.5k",{}],
+   ["prometheus/prometheus","Go","+244","★ 60.8k",{}],
+   ["ansible/ansible","Python","+132","★ 66.0k",{}],
+   ["hashicorp/terraform","Go","+121","★ 46.5k",{}]]},
+ {id:"t6", sec:"topic", name:"开发者工具", n:30, items:[
+   ["zed-industries/zed","Rust","+1,455","★ 66.3k",{}],
+   ["cli/cli","Go","+388","★ 40.1k",{}],
+   ["astral-sh/ruff","Rust","+290","★ 41.7k",{}],
+   ["sharkdp/bat","Rust","+176","★ 54.0k",{}]]},
+ {id:"t7", sec:"topic", name:"安全", n:18, items:[
+   ["hashcat/hashcat","C","+121","★ 23.4k",{}],
+   ["signalapp/Signal-Android","Java","+98","★ 27.9k",{}],
+   ["keepassxreboot/keepassxc","C++","+66","★ 24.5k",{}],
+   ["ossf/scorecard","Go","+41","★ 5.1k",{nr:1}]]},
+ {id:"t8", sec:"topic", name:"游戏/图形", n:30, items:[
+   ["godotengine/godot","C++","+733","★ 100.5k",{}],
+   ["ocornut/imgui","C++","+356","★ 68.2k",{}],
+   ["bevyengine/bevy","Rust","+288","★ 41.9k",{}],
+   ["mrdoob/three.js","JavaScript","+187","★ 108.4k",{}]]},
+ {id:"t9", sec:"topic", name:"自动化/脚本", n:30, items:[
+   ["n8n-io/n8n","TypeScript","+3,905","★ 118.4k",{tags:["选型观察","AI"]}],
+   ["home-assistant/core","Python","+367","★ 81.2k",{}],
+   ["microsoft/playwright","TypeScript","+245","★ 77.3k",{}],
+   ["SeleniumHQ/selenium","Java","+66","★ 32.8k",{}]]},
+ {id:"t10", sec:"topic", name:"其他", n:30, items:[
+   ["freeCodeCamp/freeCodeCamp","TypeScript","+1,655","★ 428.3k",{}],
+   ["public-apis/public-apis","Python","+498","★ 322.1k",{}],
+   ["EbookFoundation/free-programming-books","","+433","★ 368.9k",{}],
+   ["kamranahmedse/developer-roadmap","TypeScript","+402","★ 336.4k",{}]]}
+];
+
+function esc(s){return s.replace(/"/g,"&quot;");}
+function panelHTML(it){
+  const [repo,,,,opt] = it;
+  return `<div class="desc-en">${DESC.en}</div>
     <div class="desc-zh">${DESC.zh}</div>
-    <div class="reason">${DESC.reason}</div>
-    <div class="tags"><span class="tag">选型观察</span><span class="tag">AI</span><span class="follow-btn">☆ 关注 ＋标签</span></div>
-  </div>`;
+    ${opt.nr ? "" : `<div class="reason">${REASON}</div>`}
+    <div class="acts">
+      <a class="gh" href="#" onclick="return false">在 GitHub 打开 ↗</a>
+      ${(opt.tags||[]).map(t=>`<span class="tag">${esc(t)}<b title="删除标签">×</b></span>`).join("")}
+      <button class="tag-add">＋ 标签</button>
+    </div>`;
 }
-function board(name, items) {
-  return `<div class="board"><h3>${name}<span class="n">Top 30</span></h3>${items.map((it,i)=>card(i+1,it)).join("")}</div>`;
+function render(){
+  for(const sec of ["lang","topic"]){
+    const host = document.getElementById(sec+"-boards");
+    host.innerHTML = B.filter(b=>b.sec===sec).map(b=>`
+      <div class="board" id="${b.id}">
+        <h3>${b.name}<span class="n">Top ${b.n}</span><a class="top" href="#top">回顶部 ↑</a></h3>
+        ${b.items.map((it,i)=>`
+          <div class="row" data-b="${b.id}" data-i="${i}">
+            <span class="rank">${i+1}</span>
+            <span class="repo">${it[0]}</span>
+            ${it[1] ? `<span class="badge">${it[1]}</span>` : ""}
+            <span class="stats"><span class="up">${it[2]}</span> 本周 · ${it[3]}</span>
+            <span class="star ${it[4].f?"on":""}" title="${it[4].f?"取消关注":"关注"}">${it[4].f?"★":"☆"}</span>
+          </div>
+          <div class="panel" data-b="${b.id}" data-i="${i}">${panelHTML(it)}</div>`).join("")}
+      </div>`).join("");
+  }
+  document.getElementById("chips").innerHTML =
+    `<span class="grp">语言</span>` + B.filter(b=>b.sec==="lang").map(b=>`<a class="chip" href="#${b.id}">${b.name}<i>${b.n}</i></a>`).join("") +
+    `<span class="grp" style="margin-left:10px">主题</span>` + B.filter(b=>b.sec==="topic").map(b=>`<a class="chip" href="#${b.id}">${b.name}<i>${b.n}</i></a>`).join("");
 }
-document.getElementById("lang-boards").innerHTML = FAKE.lang.map(([n,it])=>board(n,it)).join("");
-document.getElementById("topic-boards").innerHTML = FAKE.topic.map(([n,it])=>board(n,it)).join("");
+function toast(msg){
+  const t = document.createElement("div");
+  t.className = "toast"; t.textContent = msg;
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(()=>t.remove(), 4000);
+}
+render();
+
+document.addEventListener("click", e => {
+  // 关注星标
+  const star = e.target.closest(".star");
+  if(star){
+    e.stopPropagation();
+    const on = star.classList.toggle("on");
+    star.textContent = on ? "★" : "☆";
+    star.title = on ? "取消关注" : "关注";
+    toast(on ? "已关注（未入池仓库将即时抓基线，下周起有增量）" : "已取消关注（跟踪保留）");
+    return;
+  }
+  // 手风琴展开
+  const row = e.target.closest(".row");
+  if(row){
+    const key = row.dataset.b + "-" + row.dataset.i;
+    const wasOpen = row.classList.contains("expanded");
+    document.querySelectorAll(".row.expanded").forEach(r=>r.classList.remove("expanded"));
+    document.querySelectorAll(".panel.open").forEach(p=>p.classList.remove("open"));
+    if(!wasOpen){
+      row.classList.add("expanded");
+      document.querySelector(`.panel[data-b="${row.dataset.b}"][data-i="${row.dataset.i}"]`).classList.add("open");
+    }
+    return;
+  }
+  // 删除标签
+  const x = e.target.closest(".tag b");
+  if(x){ x.parentElement.remove(); toast("已删除标签"); return; }
+  // 添加标签
+  const add = e.target.closest(".tag-add");
+  if(add){
+    const input = document.createElement("input");
+    input.className = "tag-input"; input.maxLength = 20; input.placeholder = "1~20 字符，回车确认";
+    add.replaceWith(input); input.focus();
+    input.addEventListener("keydown", ev => {
+      if(ev.key === "Enter" && input.value.trim()){
+        const chip = document.createElement("span");
+        chip.className = "tag";
+        chip.innerHTML = esc(input.value.trim()) + `<b title="删除标签">×</b>`;
+        input.replaceWith(chip); toast("已添加标签");
+      }
+      if(ev.key === "Escape"){ input.replaceWith(add); }
+    });
+    input.addEventListener("blur", () => { if(input.isConnected) input.replaceWith(add); });
+  }
+});
 </script>
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-<script>if (window.mermaid) mermaid.initialize({ startOnLoad: true, theme: "neutral" });</script>
 </body>
 </html>
