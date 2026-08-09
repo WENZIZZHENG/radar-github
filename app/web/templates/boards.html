@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block switcher %}
+{% if switcher %}
+{# 期次分段控件：示意图顶栏右侧形态；禁用态给 tooltip 原因（最早/最新一期） #}
+<div class="week-switch">
+  {% if switcher.prev_url %}<a href="{{ switcher.prev_url }}">{{ switcher.prev_text }}</a>{% else %}<span class="off" title="已是最早一期">{{ switcher.prev_text }}</span>{% endif %}
+  <b>{{ switcher.current }}</b>
+  {% if switcher.next_url %}<a href="{{ switcher.next_url }}">{{ switcher.next_text }}</a>{% else %}<span class="off" title="已是最新一期">{{ switcher.next_text }}</span>{% endif %}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+{# 第 1 层：元信息行 #}
+<p class="meta">{% if meta.window %}窗口：{{ meta.window }} · {% else %}截至 {{ meta.as_of }} · {% endif %}生成于 {{ meta.generated }}（UTC+8） · 跟踪池 {{ meta.tracked }} 个仓库 · {{ meta.method }}</p>
+
+{# 首期/缺席降级提示条（流程说明 §4）：增量榜全缺席时显示总星榜 + 明确提示 #}
+{% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+
+{# 第 2 层：我的关注（仅周报页；follows=None 时整层不渲染） #}
+{% if follows is not none %}
+<section>
+  <h2 class="sec">我的关注（{{ follows | length }}）</h2>
+  {% if follows %}
+  <div class="follow-row">
+    {% for f in follows %}
+    <div class="fcard{% if f.dead %} dead{% endif %}">
+      <span class="f-repo">{{ f.full_name }}{% if f.dead %}<span class="dead-tag">已失效</span>{% endif %}</span>
+      <span class="f-stats">
+        {%- if f.dead -%}
+        <span class="f-delta na">——</span><span class="f-note">已停止采集</span>
+        {%- elif f.delta_text -%}
+        <span class="f-delta">{{ f.delta_text }}</span><span class="f-note">本周</span>
+        {%- else -%}
+        <span class="f-delta na">——</span><span class="f-note">下周起有数据</span>
+        {%- endif -%}
+        <span class="f-total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{{ f.stars_text or "——" }}</span>
+      </span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty-follows">暂无关注：点榜单行右侧 ☆ 关注后，该项目每周增量会置顶显示在这里（关注功能下期上线）。</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{# 第 3 层：锚点导航 chips（榜内数量徽标） #}
+<section>
+  <h2 class="sec">榜单直达</h2>
+  <div class="chips">
+    <span class="grp">语言</span>
+    {%- for b in lang_boards %}<a class="chip" href="#{{ b.anchor }}">{{ b.label }}<i>{{ b.rows | length }}</i></a>{% endfor -%}
+    <span class="grp" style="margin-left:10px">主题</span>
+    {%- for b in topic_boards %}<a class="chip" href="#{{ b.anchor }}">{{ b.label }}<i>{{ b.rows | length }}</i></a>{% endfor -%}
+  </div>
+</section>
+
+{# 第 4/5 层：榜单区（17 榜直出，顺序 = compute_boards 返回顺序；空榜也渲染板块） #}
+<section>
+  <h2 class="sec">语言榜单</h2>
+  <div class="boards">
+    {% for b in lang_boards %}{% include "_board.html" %}{% endfor %}
+  </div>
+</section>
+
+<section>
+  <h2 class="sec">主题榜单</h2>
+  <div class="boards">
+    {% for b in topic_boards %}{% include "_board.html" %}{% endfor %}
+  </div>
+</section>
+{% endblock %}

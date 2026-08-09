@@ -3,11 +3,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.db import init_db
 from app.jobs import create_scheduler, start_scheduler, stop_scheduler
+from app.web.routes import STATIC_DIR
+from app.web.routes import router as web_router
 
 
 def jobs_enabled() -> bool:
@@ -30,15 +32,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="GitHub 雷达", lifespan=lifespan)
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    """首页占位：证明服务可达；T-008 榜单页面落地后替换本页。"""
-    return (
-        "<!doctype html><html lang='zh'><head><meta charset='utf-8'>"
-        "<title>GitHub 雷达</title></head><body>"
-        "<h1>GitHub 雷达运行中</h1>"
-        "<p>榜单功能开发中（T-008 后替换本页）。</p>"
-        "</body></html>"
-    )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# T-008 榜单页面路由：/ 本周报告（含 ?week= 历史周次）、/quarter 季度回顾、/total 总星榜
+app.include_router(web_router)
