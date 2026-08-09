@@ -3,16 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GitHub 雷达 · 示意图 v3（假数据）</title>
+<title>GitHub 雷达 · 示意图 v4（假数据）</title>
 <!--
-  阶段③ S 档示意图 v3（2026-08-09）：视觉重设计（ui-ux-pro-max）；交互流程以《交互流程说明》v1 为准。
-  - 设计系统（skill search.py --design-system --density 8 生成）：Dark Mode (OLED) / Developer Tool 配色
-    （bg #0F172A、card #1B2336、accent #22C55E "run green"）+ Fira Sans（界面）/ Fira Code（数据与标识符）
-  - 与 v2 相比只改视觉层：配色 / 字体 / 间距 / 圆角 / 边框 / 阴影 / 组件样式 / 视觉层次 / 状态反馈；
-    功能、假数据、交互行为（手风琴、关注、打标、toast、锚点导航、周次切换）零改动
-  - 五层信息层级：元信息行 → 我的关注 → 锚点导航 → 榜单区 → 项目行（紧凑单行 + 详情默认展开可独立折叠，D1/D3 v1.1 已定）
-  - 演示状态：新关注"——"态、dead 灰显、AI 降级（无推荐语行）、榜单不足 30
-  流程图与分支异常表见 docs/sop/交互流程说明.md（已确认 v1），本文件不再重复。
+  阶段③ S 档示意图 v4（2026-08-09，【待确认】）：按《交互流程说明》v1.3 变更——D4 翻案。
+  - 相对 v3 的变化（功能层，视觉体系不动）：
+    ① 顶栏导航 4 项 → 5 项：新增"我的关注"入口（带计数徽标，点击切换 P6 视图）；
+    ② P1 移除顶部"我的关注"横向卡片区（五层 → 四层）；
+    ③ 新增 P6 我的关注页：按语言分组（7 组，空组不渲染）的项目行列表，组内按当周增量降序，
+       行形态与榜单行一致（紧凑行＋详情默认展开＋★可取消，取消后该行即时移除＋计数 -1）；
+    ④ 演示状态：新关注"—— 下周起有数据"沉组尾、dead 灰显"已失效"沉组尾、导航计数徽标联动。
+  - v3 基底：Dark Mode (OLED) / Developer Tool 配色 + Fira Sans / Fira Code（ui-ux-pro-max 设计系统）。
+  流程图与分支异常表见 docs/sop/交互流程说明.md（v1.3 已确认），本文件不再重复。
 -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -122,30 +123,25 @@
   }
   h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 
-  /* ===== 第 2 层：我的关注（横向卡片条，可横滚） ===== */
-  .follow-row { display: flex; gap: var(--s3); overflow-x: auto; padding-bottom: var(--s2); scrollbar-width: thin; }
-  .follow-row::-webkit-scrollbar { height: 8px; }
-  .follow-row::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 4px; }
-  .fcard {
-    min-width: 244px; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-l);
-    padding: var(--s3) 14px; transition: border-color var(--t-fast) ease;
+  /* ===== 顶栏"我的关注"计数徽标（v4；复用 chip 徽标的 muted pill 语义） ===== */
+  nav.tabs a i {
+    font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
+    background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px; margin-left: 6px;
   }
-  .fcard:hover { border-color: var(--line-strong); }
-  .fcard .f-repo {
-    display: block; font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; color: var(--text-1);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .fcard .f-stats { display: flex; align-items: baseline; gap: 7px; margin-top: 5px; }
-  .fcard .f-delta { font-family: var(--font-mono); font-size: 17px; font-weight: 700; color: var(--accent-hi); }
-  .fcard .f-delta.na { font-size: 13px; color: var(--text-3); font-weight: 500; }
-  .fcard .f-note { font-size: 11px; color: var(--text-3); }
-  .fcard .f-total { margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--text-3); display: inline-flex; align-items: center; gap: 4px; }
-  .fcard .f-total svg { opacity: .75; }
-  .fcard.dead { opacity: .55; border-style: dashed; }
-  .fcard .dead-tag {
+  nav.tabs a.active i { color: var(--text-2); }
+
+  /* ===== P6 我的关注页（v4）：分组行列表——行态修饰 ===== */
+  /* dead 仓库：整行灰显＋虚线上边，"已失效"标（沉组尾，v1.3 §2A） */
+  .row.dead { opacity: .55; }
+  .row.dead .repo { color: var(--text-3); }
+  .dead-tag {
     font-size: 10.5px; border: 1px solid var(--line-strong); border-radius: var(--r-pill);
-    padding: 0 7px; color: var(--text-3); margin-left: 6px; vertical-align: 1px;
+    padding: 0 7px; color: var(--text-3); margin-left: 6px; vertical-align: 1px; white-space: nowrap;
   }
+  /* 无增量（新入池首周）：up 列退化为灰字说明（沉组尾，v1.3 §2A） */
+  .row .up.na { font-size: 11px; color: var(--text-3); font-weight: 500; }
+  /* 视图切换（示意图演示 P1/P6 两个页面） */
+  [hidden] { display: none !important; }
 
   /* ===== 第 3 层：锚点导航 chip（带榜内数量徽标） ===== */
   .chips { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
@@ -299,7 +295,6 @@
     .panel { padding: 10px var(--s3) var(--s3) 28px; }
     .chip { min-height: 36px; }
     nav.tabs a { min-height: 40px; }
-    .fcard { min-width: 220px; }
   }
 
   /* 减弱动效偏好：关闭全部过渡/动画与平滑滚动 */
@@ -323,37 +318,20 @@
       GitHub 雷达
     </h1>
     <nav class="tabs" aria-label="主导航">
-      <a href="#" class="active" aria-current="page">本周报告</a>
+      <a href="#" class="active" aria-current="page" data-view="view-home">本周报告</a>
+      <a href="#" data-view="view-follows">我的关注<i id="follow-count">6</i></a>
       <a href="#">季度回顾</a>
       <a href="#">总星榜</a>
       <a href="#">标签</a>
     </nav>
-    <div class="week-switch">
+    <div class="week-switch" id="week-switch">
       <a href="#">‹ 上一周</a><b>2026-W32</b><span class="off" title="已是最新一期">下一周 ›</span>
     </div>
   </div>
 </header>
 
-<div class="wrap">
+<div class="wrap" id="view-home">
   <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库 · 增量 = 两端快照差</p>
-
-  <section>
-    <h2 class="sec">我的关注（3）</h2>
-    <div class="follow-row">
-      <div class="fcard">
-        <span class="f-repo">ollama/ollama</span>
-        <span class="f-stats"><span class="f-delta">+1,847</span><span class="f-note">本周</span><span class="f-total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>152.3k</span></span>
-      </div>
-      <div class="fcard">
-        <span class="f-repo">asteroid-shooter/tiny</span>
-        <span class="f-stats"><span class="f-delta na">——</span><span class="f-note">下周起有数据</span><span class="f-total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>386</span></span>
-      </div>
-      <div class="fcard dead">
-        <span class="f-repo">old/dead-repo<span class="dead-tag">已失效</span></span>
-        <span class="f-stats"><span class="f-delta">+12</span><span class="f-note">本周</span><span class="f-total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>4.2k</span></span>
-      </div>
-    </div>
-  </section>
 
   <section>
     <h2 class="sec">榜单直达</h2>
@@ -371,7 +349,21 @@
   </section>
 
   <footer class="note">
-    示意图每榜仅渲染 4~5 行（实际 Top 30，不足按实际数）。· 新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成（失败时该行无推荐语块，见"安全"榜末行演示） · 数据：GitHub 官方 API 每日 UTC 00:00 快照
+    示意图每榜仅渲染 4~5 行（实际 Top 30，不足按实际数）· v4：顶部关注区已移出为独立页 P6（顶栏"我的关注"切换查看） · 新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成（失败时该行无推荐语块，见"安全"榜末行演示） · 数据：GitHub 官方 API 每日 UTC 00:00 快照
+  </footer>
+</div>
+
+<!-- ===== P6 我的关注页（v4 新增；顶栏"我的关注"与"本周报告"互斥切换演示） ===== -->
+<div class="wrap" id="view-follows" hidden>
+  <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天，与当期周报同口径） · 关注 <b class="mono">6</b> 个仓库 · 按语言分组 · 组内按当周增量降序</p>
+
+  <section>
+    <h2 class="sec">我的关注</h2>
+    <div class="boards" id="follow-boards"></div>
+  </section>
+
+  <footer class="note">
+    行形态与榜单行一致（紧凑行＋详情默认展开＋标签区）：单击折叠/展开；行内 ★ 点击即取消关注——该行即时移除、计数徽标 -1（跟踪保留，不踢出池） · 新入池首周"—— 下周起有数据"与"已失效"均沉组尾 · 空组不渲染
   </footer>
 </div>
 
@@ -401,16 +393,16 @@ const ARROW_UP = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" st
 const B = [
  {id:"l1", sec:"lang", name:"JavaScript", n:30, items:[
    ["microsoft/vscode","JavaScript","+2,431","178.2k",{}],
-   ["facebook/react","JavaScript","+1,102","238.5k",{tags:["选型观察"]}],
+   ["facebook/react","JavaScript","+1,102","238.5k",{f:1,tags:["选型观察"]}],
    ["nodejs/node","JavaScript","+486","109.3k",{}],
    ["vercel/next.js","JavaScript","+455","134.7k",{}]]},
  {id:"l2", sec:"lang", name:"TypeScript", n:30, items:[
-   ["n8n-io/n8n","TypeScript","+3,905","118.4k",{tags:["选型观察","AI"]}],
+   ["n8n-io/n8n","TypeScript","+3,905","118.4k",{f:1,tags:["选型观察","AI"]}],
    ["cline/cline","TypeScript","+2,567","47.2k",{}],
    ["sveltejs/svelte","TypeScript","+388","84.1k",{}],
    ["denoland/deno","TypeScript","+301","104.6k",{}]]},
  {id:"l3", sec:"lang", name:"Python", n:30, items:[
-   ["openai/whisper","Python","+1,203","88.9k",{}],
+   ["openai/whisper","Python","+1,203","88.9k",{f:1}],
    ["langchain-ai/langchain","Python","+987","115.0k",{tags:["AI"]}],
    ["pytorch/pytorch","Python","+542","92.4k",{}],
    ["fastapi/fastapi","Python","+356","89.2k",{}]]},
@@ -435,12 +427,12 @@ const B = [
    ["ziglang/zig","Zig","+201","41.3k",{}],
    ["rails/rails","Ruby","+88","57.6k",{}]]},
  {id:"t1", sec:"topic", name:"AI与智能", n:30, items:[
-   ["n8n-io/n8n","TypeScript","+3,905","118.4k",{tags:["选型观察","AI"]}],
+   ["n8n-io/n8n","TypeScript","+3,905","118.4k",{f:1,tags:["选型观察","AI"]}],
    ["modelcontextprotocol/servers","TypeScript","+2,012","61.7k",{tags:["AI"]}],
    ["ollama/ollama","Go","+1,847","152.3k",{f:1,tags:["AI"]}],
-   ["openai/whisper","Python","+1,203","88.9k",{}]]},
+   ["openai/whisper","Python","+1,203","88.9k",{f:1}]]},
  {id:"t2", sec:"topic", name:"前端/UI", n:30, items:[
-   ["facebook/react","JavaScript","+1,102","238.5k",{tags:["选型观察"]}],
+   ["facebook/react","JavaScript","+1,102","238.5k",{f:1,tags:["选型观察"]}],
    ["vercel/next.js","JavaScript","+455","134.7k",{}],
    ["tailwindlabs/tailwindcss","CSS","+445","90.3k",{}],
    ["sveltejs/svelte","TypeScript","+388","84.1k",{}]]},
@@ -475,7 +467,7 @@ const B = [
    ["bevyengine/bevy","Rust","+288","41.9k",{}],
    ["mrdoob/three.js","JavaScript","+187","108.4k",{}]]},
  {id:"t9", sec:"topic", name:"自动化/脚本", n:30, items:[
-   ["n8n-io/n8n","TypeScript","+3,905","118.4k",{tags:["选型观察","AI"]}],
+   ["n8n-io/n8n","TypeScript","+3,905","118.4k",{f:1,tags:["选型观察","AI"]}],
    ["home-assistant/core","Python","+367","81.2k",{}],
    ["microsoft/playwright","TypeScript","+245","77.3k",{}],
    ["SeleniumHQ/selenium","Java","+66","32.8k",{}]]},
@@ -526,7 +518,49 @@ function toast(msg){
   document.getElementById("toasts").appendChild(t);
   setTimeout(()=>t.remove(), 4000);
 }
+// ===== P6 我的关注页（v4）：假数据按语言分组，组内当周增量降序，"——"/dead 沉组尾 =====
+const F = [
+  {name:"TypeScript", items:[
+    {repo:"n8n-io/n8n", lang:"TypeScript", up:"+3,905", total:"118.4k", tags:["选型观察","AI"]},
+    {repo:"asteroid-shooter/tiny", lang:"TypeScript", na:1, total:"386", tags:[]}]},
+  {name:"Go", items:[
+    {repo:"ollama/ollama", lang:"Go", up:"+1,847", total:"152.3k", tags:["AI"]},
+    {repo:"old/dead-repo", lang:"Go", na:1, dead:1, total:"4.2k", tags:[]}]},
+  {name:"Python", items:[
+    {repo:"openai/whisper", lang:"Python", up:"+1,203", total:"88.9k", tags:[]}]},
+  {name:"JavaScript", items:[
+    {repo:"facebook/react", lang:"JavaScript", up:"+1,102", total:"238.5k", tags:["选型观察"]}]}
+];
+function renderFollows(){
+  document.getElementById("follow-boards").innerHTML = F.map((g,gi)=>`
+    <div class="board">
+      <h3>${g.name}<span class="n">${g.items.length} 个关注</span></h3>
+      ${g.items.map((it,i)=>`
+        <div class="row expanded ${it.dead?"dead":""}" data-b="f${gi}" data-i="${i}" tabindex="0" role="button" aria-expanded="true">
+          <span class="rank">${i+1}</span>
+          <span class="repo-wrap"><span class="repo" title="${it.repo}">${it.repo}</span>${it.dead?'<span class="dead-tag">已失效</span>':""}${CHEV}</span>
+          ${it.lang?`<span class="badge"><span class="dot" style="background:${LC[it.lang]||"#8b98a9"}"></span>${it.lang}</span>`:""}
+          <span class="up ${(it.na||it.dead)?"na":""}">${it.dead?"——":it.na?"—— 下周起有数据":it.up}</span>
+          <span class="total">${STAR_S}${it.total}</span>
+          <button class="star on" aria-label="取消关注" title="取消关注">${STAR_F}</button>
+        </div>
+        <div class="panel open" data-b="f${gi}" data-i="${i}">${panelHTML(["","","","",{tags:it.tags}])}</div>`).join("")}
+    </div>`).join("");
+}
+// P1/P6 视图互斥切换（示意图演示用；周次切换控件仅 P1 有，P6 无期次概念）
+const VIEWS = ["view-home","view-follows"];
+function switchView(id){
+  for(const v of VIEWS) document.getElementById(v).hidden = (v!==id);
+  document.getElementById("week-switch").hidden = (id!=="view-home");
+  document.querySelectorAll("nav.tabs a[data-view]").forEach(a=>{
+    const on = a.dataset.view===id;
+    a.classList.toggle("active", on);
+    if(on) a.setAttribute("aria-current","page"); else a.removeAttribute("aria-current");
+  });
+  window.scrollTo(0,0);
+}
 render();
+renderFollows();
 
 function toggleRow(row){
   // 默认全部展开（D1/D3 v1.1）：单击只折叠/再展开本行，各行独立，不再手风琴互斥
@@ -537,6 +571,9 @@ function toggleRow(row){
 }
 
 document.addEventListener("click", e => {
+  // 顶栏"本周报告 / 我的关注"视图切换（v4 演示）
+  const navA = e.target.closest("nav.tabs a[data-view]");
+  if(navA){ e.preventDefault(); switchView(navA.dataset.view); return; }
   // 关注星标
   const star = e.target.closest(".star");
   if(star){
@@ -545,6 +582,16 @@ document.addEventListener("click", e => {
     star.innerHTML = on ? STAR_F : STAR_O;
     star.title = on ? "取消关注" : "关注";
     star.setAttribute("aria-label", star.title);
+    // 顶栏计数徽标局部联动（v1.3 §3.2：+1/-1，无需刷新）
+    const c = document.getElementById("follow-count");
+    c.textContent = String(Math.max(0, (parseInt(c.textContent,10)||0) + (on?1:-1)));
+    // P6 内取消关注：该行＋详情面板即时从页面移除（v1.3 §3.2）
+    const row = star.closest(".row");
+    if(!on && row && row.closest("#view-follows")){
+      const p = document.querySelector(`.panel[data-b="${row.dataset.b}"][data-i="${row.dataset.i}"]`);
+      if(p) p.remove();
+      row.remove();
+    }
     toast(on ? "已关注（未入池仓库将即时抓基线，下周起有增量）" : "已取消关注（跟踪保留）");
     return;
   }
