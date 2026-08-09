@@ -1,12 +1,14 @@
-"""T-008 榜单页面（SSR）＋ T-009 关注 API ＋ T-015 关注独立页 P6：本周报告（含历史周次切换）/ 季度回顾 / 总星榜 / 我的关注 / 关注写端点。
+"""T-008 榜单页面（SSR）＋ T-009 关注 API ＋ T-015 关注独立页 P6 ＋ T-010 标签（增删 API＋P5 筛选页）：
+本周报告（含历史周次切换）/ 季度回顾 / 总星榜 / 我的关注 / 关注写端点 / 标签写端点与筛选页。
 
 职责边界（任务书钉死，越界打回）：
 - 榜单口径全部委托 app.report.compute_boards / compute_repo_deltas（《架构决策记录》决策 3/4 唯一实现），本层不重算；
 - 本层只做：URL 期次参数 → as_of 换算、首期空态降级（《交互流程说明》§4）、展示格式化（数字/颜色/锚点）；
 - P6 我的关注（v1.3 独立页）：增量复用 compute_repo_deltas 关注集过滤，本层只做分组与组内/组间排序；
-- 写操作本层仅有关注（T-009）：三态分流与动态入池在 app.follows / app.collector.snapshot，本层只做
-  输入校验与 HTTP 状态码映射（v1.3 起响应不再带 card_html——P1 关注区已移出，无可插入区域）；
-  标签增删与结果页 T-010、推荐理由生成 T-011 不在本层；本层对 recommendations / tags 两张表只读展示。
+- 关注写操作（T-009）：三态分流与动态入池在 app.follows / app.collector.snapshot，本层只做输入校验与 HTTP 状态码映射
+  （v1.3 起响应不再带 card_html——P1 关注区已移出，无可插入区域）；
+- 标签写操作与 P5 筛选页（T-010）：tags 表增删在本层（幂等/校验/404 口径见 /api/tags 路由），行内交互在 radar.js；
+- 本层对 recommendations 表只读展示（T-011 才接线生成）。
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -40,6 +43,10 @@ TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"
 
 templates = Jinja2Templates(directory=_WEB_DIR / "templates")
 router = APIRouter()
+
+# 标签 chip 链接的 path 段编码（quote safe=""：标签可含 / 与空格，全量百分号编码；Jinja 内置 urlencode
+# 是 quote_plus（空格 → +），FastAPI 路径参数用 unquote 解码不会还原 +，故自备过滤器）
+templates.env.filters["quote_tag"] = lambda s: quote(s, safe="")
 
 _ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长（与 app.report 同口径）
 _WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
@@ -336,10 +343,10 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
 
 
 def _display_maps(conn: sqlite3.Connection, as_of_date: date) -> tuple[dict, dict, dict]:
-    """详情面板展示映射（三张表全部只读）：
+    """详情面板展示映射（recommendations / description_zh / tags 三张表全部只读）：
     - 推荐理由 recommendations：按 as_of 所在 ISO 周取（周报页即该周；季/总星页取 as_of 当周，T-011 接线时可再调）；
     - 中文描述 description_zh：懒写入，当前全 NULL → 只显示英文（AI 降级口径，流程说明 §4）；
-    - 标签 tags：只读 chips 展示；增删与标签结果页跳转归 T-010。
+    - 标签 tags：每行 chips 数据源（行内增删走 /api/tags、结果页跳转 /tags/<tag>，T-010 接线）。
     """
     week_key = _week_label(as_of_date)
     reasons = dict(
@@ -626,5 +633,182 @@ def api_unfollow(full_name: str) -> dict:
             "removed": removed,
             "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
         }
+    finally:
+        conn.close()
+
+
+# ===== 标签 API 与 P5 筛选页（T-010；交互口径《交互流程说明》§3.3/§4） =====
+
+# 标签长度上限（流程说明 §3.3：1~20 字符）：与前端 maxLength=20 同值，服务端兜底
+_TAG_MAX_LEN = 20
+
+
+def _parse_tag(raw: object) -> str:
+    """标签入参校验：必须 str，去首尾空格后非空且 ≤20 字符（流程说明 §3.3），否则 400。
+
+    tag 原样存储原样判重（大小写敏感，不做归一化）；去空格只做一次（写入/判重前）。
+    """
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail=f"tag 应为字符串，收到：{raw!r}")
+    tag = raw.strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="标签不能为空（去首尾空格后）")
+    if len(tag) > _TAG_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"标签长度不能超过 {_TAG_MAX_LEN} 字符")
+    return tag
+
+
+@router.post("/api/tags")
+async def api_add_tag(request: Request) -> dict:
+    """给仓库打标签（T-010，§3.3 第 1 步）：同仓同名幂等（added=false，不重复写入→前端 toast"标签已存在"）。
+
+    响应 tags = 该仓全部标签（ORDER BY tag，与 _display_maps 行内 chips 同序）；
+    full_name 校验复用 _parse_full_name；仓库不在跟踪池 → 404。
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo", "tag": "..."}') from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo", "tag": "..."}')
+    full_name = _parse_full_name(payload.get("full_name"))
+    tag = _parse_tag(payload.get("tag"))
+    conn = get_conn()
+    try:
+        repo = conn.execute("SELECT id FROM repos WHERE full_name = ?", (full_name,)).fetchone()
+        if repo is None:
+            raise HTTPException(status_code=404, detail=f"仓库不在跟踪池：{full_name}")
+        cur = conn.execute("INSERT OR IGNORE INTO tags (repo_id, tag) VALUES (?, ?)", (repo["id"], tag))
+        conn.commit()
+        tags = [r["tag"] for r in conn.execute("SELECT tag FROM tags WHERE repo_id = ? ORDER BY tag", (repo["id"],))]
+        return {"added": cur.rowcount > 0, "tags": tags}
+    finally:
+        conn.close()
+
+
+@router.delete("/api/tags/{full_name:path}")
+def api_delete_tag(full_name: str, tag: str | None = None) -> dict:
+    """删除标签（T-010，§3.3 第 2 步）：标签/仓库不存在均幂等 removed=false（与取消关注同口径）。
+
+    形态说明（任务书授权"或等价形态"）：full_name 走 path（:path 天然承载含 / 的仓库名），tag 走 query——
+    {full_name:path}/{tag:path} 双 path 参数存在贪婪解析歧义（tag 含 / 时 full_name 会多吃段），
+    且 %2F 可能被反代解码；tag 编码进 query 后两者皆无，流程偏差已在交付报告留痕。
+    """
+    full_name = _parse_full_name(full_name)
+    tag = _parse_tag(tag)
+    conn = get_conn()
+    try:
+        repo = conn.execute("SELECT id FROM repos WHERE full_name = ?", (full_name,)).fetchone()
+        if repo is None:
+            return {"removed": False}  # 仓库不在池：删除目标本就不存在，幂等成功
+        cur = conn.execute("DELETE FROM tags WHERE repo_id = ? AND tag = ?", (repo["id"], tag))
+        conn.commit()
+        return {"removed": cur.rowcount > 0}
+    finally:
+        conn.close()
+
+
+def _tag_cloud(conn: sqlite3.Connection) -> list[dict]:
+    """标签云数据（P5 总页）：每个标签＋项目数；项目数降序、同数按标签名（任务书口径）。"""
+    rows = conn.execute("SELECT tag, COUNT(*) AS n FROM tags GROUP BY tag").fetchall()
+    return [
+        {"tag": r["tag"], "n": r["n"], "href": f"/tags/{quote(r['tag'], safe='')}"}
+        for r in sorted(rows, key=lambda r: (-r["n"], r["tag"]))
+    ]
+
+
+def _tag_row_view(rank: int, row: sqlite3.Row, stars: int | None, *, followed: set, reasons: dict, zh: dict, tags: dict) -> dict:
+    """标签结果页行视图：与 _row_view 同字段契约（_row.html 共用），无增量列（按总星排序口径）。
+
+    dead 仓库保留展示（打过的标签仍在）：整行灰显＋"已失效"（_row.html 既有分支），up 列退化"——"。
+    """
+    return {
+        "rank": rank,
+        "full_name": row["full_name"],
+        "language": row["language"],
+        "lang_color": LANG_COLORS.get(row["language"] or "", _DEFAULT_LANG_COLOR),
+        "dead": bool(row["dead"]),
+        "up_na_text": "——" if row["dead"] else None,
+        "delta_text": None,  # 标签页无增量概念（同总星榜行形态）
+        "delta_neg": False,
+        "stars_text": None if stars is None else _fmt_stars(stars),
+        "followed": row["full_name"] in followed,
+        "description_en": row["description_en"],
+        "description_zh": zh.get(row["full_name"]),
+        "reason": reasons.get(row["full_name"]),  # None → 无推荐语块（AI 降级形态，不留空框）
+        "tags": tags.get(row["full_name"], []),
+        "window_note": None,
+    }
+
+
+@router.get("/tags", response_class=HTMLResponse)
+def tags_page(request: Request) -> HTMLResponse:
+    """P5 标签筛选总页（流程说明 §1）：全部标签云；空库渲染空态（引导打标入口）。"""
+    conn = get_conn()
+    try:
+        follow_count = conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0]
+        return templates.TemplateResponse(
+            request=request,
+            name="tags.html",
+            context={
+                "request": request,
+                "page": "tags",  # 顶栏 active 态
+                "title": "标签筛选",
+                "tag": None,  # None → 模板渲染云视图（结果页才传 tag）
+                "tags": _tag_cloud(conn),
+                "follow_count": follow_count,
+            },
+        )
+    finally:
+        conn.close()
+
+
+@router.get("/tags/{tag:path}", response_class=HTMLResponse)
+def tag_page(request: Request, tag: str) -> HTMLResponse:
+    """P5 标签结果页（流程说明 §3.3 第 3 步）：该标签下项目列表，行形态复用 _row.html（紧凑行＋默认展开＋★）。
+
+    排序：最新快照总星降序（与总星榜同口径）；标签集小（个位~几十），逐仓端点查询走主键 seek
+    （P6 关注集同模式；schema 硬约束禁止的相关子查询形态仅针对全池榜单 SQL，此处不触发）。
+    :path 承载含 / 的标签（href 已 quote 编码；反代若解码 %2F 也不影响语义，贪婪匹配兜底）；
+    空结果渲染 §4 空态（"还没有项目打过「xx」标签"＋返回 /tags 链接）。
+    """
+    tag = tag.strip()
+    if not tag:
+        # /tags/（尾斜杠）会匹配本路由且 tag=""，走到这里；/tags 本体由精确路由处理
+        raise HTTPException(status_code=404)
+    now = datetime.now(timezone.utc)
+    as_of = now.strftime(_ISO_FMT)
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead"
+            " FROM tags t JOIN repos r ON r.id = t.repo_id WHERE t.tag = ?",
+            (tag,),
+        ).fetchall()
+        starred = []
+        for r in rows:
+            starred.append((_endpoint_stars(conn, r["id"], as_of), r))
+        starred.sort(key=lambda t: (-(t[0] or 0), t[1]["full_name"]))  # 无快照行按 0 沉底，同星按名稳定
+
+        reasons, zh, tags = _display_maps(conn, now.date())
+        follow_rows = conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id").fetchall()
+        followed = {r["full_name"] for r in follow_rows}
+        view_rows = [
+            _tag_row_view(i + 1, row, stars, followed=followed, reasons=reasons, zh=zh, tags=tags)
+            for i, (stars, row) in enumerate(starred)
+        ]
+        return templates.TemplateResponse(
+            request=request,
+            name="tags.html",
+            context={
+                "request": request,
+                "page": "tags",
+                "title": f"标签「{tag}」",
+                "tag": tag,
+                "rows": view_rows,
+                "total": len(view_rows),
+                "follow_count": len(follow_rows),
+            },
+        )
     finally:
         conn.close()

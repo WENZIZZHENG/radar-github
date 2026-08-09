@@ -17,7 +17,10 @@
   {% if r.window_note %}<div class="window-note">{{ r.window_note }}</div>{% endif %}
   <div class="acts">
     <a class="gh" href="https://github.com/{{ r.full_name }}" target="_blank" rel="noopener noreferrer">在 GitHub 打开 <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5.5"/></svg></a>
-    {# 标签只读展示：增删按钮与标签结果页跳转归 T-010 #}
-    {% for t in r.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+    {# 标签区（T-010 已接线）：chip 本体是 /tags/<tag> 链接；× 删除钮带 data-repo/data-tag 供 radar.js 调 DELETE；
+       中文标签 href 由服务端 quote safe='' 编码（过滤器 quote_tag，见 routes.py），空格也百分号化 #}
+    {% for t in r.tags %}<span class="tag"><a class="tag-link" href="/tags/{{ t | quote_tag }}">{{ t }}</a><b title="删除标签" data-repo="{{ r.full_name }}" data-tag="{{ t }}">×</b></span>{% endfor %}
+    {# 打标入口（P1/P3/P4/P6 四页共用本模板，全都有增删能力）：data-repo 供 JS 提交 POST /api/tags #}
+    <button class="tag-add" data-repo="{{ r.full_name }}">＋ 标签</button>
   </div>
 </div>

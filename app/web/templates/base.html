@@ -29,8 +29,7 @@
       <a href="/follows"{% if page == "follows" %} class="active" aria-current="page"{% endif %}>我的关注<i id="nav-follow-count">{{ follow_count }}</i></a>
       <a href="/quarter"{% if page == "quarter" %} class="active" aria-current="page"{% endif %}>季度回顾</a>
       <a href="/total"{% if page == "total" %} class="active" aria-current="page"{% endif %}>总星榜</a>
-      {# 标签页归 T-010：禁用必须给原因（流程说明 §0），原因放 title tooltip #}
-      <span class="off" title="标签功能开发中（T-010 上线）">标签</span>
+      <a href="/tags"{% if page == "tags" %} class="active" aria-current="page"{% endif %}>标签</a>
     </nav>
     {% block switcher %}{% endblock %}
   </div>

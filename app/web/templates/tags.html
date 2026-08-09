@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+{# P5 标签筛选（流程说明 §1：/tags 标签云 → /tags/<tag> 该标签下项目列表）。两视图共用一个模板：tag 为空 → 云，非空 → 结果页 #}
+{% if tag %}
+{# ---- 标签结果页：行形态与榜单行完全一致（_row.html 共用：紧凑行＋默认展开＋标签区＋★） ---- #}
+<p class="meta">标签「<b class="mono">{{ tag }}</b>」下的 {{ total }} 个项目 · 按最新快照总星降序</p>
+{% if rows %}
+<section>
+  <h2 class="sec">标签「{{ tag }}」</h2>
+  <div class="boards">
+    <div class="board">
+      {% for r in rows %}{% set anchor = "tag" %}{% set idx = loop.index0 %}{% include "_row.html" %}{% endfor %}
+    </div>
+  </div>
+</section>
+{% else %}
+{# 空标签筛选空态（流程说明 §4）：必须回答"接下来会发生什么"＋返回链接 #}
+<p class="empty-follows">还没有项目打过「{{ tag }}」标签。<a href="/tags">返回标签列表</a></p>
+{% endif %}
+{% else %}
+{# ---- 标签云总页：每个标签＋项目数（项目数降序、同数按标签名，排序在 routes._tag_cloud） ---- #}
+<p class="meta">全部 {{ tags | length }} 个标签 · 从任意标签进入项目列表</p>
+{% if tags %}
+<section>
+  <h2 class="sec">全部标签</h2>
+  <div class="chips">
+    {% for t in tags %}<a class="tag tag-cloud" href="{{ t.href }}">{{ t.tag }}<i>{{ t.n }}</i></a>{% endfor %}
+  </div>
+</section>
+{% else %}
+{# 空库空态（任务书口径）：引导打标入口 #}
+<p class="empty-follows">还没有任何标签：展开项目行点「＋ 标签」即可打标。<a href="/">回首页</a></p>
+{% endif %}
+{% endif %}
+{% endblock %}

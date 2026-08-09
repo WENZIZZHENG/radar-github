@@ -319,3 +319,22 @@ nav.tabs a.active i { color: var(--text-2); }
 .row .up.na { font-size: 11px; color: var(--text-3); font-weight: 500; }
 /* P6 空态里的回首页链接：弱文字块中点出可点性 */
 .empty-follows a { color: var(--blue); }
+
+/* ===== T-010 追加（标签增删＋P5 筛选页；样式照示意图，一律复用 :root token） ===== */
+
+/* chip 本体变链接（跳 /tags/<tag>）：去链接下划线，色随 chip；hover 下划线提示可点 */
+.tag .tag-link { color: inherit; text-decoration: none; }
+.tag .tag-link:hover { text-decoration: underline; }
+/* 删除 × 扩大命中区（负 margin 保持 chip 外观不变） */
+.tag b { padding: 2px 4px; margin: -2px -4px; border-radius: 4px; }
+.tag b:hover { background: rgba(88,166,255,.14); }
+/* 非法输入（空/超 20 字符，流程说明 §4）：红边＋内联提示，不提交 */
+.tag-input.invalid { border-color: var(--destructive); box-shadow: 0 0 0 3px rgba(239,68,68,.15); }
+.tag-hint { font-size: 11px; color: var(--destructive); }
+/* P5 标签云 chip：复用锚点 chip 的项目数徽标语义（.tag 本体即 chip 样式） */
+.tag.tag-cloud { text-decoration: none; font-size: 12.5px; padding: 5px 13px; }
+.tag.tag-cloud:hover { border-color: var(--blue); background: rgba(88,166,255,.18); }
+.tag.tag-cloud i {
+  font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
+  background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px;
+}
