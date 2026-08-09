@@ -1,6 +1,6 @@
 """进程内调度（架构决策 7：SSR + SQLite + 进程内 APScheduler，不引独立调度进程）。
 
-每日 UTC 00:00 跑一次全日任务（快照＋发现池，逻辑全在 app.collector.discover）：
+每日 UTC 00:00 跑一次全日任务（快照＋发现池，逻辑全在 app.collector.discover；T-011 串行接 AI 周度生成）：
 - misfire_grace_time=1 小时：进程重启错过整点，1 小时内醒来补跑一次；
 - coalesce=True：多次错过合并成一次，不连刷配额（共识 §8 允许数据空洞，没必要补）；
 - 时区钉死 UTC：服务器本地时区不可控，采集口径全部 UTC（与 UTC 定长时间戳硬约定一致）。
@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.ai import DeepSeekClient, ensure_weekly_ai
 from app.collector.discover import get_job_logger, run_daily
 from app.collector.github import GitHubClient
 from app.config import get_settings
@@ -23,13 +24,24 @@ MISFIRE_GRACE_SECONDS = 3600
 
 
 async def daily_job() -> None:
-    """调度入口：自带连接与客户端生命周期；run_daily 内部已吞异常记日志，调度器侧无需再兜。"""
+    """调度入口：自带连接与客户端生命周期；run_daily 内部已吞异常记日志，调度器侧无需再兜。
+
+    T-011：快照/发现之后串行跑 AI 周度生成（懒翻译＋推荐理由，同一 conn 复用 WAL 读写不互阻）。
+    AI 整段 try/except 吞掉记 ERROR 不抛出——AI 失败永不阻断快照主流程（key 缺失在
+    ensure_weekly_ai 内部降级返回零统计，此路径行为与接线前一致）。
+    """
     settings = get_settings()
     init_db()  # schema 全量 IF NOT EXISTS：调度进程可能与 uvicorn 分开发育，各自保证库表存在
     conn = get_conn()
     try:
+        log = get_job_logger()
         async with GitHubClient(settings.github_token) as client:  # token 空/无效由客户端在使用点报清晰错误
-            await run_daily(client, conn, log=get_job_logger())
+            await run_daily(client, conn, log=log)
+        try:
+            async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
+                await ensure_weekly_ai(conn, ai_client, now=datetime.now(timezone.utc), log=log)
+        except Exception:
+            log.exception("AI 周度生成整轮异常：吞掉不抛出（AI 降级不阻断快照主流程），次日调度自然重试")
     finally:
         conn.close()
 
