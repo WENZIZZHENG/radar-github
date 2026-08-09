@@ -42,4 +42,7 @@
 当前任务：**T-001 项目骨架与统一验证入口**（批次一：数据底座）。
 规模档：**S（轻量）**——判定信号：无真实外部用户（本人单人使用）；交互功能 3 个（榜单浏览/关注/标签，季度回顾与总星榜复用同一展示模式）；无数据迁移；不涉资金/权限/隐私（Basic Auth 为运维层挡外人，非应用权限体系）。判定已记入此，本人下调/上调须留痕。
 
-> 技术验证命令（pytest / verify 入口）随 T-001 骨架落地后补充到本节——未实际跑通的命令不写入。
+> 技术验证命令（T-001 起生效，均已实测跑通）：
+> - 统一验证入口（收口只认它一次跑绿）：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1`（ruff + pytest）
+> - 本地起服务：`.venv/Scripts/python.exe -m uvicorn app.main:app --port 8000`
+> - 依赖安装：`uv venv .venv && uv pip install -r pyproject.toml --extra dev`
