@@ -1,0 +1,56 @@
+# ==========================================================================
+# Radar 雷达 · systemd unit（T-012 部署起草物）
+# 部署位置：/etc/systemd/system/radar.service
+#
+# 一次性前置（以 root 执行）：
+#   1) 建非 root 运行用户（应用不需要 root，最小权限）：
+#        sudo useradd --system --user-group -m --shell /usr/sbin/nologin radar
+#      （-m 建家目录：uv 装到 ~/.local/bin、自管 Python 与缓存都要可写 HOME；
+#       评审中-1——nologin shell 下 `sudo -iu radar` 走不通，步骤 3 用显式 bash 形态）
+#   2) 代码 clone 到 /opt/radar，授权（data/ 需可写：SQLite 落盘 + WAL 文件）：
+#        sudo chown -R radar:radar /opt/radar
+#   3) 装依赖（生产不装 dev extra）。uv 官方安装脚本装到执行用户的 ~/.local/bin，
+#      必须显式以 radar 身份＋其 HOME 执行（nologin 用户不能 -i 登录，用 bash -c 形态）：
+#        sudo -u radar -H bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+#        sudo -u radar -H bash -c 'cd /opt/radar && export PATH="$HOME/.local/bin:$PATH" && uv venv .venv && uv pip install --python .venv/bin/python -r pyproject.toml'
+#      （Python 需 ≥3.12；系统版本不够时用 `uv python install 3.12` 让 uv 自管，见《服务器探测记录》第 7 项）
+#
+# 启用与排障：
+#   sudo systemctl daemon-reload        # 每次改本文件后都要先 reload
+#   sudo systemctl enable --now radar   # 开机自启并立即启动
+#   sudo systemctl status radar         # 看运行状态
+#   journalctl -u radar -f              # 跟随日志
+#   journalctl -u radar --since today   # 今天的日志
+# ==========================================================================
+
+[Unit]
+Description=Radar GitHub 热门项目雷达 (FastAPI + uvicorn)
+# 等网络就绪再启动：采集任务要访问 GitHub/DeepSeek API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radar
+Group=radar
+WorkingDirectory=/opt/radar
+
+# 环境变量（可选项，双保险）：app/config.py 会自解析 /opt/radar/.env，
+# 且系统环境变量优先于 .env（setdefault 不覆盖），所以不靠这行也能拿到密钥。
+# `-` 前缀表示文件缺失不报错。注意 systemd EnvironmentFile 只认纯 KEY=VALUE 行，
+# 不支持 export 前缀和复杂引号转义——.env 保持简单格式即可两处通用。
+EnvironmentFile=-/opt/radar/.env
+
+# 只绑回环：公网唯一入口是 Caddy（反代 127.0.0.1:8000，见 deploy/Caddyfile），
+# 应用不直接暴露公网，攻击面收敛到 Caddy 一层；改端口需与 Caddyfile 同步改。
+ExecStart=/opt/radar/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# 崩溃自动拉起；间隔 5 秒，避免故障时疯狂重启刷日志
+Restart=always
+RestartSec=5
+
+# 警告：不要在此加 Environment=RADAR_JOBS_ENABLED=0 ——
+# 每日采集/每周榜单是进程内 APScheduler 随应用 lifespan 启动的，置 0 等于关停全部定时任务。
+
+[Install]
+WantedBy=multi-user.target

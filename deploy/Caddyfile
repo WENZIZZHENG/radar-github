@@ -1,0 +1,57 @@
+# ==========================================================================
+# Radar 雷达 · Caddy 反代配置（T-012 部署起草物）
+# 部署位置：/etc/caddy/Caddyfile（Caddy 官方 apt 包默认配置路径）
+#
+# 语法前提：Caddy v2.8。访问控制指令自 v2.8.0 起更名为 basic_auth
+# （v2.8.0 之前名为 basicauth，已弃用勿用——低于 v2.8.0 的 Caddy 解析不了本文件，先升级）。
+#
+# 环境变量占位（Caddyfile 支持 {$VAR}，配置加载/适配时展开）：
+#   RADAR_DOMAIN           站点域名，如 radar.example.com（只写域名，勿带 https://）
+#   RADAR_BASIC_AUTH_USER  Basic Auth 用户名
+#   RADAR_BASIC_AUTH_HASH  Basic Auth 密码的 bcrypt hash
+#
+# hash 生成与注入：
+#   1) 生成：在服务器执行 `caddy hash-password`，交互输入密码，输出 bcrypt hash。
+#      配置里只放 hash 不放明文——hash 可随文件留存，明文不要落任何文件。
+#      注意 bcrypt hash 含 `$` 字符：写进 shell export 时用单引号包起来，
+#      写进 systemd Environment / EnvironmentFile 则原样粘贴即可。
+#   2) 注入方式任选其一：
+#      a) `sudo systemctl edit caddy`，在 [Service] 块加三行：
+#           Environment=RADAR_DOMAIN=radar.example.com
+#           Environment=RADAR_BASIC_AUTH_USER=...
+#           Environment=RADAR_BASIC_AUTH_HASH=...
+#      b) 集中写入 /etc/caddy/env（权限 600），再 `sudo systemctl edit caddy` 加一行：
+#           EnvironmentFile=-/etc/caddy/env
+#   3) 生效：只改 Caddyfile 本体用 `sudo systemctl reload caddy`；
+#      改了环境变量必须 `sudo systemctl restart caddy`
+#      （reload 复用原进程环境，拿不到新变量值）。
+#
+# HTTPS 自动签发的前置条件（全部满足后 Caddy 全自动签发/续期，无需人工干预）：
+#   1) RADAR_DOMAIN 的 DNS A 记录已指向本服务器公网 IP；
+#   2) 80/443 对外开放（机器防火墙 + 云安全组）——80 走 ACME HTTP-01 挑战，443 提供 HTTPS；
+#   3) 80/443 没有被其他 Web 服务占用（见《服务器探测记录》第 3、4 项）。
+# ==========================================================================
+
+{$RADAR_DOMAIN} {
+
+	# 访问控制：Basic Auth 挡外人（《架构决策记录》决策 8）。
+	# 单人使用、无应用内用户体系——这一层就是全部"权限"，密码强度即全部防线。
+	basic_auth {
+		{$RADAR_BASIC_AUTH_USER} {$RADAR_BASIC_AUTH_HASH}
+	}
+
+	# 反代到本机回环上的 uvicorn。应用只绑 127.0.0.1（见 deploy/radar.service），
+	# 公网唯一入口就是 Caddy，攻击面收敛到这一层。
+	# X-Forwarded-For / X-Forwarded-Proto / Host 由 Caddy 默认带齐，无需额外配置。
+	reverse_proxy 127.0.0.1:8000
+
+	# 安全响应头（保持克制，只加对 SSR 页面确定无害的三条）：
+	header {
+		# 禁止浏览器嗅探 MIME，防把文本响应误当脚本执行
+		X-Content-Type-Options nosniff
+		# 禁止被 iframe 嵌套，防点击劫持
+		X-Frame-Options DENY
+		# 跨站跳转不带完整 Referer，减少 URL 信息外泄
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
