@@ -1,0 +1,33 @@
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# 数据与备份产物（SQLite 库与备份不入库）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+backups/
+
+# 日志
+logs/
+*.log
+
+# 操作系统
+.DS_Store
+Thumbs.db
