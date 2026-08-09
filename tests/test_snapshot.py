@@ -143,6 +143,7 @@ def test_ingest_maps_items_to_two_tables(tmp_path):
 
     row = conn.execute("SELECT * FROM repos WHERE full_name = 'octocat/hello'").fetchone()
     assert row["topics"] == '["ai", "cli"]'  # schema 硬约定：JSON 数组字符串，不是 Python repr
+    assert row["node_id"] == "node-octocat/hello"  # T-006 勘误补列：每日 nodes(ids:) 采集入口必须入库
     assert row["description_en"] == "demo"
     assert row["language"] == "Python"
     assert row["dead"] == 0

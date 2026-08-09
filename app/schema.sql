@@ -8,6 +8,7 @@
 CREATE TABLE IF NOT EXISTS repos (
     id INTEGER PRIMARY KEY,
     full_name TEXT NOT NULL UNIQUE,        -- owner/repo，天然唯一键，采集去重靠它
+    node_id TEXT NOT NULL UNIQUE,          -- Relay 全局 ID：每日 GraphQL nodes(ids:) 批量采集的入口（T-006 勘误补列）
     description_en TEXT,                   -- GitHub 原文描述，官方允许为空
     description_zh TEXT,                   -- 中文翻译，懒写入：未翻译前保持 NULL
     language TEXT,                         -- 主语言，GitHub 上部分仓库无语言，允许 NULL

@@ -32,7 +32,8 @@ BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_CAP_SECONDS = 60.0
 
 # 字段一次拿全：nameWithOwner/description/primaryLanguage/topics 入库；
-# isArchived/isPrivate/isDisabled 是死库信号（T-005 置 repos.dead 后停采），pushedAt 辅助判断停更。
+# isPrivate/isDisabled（及 nodes 返回 null）是死库信号（置 repos.dead 后停采）；
+# isArchived 不算死库——归档只读但仍可被 star，星数仍会动，停采反丢数据（T-006 评审确认口径）；pushedAt 辅助判断停更。
 NODES_QUERY = """
 query BatchRepos($ids: [ID!]!) {
   nodes(ids: $ids) {
@@ -143,16 +144,18 @@ class GitHubClient:
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
-    async def search_repositories(self, query: str, *, per_page: int = 100, page: int = 1) -> dict:
+    async def search_repositories(self, query: str, *, sort: str = "stars", per_page: int = 100, page: int = 1) -> dict:
         """Search REST（仅发现/初始分片用）：主动限速后请求，返回原始 JSON。
 
         GitHub Search 只吐前 1000 条结果（per_page=100 时 page ≤ 10）；分片保证不越界是调用方（T-005）的责任。
+        sort 默认 stars（初始分片按星数定序）；T-006 发现池传 updated 捞"最近活跃"新面孔——
+        星数榜头部常年固化，按 updated 排序才能轮到涨星中的新仓库翻进前 500。
         """
         await self._pace_search()
         response = await self._request(
             "GET",
             SEARCH_URL,
-            params={"q": query, "sort": "stars", "order": "desc", "per_page": per_page, "page": page},
+            params={"q": query, "sort": sort, "order": "desc", "per_page": per_page, "page": page},
         )
         return response.json()
 

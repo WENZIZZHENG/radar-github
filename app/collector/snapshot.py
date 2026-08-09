@@ -134,6 +134,7 @@ def ingest_items(conn: sqlite3.Connection, items: list[dict], *, captured_at: st
     repo_rows = [
         (
             item["full_name"],
+            item["node_id"],  # Relay 全局 ID：每日 nodes(ids:) 批量采集必需（T-006 勘误补存）
             item.get("description"),  # GitHub 官方允许为空，schema 允许 NULL
             item.get("language"),  # 同上：部分仓库无语言
             json.dumps(item.get("topics") or [], ensure_ascii=False),  # schema 硬约定：topics 存 JSON 数组字符串
@@ -144,8 +145,8 @@ def ingest_items(conn: sqlite3.Connection, items: list[dict], *, captured_at: st
     with conn:  # 一个分片一个事务：异常整体回滚，断点不落盘，重跑整片幂等
         cur = conn.executemany(
             """
-            INSERT OR IGNORE INTO repos (full_name, description_en, language, topics, dead, source, created_at)
-            VALUES (?, ?, ?, ?, 0, 'initial', ?)
+            INSERT OR IGNORE INTO repos (full_name, node_id, description_en, language, topics, dead, source, created_at)
+            VALUES (?, ?, ?, ?, ?, 0, 'initial', ?)
             """,
             repo_rows,
         )

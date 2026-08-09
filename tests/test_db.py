@@ -15,8 +15,8 @@ def test_init_db_idempotent(tmp_path):
     init_db(db)
     conn = get_conn(db)
     conn.execute(
-        "INSERT INTO repos (full_name, source, created_at) VALUES (?, ?, ?)",
-        ("octocat/keep", "search", "2026-08-01T00:00:00Z"),
+        "INSERT INTO repos (full_name, node_id, source, created_at) VALUES (?, ?, ?, ?)",
+        ("octocat/keep", "node-keep", "search", "2026-08-01T00:00:00Z"),
     )
     conn.commit()
     conn.close()
@@ -60,8 +60,8 @@ def test_read_write_roundtrip(tmp_path):
     conn = get_conn(db)
     try:
         cur = conn.execute(
-            "INSERT INTO repos (full_name, language, topics, source, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("octocat/hello", "Python", '["ai", "cli"]', "trending", "2026-08-01T00:00:00Z"),
+            "INSERT INTO repos (full_name, node_id, language, topics, source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("octocat/hello", "node-hello", "Python", '["ai", "cli"]', "trending", "2026-08-01T00:00:00Z"),
         )
         conn.execute(
             "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
