@@ -22,6 +22,7 @@ from app.config import BASE_DIR, get_settings
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 SEARCH_URL = "https://api.github.com/search/repositories"
+REPOS_URL = "https://api.github.com/repos"  # 单仓库元数据：/{owner}/{repo}（关注动态入池用）
 
 MAX_NODES_PER_QUERY = 100  # nodes(ids:) 一次最多 100 个：GraphQL 单请求复杂度上限内最经济的批量
 DEFAULT_MIN_SEARCH_INTERVAL = 2.1  # 秒；Search 限速 30 次/分钟 → 间隔须 ≥2.0，多留 0.1 秒防边界抖动
@@ -69,6 +70,10 @@ class GitHubAuthError(GitHubError):
 
 class GitHubRateLimitError(GitHubError):
     """重试上限耗尽后仍被限速。"""
+
+
+class GitHubNotFoundError(GitHubError):
+    """404：资源不存在/已删除/转私有。单独成类供调用方映射用户可见 404（关注未入池仓库）；其余路径语义不变。"""
 
 
 def utc_now_iso() -> str:
@@ -176,6 +181,17 @@ class GitHubClient:
             raise GitHubError(f"GitHub GraphQL 返回错误：{detail}")
         return payload["data"]["nodes"]
 
+    async def fetch_repo(self, full_name: str) -> dict:
+        """单仓库元数据（决策 9 关注动态入池）：REST GET /repos/{owner}/{repo}。
+
+        一次请求拿全入库字段（full_name/node_id/description/language/topics/stargazers_count），
+        响应字段与 Search item 同构，入库映射与采集层共用同一套口径。
+        404（仓库不存在/已删除/转私有）抛 GitHubNotFoundError，由调用方映射用户可见错误；
+        核心 REST 限速 5000 次/小时（认证），单发请求不配主动限速（Search 的 30 次/分钟才需要 _pace_search）。
+        """
+        response = await self._request("GET", f"{REPOS_URL}/{full_name}")
+        return response.json()
+
     async def _pace_search(self) -> None:
         now = time.monotonic()
         wait = search_wait_seconds(self._last_search_at, now, self._min_search_interval)
@@ -208,6 +224,8 @@ class GitHubClient:
                     raise GitHubError(f"GitHub 服务端错误（HTTP {status}）：重试 {self._max_retries} 次后放弃")
                 await self._sleep(backoff_wait_seconds(attempt))
                 continue
+            if status == 404:
+                raise GitHubNotFoundError(f"GitHub 资源不存在（HTTP 404）：{response.text[:200]}")
             if status >= 400:
                 raise GitHubError(f"GitHub 请求失败（HTTP {status}）：{response.text[:200]}")
             return response

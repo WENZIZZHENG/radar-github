@@ -305,10 +305,6 @@ footer.note { margin-top: var(--s6); font-size: 12px; line-height: 1.7; color: v
 .board-empty { padding: var(--s3) var(--s4); font-size: 12.5px; color: var(--text-3); }
 .empty-follows { font-size: 12.5px; color: var(--text-3); }
 
-/* 关注星标禁用态（T-009 接线前）：禁用必须给原因——原因在 title tooltip，样式降饱和 */
-.star:disabled { cursor: not-allowed; opacity: .45; }
-.star:disabled:hover { color: #6B7A90; background: none; }
-
 /* 负增量：示意图未演示负值样式，用既有 --destructive token 与正增量区分语义（偏差已留痕） */
 .row .up.neg { color: var(--destructive); }
 
@@ -323,3 +319,11 @@ nav.tabs .off {
 
 /* 无描述占位：弱文字降不透明度，不抢正文 */
 .panel .desc-en.na { opacity: .7; }
+
+/* ===== T-009 追加（关注接线；一律复用 :root token，不新造颜色） ===== */
+
+/* toast 报错态（关注/取消失败，流程说明 §3.2：toast 报错）：侧条换警示红，与成功绿区分语义 */
+.toast.err { border-left-color: var(--destructive); }
+
+/* hidden 属性兜底：.follow-row 的 display:flex 优先级高于 UA 的 [hidden] 规则，必须显式压制 */
+#follow-row[hidden], #follows-empty[hidden] { display: none; }

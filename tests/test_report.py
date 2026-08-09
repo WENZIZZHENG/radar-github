@@ -263,3 +263,29 @@ def test_endpoint_sql_uses_index_seek(conn):
         plan = [row["detail"] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)]
         assert any("SEARCH" in detail for detail in plan), plan
         assert not any("SCAN" in detail for detail in plan), plan
+
+
+def test_repo_ids_filter_limits_computation(conn):
+    """repo_ids 过滤参数（T-008 评审中-2 转办，T-009 落地）：只算指定集合；dead 剔除口径不变。
+
+    "我的关注"区只对关注 repo_id 集合算增量，不再全池复算；None 默认全池回归（既有行为一字不变）。
+    """
+    r1 = _add_repo(conn, "a/one", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+    r2 = _add_repo(conn, "a/two", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 300)])
+    r3 = _add_repo(conn, "a/three", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 400)])
+    r_dead = _add_repo(conn, "a/dead", dead=1, snapshots=[(_iso(7), 100), (_iso(0), 500)])
+
+    deltas = compute_repo_deltas(conn, period="week", as_of=AS_OF, repo_ids={r1, r2, r_dead})
+    assert set(deltas) == {r1, r2}  # 只算指定集；集合里的 dead 照样剔除（调用方按缺席口径补端点星数）
+    assert deltas[r1].delta == 100 and deltas[r2].delta == 200
+
+    # 空集 → 空结果：无关注时不打任何端点查询
+    assert compute_repo_deltas(conn, period="week", as_of=AS_OF, repo_ids=[]) == {}
+
+    # None 默认全池回归：三个 alive 全在结果里（dead 不在），与未传参数行为一致
+    all_deltas = compute_repo_deltas(conn, period="week", as_of=AS_OF)
+    assert set(all_deltas) == {r1, r2, r3}
+    assert all_deltas[r3].delta == 300
+    # total 口径同样接受过滤
+    total_deltas = compute_repo_deltas(conn, period="total", as_of=AS_OF, repo_ids=[r3])
+    assert set(total_deltas) == {r3} and total_deltas[r3].stars == 400

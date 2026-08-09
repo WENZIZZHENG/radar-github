@@ -169,6 +169,52 @@ def ingest_items(conn: sqlite3.Connection, items: list[dict], *, captured_at: st
     return IngestResult(repos_inserted, snapshots_inserted)
 
 
+def ingest_followed_repo(conn: sqlite3.Connection, item: dict, *, captured_at: str, now_iso: str) -> int:
+    """单仓库关注入池/复活（《架构决策记录》决策 9 动态入池）：repos(source='follow')＋基线快照一个事务同生共死。
+
+    - 未入池：插入 repos 行（source='follow'，字段映射与 ingest_items 同口径）＋当行基线快照；
+    - 已入池 dead（复活）：repos 行 INSERT OR IGNORE 跳过（元数据不动），仅置 dead=0 回到每日
+      _snapshot_all 的 dead=0 选池，并补一张最新基线快照（死库期间星数无采集，增量两端从这里起算）；
+    - 幂等：full_name/node_id 撞已有行 INSERT OR IGNORE 跳过，基线快照主键 (repo_id, captured_at) 冲突跳过；
+    - 返回 repo_id（新插或既有行），供调用方接着写 follows；
+    - fail loud：full_name 不在库但 INSERT 被 IGNORE（node_id 撞已有行＝仓库改名旧名在库）时抛 ValueError，
+      事务整体回滚不留半写；改名归并超出当前边界（T-006 评审中-1 同型坑，既定姿态）；
+    - fail loud：full_name 在库但 node_id 与 GitHub 现值不一致（原仓库被删除后同名重建）时抛 ValueError
+      （T-009 评审中-1：不拦则会带着旧 node_id 复活，次日 nodes(ids:) 拿 null 被静默再标 dead）。
+    """
+    with conn:  # repos＋快照要么都成要么都败：异常整体回滚，重试幂等
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO repos (full_name, node_id, description_en, language, topics, dead, source, created_at)
+            VALUES (?, ?, ?, ?, ?, 0, 'follow', ?)
+            """,
+            (
+                item["full_name"],
+                item["node_id"],  # Relay 全局 ID：次日 nodes(ids:) 批量采集入口，必填
+                item.get("description"),  # GitHub 官方允许为空，schema 允许 NULL
+                item.get("language"),  # 同上
+                json.dumps(item.get("topics") or [], ensure_ascii=False),  # schema 硬约定：JSON 数组字符串
+                now_iso,
+            ),
+        )
+        row = conn.execute("SELECT id, dead, node_id FROM repos WHERE full_name = ?", (item["full_name"],)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"仓库 {item['full_name']} 的 node_id 与库内已有记录冲突（仓库可能已改名，旧名仍在库），暂未自动归并"
+            )
+        if row["node_id"] != item["node_id"]:
+            # 同名重建（T-009 评审中-1）：与改名撞库同姿态 fail loud，由本人知情处置，不自动归并
+            raise ValueError(f"仓库 {item['full_name']} 的 node_id 已变化（原仓库可能被删除后同名重建），暂未自动归并")
+        repo_id = row["id"]
+        if row["dead"]:
+            conn.execute("UPDATE repos SET dead = 0 WHERE id = ?", (repo_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
+            (repo_id, captured_at, item["stargazers_count"]),
+        )
+    return repo_id
+
+
 class ProgressStore:
     """叶子分片断点（JSON）：已完成分片重跑跳过；损坏时 fail loud 由人工处置（删掉=全量重跑，入库幂等不丢数据）。
 

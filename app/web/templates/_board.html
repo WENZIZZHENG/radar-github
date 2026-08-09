@@ -8,8 +8,8 @@
     {% if r.language %}<span class="badge"><span class="dot" style="background:{{ r.lang_color }}"></span>{{ r.language }}</span>{% endif %}
     {% if r.delta_text is not none %}<span class="up{% if r.delta_neg %} neg{% endif %}">{{ r.delta_text }}</span>{% endif %}
     <span class="total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{{ r.stars_text }}</span>
-    {# 关注星标只渲染样式、不绑写操作（T-009 接线）：禁用态 + tooltip 说明原因 #}
-    <button class="star{% if r.followed %} on{% endif %}" disabled title="关注功能开发中（T-009 接线）" aria-label="关注">{% if r.followed %}<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{% else %}<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{% endif %}</button>
+    {# 关注星标（T-009 已接线）：data-repo 供 JS 调关注 API；同一仓库跨榜重复时全部星标联动切换 #}
+    <button class="star{% if r.followed %} on{% endif %}" data-repo="{{ r.full_name }}" title="{% if r.followed %}取消关注{% else %}关注{% endif %}" aria-label="{% if r.followed %}取消关注{% else %}关注{% endif %}">{% if r.followed %}<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{% else %}<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{% endif %}</button>
   </div>
   <div class="panel open" data-b="{{ b.anchor }}" data-i="{{ loop.index0 }}">
     {% if r.description_en %}<div class="desc-en">{{ r.description_en }}</div>{% else %}<div class="desc-en na">（本仓库暂无描述）</div>{% endif %}

@@ -192,3 +192,17 @@ def test_follow_section_on_weekly(client):
     text = client.get("/").text
     assert "我的关注（1）" in text
     assert "a/go" in text
+
+
+def test_star_buttons_wired(client):
+    """T-009 接线：星标启用（不再 disabled）、带 data-repo 与关注/取消关注 title；toast 容器就位。"""
+    text = client.get("/total").text
+    assert "关注功能开发中" not in text  # T-008 禁用态文案已移除
+    assert "disabled" not in text  # 星标不再带 disabled 属性
+    assert 'data-repo="a/py"' in text  # 未关注 → JS 据此 POST 关注
+    assert 'class="star on" data-repo="a/go"' in text  # 已关注 → 实心＋取消关注态
+    assert 'title="关注"' in text
+    assert 'title="取消关注"' in text
+    assert 'id="toasts"' in text  # toast 容器（关注/取消反馈）每页就位
+    text = client.get("/").text
+    assert 'id="follows-sec" data-as-of="' in text  # 关注区带页面 as_of：API 渲染新卡沿用同窗口径

@@ -1,26 +1,36 @@
-"""T-008 榜单页面（SSR）：本周报告（含历史周次切换）/ 季度回顾 / 总星榜。
+"""T-008 榜单页面（SSR）＋ T-009 关注 API：本周报告（含历史周次切换）/ 季度回顾 / 总星榜 / 关注写端点。
 
 职责边界（任务书钉死，越界打回）：
 - 榜单口径全部委托 app.report.compute_boards / compute_repo_deltas（《架构决策记录》决策 3/4 唯一实现），本层不重算；
 - 本层只做：URL 期次参数 → as_of 换算、首期空态降级（《交互流程说明》§4）、展示格式化（数字/颜色/锚点）；
-- 写操作一律不在本层：关注 T-009、标签增删与结果页 T-010、推荐理由生成 T-011；
-  本层对 follows / recommendations / tags 三张表只读展示。
+- 写操作本层仅有关注（T-009）：三态分流与动态入池在 app.follows / app.collector.snapshot，本层只做
+  输入校验、HTTP 状态码映射与关注卡局部渲染；标签增删与结果页 T-010、推荐理由生成 T-011 不在本层；
+  本层对 recommendations / tags 两张表只读展示。
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
+from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from app.classify import load_topics
-from app.config import BASE_DIR
+from app.collector.github import (
+    GitHubAuthError,
+    GitHubClient,
+    GitHubError,
+    GitHubNotFoundError,
+)
+from app.config import BASE_DIR, get_settings
 from app.db import get_conn
+from app.follows import follow_repo, unfollow_repo
 from app.report import Board, ReportRow, compute_boards, compute_repo_deltas
 
 _WEB_DIR = Path(__file__).resolve().parent
@@ -236,10 +246,14 @@ def _endpoint_stars(conn: sqlite3.Connection, repo_id: int, before: str) -> int 
 
 
 def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_of: str) -> list[dict]:
-    """我的关注（流程说明 §2 第 2 层）：增量取周口径 deltas；dead 仓库被 compute_repo_deltas 剔除，端点星数单独补取。"""
+    """我的关注（流程说明 §2 第 2 层）：增量取周口径 deltas；dead 仓库被 compute_repo_deltas 剔除，端点星数单独补取。
+
+    中-2 转办落地（T-009）：只对关注集算增量（repo_ids 过滤），不再全池复算——
+    6.4 万仓全池逐仓端点查询 ≈ 秒级/页，关注集通常个位数到几十。
+    """
     if not follow_rows:
         return []
-    deltas = compute_repo_deltas(conn, period="week", as_of=as_of)
+    deltas = compute_repo_deltas(conn, period="week", as_of=as_of, repo_ids=[r["id"] for r in follow_rows])
     cards = []
     for r in follow_rows:
         info = deltas.get(r["id"])
@@ -369,6 +383,7 @@ def _boards_context(
             "meta": _meta(conn, period, as_of_date),  # 窗口/口径按请求期次展示，不因降级改写成总星榜口径
             "notice": notice,
             "follows": follows,
+            "page_as_of": as_of,  # 关注区局部刷新口径：关注 API 渲染新卡沿用页面同窗 as_of（T-008 语义）
             "lang_boards": lang_boards,
             "topic_boards": topic_boards,
         }
@@ -424,3 +439,113 @@ def total(request: Request) -> HTMLResponse:
             show_follows=False,
         ),
     )
+
+
+# ===== 关注 API（T-009；决策 9 动态入池；三态分流在 app.follows） =====
+
+# owner/repo 字符集（GitHub 惯例：字母数字与 -_.）；长度上限 = owner 39 + "/" + repo 100
+_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_FULL_NAME_MAX_LEN = 140
+
+
+async def _github_client() -> AsyncIterator[GitHubClient]:
+    """请求级 GitHub 客户端（关注动态入池唯一外呼点）：token 空/无效由客户端在使用点报清晰错误。
+
+    依赖注入形态（Depends）：单测用 app.dependency_overrides 换假 client，不打真 API。
+    """
+    client = GitHubClient(get_settings().github_token)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+def _parse_full_name(raw: object) -> str:
+    """full_name 入参校验：非法形态直接 400（fail-loud，不把垃圾输入带去打 GitHub）。"""
+    if not isinstance(raw, str) or not _FULL_NAME_RE.fullmatch(raw) or len(raw) > _FULL_NAME_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"full_name 应为 owner/repo 形态，收到：{raw!r}")
+    return raw
+
+
+def _parse_as_of(raw: object) -> str | None:
+    """as_of 可选入参：缺省 None（取当前 UTC）；给了必须符合 UTC 定长硬约定，否则 400。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail=f"as_of 应为 UTC 定长 ISO（YYYY-MM-DDTHH:MM:SSZ），收到：{raw!r}")
+    try:
+        datetime.strptime(raw, _ISO_FMT)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"as_of 应为 UTC 定长 ISO（YYYY-MM-DDTHH:MM:SSZ），收到：{raw!r}"
+        ) from None
+    return raw
+
+
+def _follow_card_html(conn: sqlite3.Connection, repo_id: int, as_of: str) -> str | None:
+    """渲染单张关注卡（关注成功后前端局部插入关注区）：卡片数据与页面关注区同窗同口径。"""
+    row = conn.execute("SELECT r.id, r.full_name, r.dead FROM repos r WHERE r.id = ?", (repo_id,)).fetchone()
+    if row is None:
+        return None  # 防御：刚写入的行不会缺；缺了也不让关注请求整体失败
+    cards = _follow_cards(conn, [row], as_of)
+    return templates.get_template("_follow_card.html").render({"f": cards[0]})
+
+
+@router.post("/api/follows")
+async def api_follow(request: Request, client: GitHubClient = Depends(_github_client)) -> dict:
+    """关注一个仓库（三态：已入池只补 follows / dead 复活＋基线 / 未入池动态入池）。
+
+    请求体 JSON：{"full_name": "owner/repo", "as_of": 可选（页面关注区同窗口径，缺省当前 UTC）}。
+    幂等：重复关注返回 already_followed=true，库内零变化。
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo"}') from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo"}')
+    full_name = _parse_full_name(payload.get("full_name"))
+    as_of = _parse_as_of(payload.get("as_of")) or datetime.now(timezone.utc).strftime(_ISO_FMT)
+    conn = get_conn()
+    try:
+        try:
+            outcome = await follow_repo(conn, client, full_name)
+        except GitHubNotFoundError:
+            raise HTTPException(
+                status_code=404, detail=f"GitHub 上找不到仓库 {full_name}（不存在/已删除/转私有）"
+            ) from None
+        except GitHubAuthError as exc:
+            # token 配置问题（服务端侧）：message 自带修复指引，原样透传给本人
+            raise HTTPException(status_code=500, detail=str(exc)) from None
+        except GitHubError as exc:
+            raise HTTPException(status_code=502, detail=f"GitHub 请求失败：{exc}") from None
+        except ValueError as exc:
+            # node_id 撞库（改名仓库）：已回滚无半写，409 让本人知情处置
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        return {
+            "full_name": outcome.full_name,
+            "followed": True,
+            "state": outcome.state,
+            "already_followed": outcome.already_followed,
+            "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
+            "card_html": None if outcome.already_followed else _follow_card_html(conn, outcome.repo_id, as_of),
+        }
+    finally:
+        conn.close()
+
+
+@router.delete("/api/follows/{full_name:path}")
+def api_unfollow(full_name: str) -> dict:
+    """取消关注：只删 follows 行（跟踪保留）；未关注/不存在的仓库幂等成功（removed=false）。"""
+    full_name = _parse_full_name(full_name)
+    conn = get_conn()
+    try:
+        removed = unfollow_repo(conn, full_name)
+        return {
+            "full_name": full_name,
+            "followed": False,
+            "removed": removed,
+            "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
+        }
+    finally:
+        conn.close()

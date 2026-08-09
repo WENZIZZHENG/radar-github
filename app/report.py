@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -102,14 +103,21 @@ def _endpoint_snapshot(conn: sqlite3.Connection, repo_id: int, before: str) -> s
     return conn.execute(_ENDPOINT_SQL, (repo_id, before)).fetchone()
 
 
+# 指定 repo_ids 过滤时按 full_name 反查的分块大小：防御旧编译 SQLite 的 999 变量上限（与 snapshot 同口径）
+_REPO_FILTER_CHUNK = 500
+
+
 def compute_repo_deltas(
-    conn: sqlite3.Connection, *, period: str, as_of: str | None = None
+    conn: sqlite3.Connection, *, period: str, as_of: str | None = None, repo_ids: Collection[int] | None = None
 ) -> dict[int, RepoDelta]:
     """逐 alive 仓库计算指定口径的增量结果，返回 {repo_id: RepoDelta}。
 
     - period="week"/"quarter"：两端快照差 + 滑动窗口校验，缺席记 absent_reason=ABSENT_FIRST_WEEK；
     - period="total"：只取最新端点星数，无增量（delta/window_days 恒 None）；
     - as_of 缺省取当前 UTC；指定历史 as_of 即回看历史周次（P2 页面的切换依据）；
+    - repo_ids 缺省 None＝全池 alive（既有行为）；传入集合则只算这些仓库——"我的关注"区只复算关注集
+      （T-008 评审中-2 转办，T-009 落地）：6.4 万仓全池逐仓端点查询是秒级/页浪费；
+      dead 剔除口径不变：传入集合中的 dead 仓库同样不进结果（调用方按缺席口径自行补端点星数）；
     - as_of 之前无任何快照的仓库不在返回 dict 中（无总星数可展示，任何榜都安放不了）。
 
     公开给页面层："我的关注"区需要逐仓库判断首周缺席（显示"——"）而非混入 0 增量。
@@ -120,9 +128,18 @@ def compute_repo_deltas(
     as_of_dt = _parse_iso(as_of)  # 顺带校验调用方给的 as_of 符合定长硬约定
 
     # dead=0 过滤下推 SQL：死库连端点查询都不必做（决策 4 剔除榜单）
-    repo_ids = [row["id"] for row in conn.execute("SELECT id FROM repos WHERE dead = 0")]
+    if repo_ids is None:
+        ids = [row["id"] for row in conn.execute("SELECT id FROM repos WHERE dead = 0")]
+    else:
+        ids = []
+        requested = list(repo_ids)
+        for offset in range(0, len(requested), _REPO_FILTER_CHUNK):
+            chunk = requested[offset : offset + _REPO_FILTER_CHUNK]
+            placeholders = ", ".join("?" * len(chunk))
+            rows = conn.execute(f"SELECT id FROM repos WHERE dead = 0 AND id IN ({placeholders})", chunk)
+            ids.extend(row["id"] for row in rows)
     result: dict[int, RepoDelta] = {}
-    for repo_id in repo_ids:
+    for repo_id in ids:
         end = _endpoint_snapshot(conn, repo_id, as_of)
         if end is None:
             continue
