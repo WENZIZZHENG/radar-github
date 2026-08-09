@@ -59,7 +59,7 @@ def _seed_full(conn):
     )
     conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_go, "2026-08-02T00:00:00Z"))
     # 推荐语按 as_of 所在 ISO 周取数：周 key 必须与"今天"同周，否则 /total 面板取不到
-    iso = date.today().isocalendar()
+    iso = datetime.now(timezone.utc).date().isocalendar()  # UTC 口径锁死：与应用 routes.py now(timezone.utc) 一致；本地 date.today() 在周一清晨（UTC 仍周日）会错开一周必红
     conn.execute(
         "INSERT INTO recommendations (repo_id, report_week, text) VALUES (?, ?, ?)",
         (repo_py, f"{iso.year}-W{iso.week:02d}", "本周亮点：测试推荐语"),
