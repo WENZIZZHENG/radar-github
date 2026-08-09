@@ -1,28 +1,7 @@
-{# 单张榜：榜头（分类名 + 实际数量 + 回顶部）+ 项目行（紧凑单行）+ 详情面板（默认全部展开，D1/D3 v1.1） #}
+{# 单张榜：榜头（分类名 + 实际数量 + 回顶部）+ 项目行（紧凑单行，_row.html 与 P6 共用）+ 详情面板（默认全部展开，D1/D3 v1.1） #}
 <div class="board" id="{{ b.anchor }}">
   <h3>{{ b.label }}<span class="n">Top {{ b.rows | length }}</span><a class="top" href="#top">回顶部 <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg></a></h3>
-  {% for r in b.rows %}
-  <div class="row expanded" data-b="{{ b.anchor }}" data-i="{{ loop.index0 }}" tabindex="0" role="button" aria-expanded="true">
-    <span class="rank">{{ r.rank }}</span>
-    <span class="repo-wrap"><span class="repo" title="{{ r.full_name }}">{{ r.full_name }}</span><svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></span>
-    {% if r.language %}<span class="badge"><span class="dot" style="background:{{ r.lang_color }}"></span>{{ r.language }}</span>{% endif %}
-    {% if r.delta_text is not none %}<span class="up{% if r.delta_neg %} neg{% endif %}">{{ r.delta_text }}</span>{% endif %}
-    <span class="total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{{ r.stars_text }}</span>
-    {# 关注星标（T-009 已接线）：data-repo 供 JS 调关注 API；同一仓库跨榜重复时全部星标联动切换 #}
-    <button class="star{% if r.followed %} on{% endif %}" data-repo="{{ r.full_name }}" title="{% if r.followed %}取消关注{% else %}关注{% endif %}" aria-label="{% if r.followed %}取消关注{% else %}关注{% endif %}">{% if r.followed %}<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{% else %}<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{% endif %}</button>
-  </div>
-  <div class="panel open" data-b="{{ b.anchor }}" data-i="{{ loop.index0 }}">
-    {% if r.description_en %}<div class="desc-en">{{ r.description_en }}</div>{% else %}<div class="desc-en na">（本仓库暂无描述）</div>{% endif %}
-    {% if r.description_zh %}<div class="desc-zh">{{ r.description_zh }}</div>{% endif %}
-    {% if r.reason %}<div class="reason"><b>推荐理由</b>{{ r.reason }}</div>{% endif %}
-    {% if r.window_note %}<div class="window-note">{{ r.window_note }}</div>{% endif %}
-    <div class="acts">
-      <a class="gh" href="https://github.com/{{ r.full_name }}" target="_blank" rel="noopener noreferrer">在 GitHub 打开 <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5.5"/></svg></a>
-      {# 标签只读展示：增删按钮与标签结果页跳转归 T-010 #}
-      {% for t in r.tags %}<span class="tag">{{ t }}</span>{% endfor %}
-    </div>
-  </div>
-  {% else %}
+  {% for r in b.rows %}{% set anchor = b.anchor %}{% set idx = loop.index0 %}{% include "_row.html" %}{% else %}
   {# 空榜也渲染板块（示意图口径：0 也列出板块） #}
   <p class="board-empty">本期暂无数据</p>
   {% endfor %}

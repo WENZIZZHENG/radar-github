@@ -1,6 +1,8 @@
 // T-008 榜单页交互：行详情默认全部展开（D1/D3 v1.1），单击只折叠/再展开本行，各行独立。
-// T-009 关注星标接线（决策 9 动态入池）：点击 → fetch 关注/取消 JSON API → toast＋星标态＋关注区即时更新；
+// T-009 关注星标接线（决策 9 动态入池）：点击 → fetch 关注/取消 JSON API → toast＋星标态即时更新；
 // 乐观切换星标态（流程说明 §0：<100ms 可见反馈），失败回滚原态并报错 toast。标签仍只读（T-010 接线）。
+// T-015（v1.3 关注独立页 P6）：关注/取消后顶栏计数徽标以服务端 follow_count 局部更新（不再往页面插卡）；
+// P6 页内点 ★ 取消 → 该行＋详情面板即时移除，组空连组块移除，全空 reload 出空态。
 const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 
@@ -32,25 +34,27 @@ function setAllStars(repo, on) {
   document.querySelectorAll('.star[data-repo="' + repo + '"]').forEach((s) => setStar(s, on));
 }
 
-function updateFollowSection(repo, on, data) {
-  const title = document.getElementById("follows-title");
-  if (title && typeof data.follow_count === "number") title.textContent = "我的关注（" + data.follow_count + "）";
-  const row = document.getElementById("follow-row");
-  if (!row) return; // 季度/总星页无关注区：星标已切换，回到周报页自然呈现
-  const empty = document.getElementById("follows-empty");
-  if (on) {
-    if (data.card_html && !row.querySelector('.fcard[data-repo="' + repo + '"]')) {
-      row.insertAdjacentHTML("beforeend", data.card_html); // 服务端渲染新卡，卡面与 SSR 同模板
-    }
-    row.hidden = false;
-    if (empty) empty.hidden = true;
-  } else {
-    const card = row.querySelector('.fcard[data-repo="' + repo + '"]');
-    if (card) card.remove();
-    if (!row.children.length) {
-      row.hidden = true;
-      if (empty) empty.hidden = false;
-    }
+// 顶栏计数徽标局部更新（流程说明 §3.2：+1/-1 无需刷新）：直接采用服务端 follow_count 真值——
+// 幂等响应（already_followed=true / removed=false）计数自然不变，前端不必判分支
+function updateFollowCount(data) {
+  if (typeof data.follow_count !== "number") return;
+  const badge = document.getElementById("nav-follow-count");
+  if (badge) badge.textContent = String(data.follow_count);
+  const total = document.getElementById("follow-total"); // P6 元信息行"关注 N 个仓库"，同口径联动
+  if (total) total.textContent = String(data.follow_count);
+}
+
+// P6 页内点 ★ 取消关注（流程说明 §3.2）：该行＋详情面板即时从 DOM 移除；组空连组块移除；全空 reload 出空态
+function removeFollowRow(star) {
+  const row = star.closest(".row");
+  if (!row || !row.closest("#follow-boards")) return; // 非 P6 页面：行保留，星标已切换即可
+  const panel = document.querySelector(`.panel[data-b="${row.dataset.b}"][data-i="${row.dataset.i}"]`);
+  const board = row.closest(".board");
+  if (panel) panel.remove();
+  row.remove();
+  if (board && !board.querySelector(".row")) {
+    board.remove();
+    if (!document.querySelector("#follow-boards .board")) location.reload(); // 全空 → 空态（任务书允许 reload 简化）
   }
 }
 
@@ -58,14 +62,13 @@ async function toggleFollow(star) {
   const repo = star.dataset.repo;
   const on = !star.classList.contains("on");
   setAllStars(repo, on); // 乐观切换；失败整体回滚
-  const sec = document.getElementById("follows-sec");
   try {
     let resp;
     if (on) {
       resp = await fetch("/api/follows", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ full_name: repo, as_of: sec ? sec.dataset.asOf : null }),
+        body: JSON.stringify({ full_name: repo }),
       });
     } else {
       resp = await fetch("/api/follows/" + repo.split("/").map(encodeURIComponent).join("/"), { method: "DELETE" });
@@ -73,9 +76,10 @@ async function toggleFollow(star) {
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
     toast(on ? "已关注（未入池仓库将即时抓基线，下周起有增量）" : "已取消关注（跟踪保留）");
-    updateFollowSection(repo, on, data);
+    updateFollowCount(data);
+    if (!on) removeFollowRow(star); // 行移除放在成功之后：失败时行仍在、星标回滚原态
   } catch (err) {
-    setAllStars(repo, !on); // 失败回滚原态（流程说明 §3.2）
+    setAllStars(repo, !on); // 失败回滚原态（流程说明 §3.2）；计数只在成功后动过，无需回滚
     toast((on ? "关注失败：" : "取消关注失败：") + err.message, true);
   }
 }

@@ -19,20 +19,7 @@
 {# 首期/缺席降级提示条（流程说明 §4）：增量榜全缺席时显示总星榜 + 明确提示 #}
 {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 
-{# 第 2 层：我的关注（仅周报页；follows=None 时整层不渲染）。
-   follow-row / 空态提示恒渲染、按 hidden 切换：T-009 关注/取消后前端局部增删卡片，无需整页刷新；
-   data-as-of 供关注 API 渲染新卡沿用本页窗口（历史周次页关注后新卡增量与页面同窗） #}
-{% if follows is not none %}
-<section id="follows-sec" data-as-of="{{ page_as_of }}">
-  <h2 class="sec" id="follows-title">我的关注（{{ follows | length }}）</h2>
-  <div class="follow-row" id="follow-row"{% if not follows %} hidden{% endif %}>
-    {% for f in follows %}{% include "_follow_card.html" %}{% endfor %}
-  </div>
-  <p class="empty-follows" id="follows-empty"{% if follows %} hidden{% endif %}>暂无关注：点榜单行右侧 ☆ 关注后，该项目每周增量会置顶显示在这里。</p>
-</section>
-{% endif %}
-
-{# 第 3 层：锚点导航 chips（榜内数量徽标） #}
+{# 第 2 层：锚点导航 chips（榜内数量徽标）。v1.3：原第 2 层"我的关注"已移出为独立页 P6（/follows，顶栏导航进入） #}
 <section>
   <h2 class="sec">榜单直达</h2>
   <div class="chips">
@@ -43,7 +30,7 @@
   </div>
 </section>
 
-{# 第 4/5 层：榜单区（17 榜直出，顺序 = compute_boards 返回顺序；空榜也渲染板块） #}
+{# 第 3/4 层：榜单区（17 榜直出，顺序 = compute_boards 返回顺序；空榜也渲染板块）＋项目行 #}
 <section>
   <h2 class="sec">语言榜单</h2>
   <div class="boards">

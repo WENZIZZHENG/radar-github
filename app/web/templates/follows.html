@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+{# P6 我的关注（v1.3 独立页，流程说明 §2A 三层）：元信息行 → 分组区（按语言，空组不渲染）→ 项目行（_row.html 与榜单行共用） #}
+<p class="meta">窗口：{{ meta.window }}，与当期周报同口径 · 关注 <b class="mono" id="follow-total">{{ follow_count }}</b> 个仓库 · 按语言分组 · 组内按当周增量降序</p>
+
+{% if groups %}
+<section>
+  <h2 class="sec">我的关注</h2>
+  {# id="follow-boards"：radar.js 据以识别 P6 页面，页内取消关注时即时移除该行（组空连组块移除） #}
+  <div class="boards" id="follow-boards">
+    {% for g in groups %}
+    <div class="board" id="{{ g.anchor }}">
+      <h3>{{ g.label }}<span class="n">{{ g.rows | length }} 个关注</span></h3>
+      {% for r in g.rows %}{% set anchor = g.anchor %}{% set idx = loop.index0 %}{% include "_row.html" %}{% endfor %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% else %}
+{# 空关注空态（流程说明 §4：空态必须回答"接下来会发生什么"）＋回首页链接 #}
+<p class="empty-follows">还没有关注任何项目：去榜单点行右侧 ☆，该项目每周增量会出现在这里。<a href="/">回首页</a></p>
+{% endif %}
+{% endblock %}

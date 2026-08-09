@@ -106,32 +106,7 @@ h2.sec::before {
 }
 h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 
-/* ===== 第 2 层：我的关注（横向卡片条，可横滚） ===== */
-.follow-row { display: flex; gap: var(--s3); overflow-x: auto; padding-bottom: var(--s2); scrollbar-width: thin; }
-.follow-row::-webkit-scrollbar { height: 8px; }
-.follow-row::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 4px; }
-.fcard {
-  min-width: 244px; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-l);
-  padding: var(--s3) 14px; transition: border-color var(--t-fast) ease;
-}
-.fcard:hover { border-color: var(--line-strong); }
-.fcard .f-repo {
-  display: block; font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; color: var(--text-1);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.fcard .f-stats { display: flex; align-items: baseline; gap: 7px; margin-top: 5px; }
-.fcard .f-delta { font-family: var(--font-mono); font-size: 17px; font-weight: 700; color: var(--accent-hi); }
-.fcard .f-delta.na { font-size: 13px; color: var(--text-3); font-weight: 500; }
-.fcard .f-note { font-size: 11px; color: var(--text-3); }
-.fcard .f-total { margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--text-3); display: inline-flex; align-items: center; gap: 4px; }
-.fcard .f-total svg { opacity: .75; }
-.fcard.dead { opacity: .55; border-style: dashed; }
-.fcard .dead-tag {
-  font-size: 10.5px; border: 1px solid var(--line-strong); border-radius: var(--r-pill);
-  padding: 0 7px; color: var(--text-3); margin-left: 6px; vertical-align: 1px;
-}
-
-/* ===== 第 3 层：锚点导航 chip（带榜内数量徽标） ===== */
+/* ===== 第 2 层：锚点导航 chip（带榜内数量徽标） ===== */
 .chips { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
 .chips .grp { font-size: 12px; color: var(--text-3); letter-spacing: .06em; margin-right: 2px; }
 .chip {
@@ -283,7 +258,6 @@ footer.note { margin-top: var(--s6); font-size: 12px; line-height: 1.7; color: v
   .panel { padding: 10px var(--s3) var(--s3) 28px; }
   .chip { min-height: 36px; }
   nav.tabs a { min-height: 40px; }
-  .fcard { min-width: 220px; }
 }
 
 /* 减弱动效偏好：关闭全部过渡/动画与平滑滚动 */
@@ -325,5 +299,23 @@ nav.tabs .off {
 /* toast 报错态（关注/取消失败，流程说明 §3.2：toast 报错）：侧条换警示红，与成功绿区分语义 */
 .toast.err { border-left-color: var(--destructive); }
 
-/* hidden 属性兜底：.follow-row 的 display:flex 优先级高于 UA 的 [hidden] 规则，必须显式压制 */
-#follow-row[hidden], #follows-empty[hidden] { display: none; }
+/* ===== T-015 追加（P6 我的关注独立页＋顶栏计数徽标；样式照抄示意图 v4，一律复用 :root token） ===== */
+
+/* 顶栏"我的关注"计数徽标（示意图 v4：复用 chip 徽标的 muted pill 语义） */
+nav.tabs a i {
+  font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
+  background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px; margin-left: 6px;
+}
+nav.tabs a.active i { color: var(--text-2); }
+
+/* P6 dead 仓库行：整行灰显＋"已失效"标（沉组尾，v1.3 §2A） */
+.row.dead { opacity: .55; }
+.row.dead .repo { color: var(--text-3); }
+.row .dead-tag {
+  font-size: 10.5px; border: 1px solid var(--line-strong); border-radius: var(--r-pill);
+  padding: 0 7px; color: var(--text-3); margin-left: 6px; vertical-align: 1px; white-space: nowrap;
+}
+/* P6 无增量（新入池首周）/dead：up 列退化为灰字说明（沉组尾，v1.3 §2A） */
+.row .up.na { font-size: 11px; color: var(--text-3); font-weight: 500; }
+/* P6 空态里的回首页链接：弱文字块中点出可点性 */
+.empty-follows a { color: var(--blue); }

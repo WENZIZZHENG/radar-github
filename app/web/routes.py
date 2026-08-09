@@ -1,11 +1,12 @@
-"""T-008 榜单页面（SSR）＋ T-009 关注 API：本周报告（含历史周次切换）/ 季度回顾 / 总星榜 / 关注写端点。
+"""T-008 榜单页面（SSR）＋ T-009 关注 API ＋ T-015 关注独立页 P6：本周报告（含历史周次切换）/ 季度回顾 / 总星榜 / 我的关注 / 关注写端点。
 
 职责边界（任务书钉死，越界打回）：
 - 榜单口径全部委托 app.report.compute_boards / compute_repo_deltas（《架构决策记录》决策 3/4 唯一实现），本层不重算；
 - 本层只做：URL 期次参数 → as_of 换算、首期空态降级（《交互流程说明》§4）、展示格式化（数字/颜色/锚点）；
+- P6 我的关注（v1.3 独立页）：增量复用 compute_repo_deltas 关注集过滤，本层只做分组与组内/组间排序；
 - 写操作本层仅有关注（T-009）：三态分流与动态入池在 app.follows / app.collector.snapshot，本层只做
-  输入校验、HTTP 状态码映射与关注卡局部渲染；标签增删与结果页 T-010、推荐理由生成 T-011 不在本层；
-  本层对 recommendations / tags 两张表只读展示。
+  输入校验与 HTTP 状态码映射（v1.3 起响应不再带 card_html——P1 关注区已移出，无可插入区域）；
+  标签增删与结果页 T-010、推荐理由生成 T-011 不在本层；本层对 recommendations / tags 两张表只读展示。
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from app.classify import load_topics
+from app.classify import LANGUAGES, OTHER_LANGUAGE_KEY, classify_language, load_topics
 from app.collector.github import (
     GitHubAuthError,
     GitHubClient,
@@ -63,6 +64,9 @@ LANG_COLORS = {
     "Scala": "#d05a4d",
 }
 _DEFAULT_LANG_COLOR = "#8b98a9"
+
+# 语言 key → GitHub 精确名（LANGUAGES 的反向映射）：P6 分组块头展示用；"其它语言"组单独给中文名
+_LANG_KEY_TO_NAME = {v: k for k, v in LANGUAGES.items()}
 
 _topic_table_cache: dict | None = None
 
@@ -246,7 +250,7 @@ def _endpoint_stars(conn: sqlite3.Connection, repo_id: int, before: str) -> int 
 
 
 def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_of: str) -> list[dict]:
-    """我的关注（流程说明 §2 第 2 层）：增量取周口径 deltas；dead 仓库被 compute_repo_deltas 剔除，端点星数单独补取。
+    """P6 我的关注页行数据（流程说明 §2A）：增量取当期周报同窗口周口径；dead 仓库被 compute_repo_deltas 剔除，端点星数单独补取。
 
     中-2 转办落地（T-009）：只对关注集算增量（repo_ids 过滤），不再全池复算——
     6.4 万仓全池逐仓端点查询 ≈ 秒级/页，关注集通常个位数到几十。
@@ -258,16 +262,77 @@ def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_o
     for r in follow_rows:
         info = deltas.get(r["id"])
         stars = info.stars if info is not None else _endpoint_stars(conn, r["id"], as_of)
-        delta_text = _fmt_delta(info.delta) if info is not None and info.delta is not None else None
+        delta = info.delta if info is not None else None
+        window_note = None
+        if info is not None and info.window_days is not None and abs(info.window_days - _NOMINAL_DAYS["week"]) > 0.05:
+            # 与榜单行同一标注口径（决策 4：窗口异常必须标注实际天数）
+            window_note = f"实际窗口 {info.window_days:g} 天（取最近可得两端快照）"
         cards.append(
             {
                 "full_name": r["full_name"],
+                "language": r["language"],
+                "description_en": r["description_en"],
                 "dead": bool(r["dead"]),
-                "delta_text": delta_text,  # None → 首周缺席口径：模板渲染"—— 下周起有数据"
+                "delta": delta,  # None → 首周缺席/dead：up 列退化灰字（排序时沉组尾）
+                "delta_text": _fmt_delta(delta) if delta is not None else None,
+                "delta_neg": delta is not None and delta < 0,
                 "stars_text": None if stars is None else _fmt_stars(stars),
+                "window_note": window_note,
             }
         )
     return cards
+
+
+def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> list[dict]:
+    """P6 分组区（流程说明 §2A）：按语言分 7 组（classify_language 同口径；空组不进结果即不渲染）。
+
+    组内三态排序：正常行按当周增量降序 → 无增量行（"—— 下周起有数据"）→ dead 行（灰显"已失效"）沉尾；
+    组间按组内最大当周增量降序（全是无增量/dead 的组按 0 沉后，稳定排序保持关注先后）。
+    """
+    by_lang: dict[str, list[dict]] = {}
+    for c in cards:
+        by_lang.setdefault(classify_language(c["language"]), []).append(c)
+    groups = []
+    for key, rows in by_lang.items():
+        normal = sorted((r for r in rows if not r["dead"] and r["delta"] is not None), key=lambda r: -r["delta"])
+        na = [r for r in rows if not r["dead"] and r["delta"] is None]
+        dead = [r for r in rows if r["dead"]]
+        view_rows = []
+        for i, r in enumerate(normal + na + dead):
+            up_na_text = None
+            if r["dead"]:
+                up_na_text = "——"
+            elif r["delta_text"] is None:
+                up_na_text = "—— 下周起有数据"
+            view_rows.append(
+                {
+                    "rank": i + 1,  # 组内序号（示意图口径：rank 为组内排名）
+                    "full_name": r["full_name"],
+                    "language": r["language"],
+                    "lang_color": LANG_COLORS.get(r["language"] or "", _DEFAULT_LANG_COLOR),
+                    "dead": r["dead"],
+                    "delta_text": r["delta_text"],
+                    "delta_neg": r["delta_neg"],
+                    "up_na_text": up_na_text,
+                    "stars_text": r["stars_text"],
+                    "followed": True,  # P6 行恒为已关注（金色★ on；点击即取消并移除该行）
+                    "description_en": r["description_en"],
+                    "description_zh": zh.get(r["full_name"]),
+                    "reason": reasons.get(r["full_name"]),  # None → 无推荐语块（AI 降级形态）
+                    "tags": tags.get(r["full_name"], []),
+                    "window_note": r["window_note"],
+                }
+            )
+        groups.append(
+            {
+                "anchor": f"f-{key}",
+                "label": "其它语言" if key == OTHER_LANGUAGE_KEY else _LANG_KEY_TO_NAME[key],
+                "best": normal[0]["delta"] if normal else 0,  # 组间排序键：组内最大增量；无增量/dead 组按 0
+                "rows": view_rows,
+            }
+        )
+    groups.sort(key=lambda g: -g["best"])
+    return groups
 
 
 def _display_maps(conn: sqlite3.Connection, as_of_date: date) -> tuple[dict, dict, dict]:
@@ -307,6 +372,8 @@ def _row_view(rank: int, row: ReportRow, *, period: str, followed: set, reasons:
         "full_name": row.full_name,
         "language": row.language,
         "lang_color": LANG_COLORS.get(row.language or "", _DEFAULT_LANG_COLOR),
+        "dead": False,  # 榜单行无 dead/无增量形态（dead 剔除、首周缺席不上榜）；P6 行才有，供 _row.html 分支
+        "up_na_text": None,
         "delta_text": delta_text,  # None → 总星榜行不渲染增量列（无增量概念，非"——"）
         "delta_neg": delta_neg,
         "stars_text": _fmt_stars(row.stars),
@@ -336,9 +403,8 @@ def _boards_context(
     as_of: str,
     as_of_date: date,
     now: datetime,
-    show_follows: bool,
 ) -> dict:
-    """三页面共用的上下文装配：榜单（含首期空态降级）→ 关注区 → 元信息 → 期次控件。
+    """三页面共用的上下文装配：榜单（含首期空态降级）→ 元信息 → 期次控件。
 
     DB 连接请求级获取/关闭（不持全局长连接）；WAL 下读榜单不阻塞每日采集写入。
     """
@@ -353,12 +419,9 @@ def _boards_context(
             effective_period = "total"
             notice = _fallback_notice(conn, period, label, as_of_date, any(b.rows for b in boards))
 
-        follow_rows = conn.execute(
-            "SELECT r.id, r.full_name, r.dead FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
-        ).fetchall()
+        # 关注集只取两处展示用途：行内星标 on/off 态、顶栏"我的关注"计数徽标（v1.3 起关注区在 P6 独立页）
+        follow_rows = conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id").fetchall()
         followed = {r["full_name"] for r in follow_rows}
-        # 关注区置顶仅属周报页（流程说明 §2 五层是 P1 结构；P3/P4"布局同 P1 榜单区"不含关注区）
-        follows = _follow_cards(conn, follow_rows, as_of) if show_follows else None
 
         reasons, zh, tags = _display_maps(conn, as_of_date)
         row_ctx = {"period": effective_period, "followed": followed, "reasons": reasons, "zh": zh, "tags": tags}
@@ -382,8 +445,7 @@ def _boards_context(
             "switcher": switcher,
             "meta": _meta(conn, period, as_of_date),  # 窗口/口径按请求期次展示，不因降级改写成总星榜口径
             "notice": notice,
-            "follows": follows,
-            "page_as_of": as_of,  # 关注区局部刷新口径：关注 API 渲染新卡沿用页面同窗 as_of（T-008 语义）
+            "follow_count": len(follow_rows),
             "lang_boards": lang_boards,
             "topic_boards": topic_boards,
         }
@@ -402,9 +464,7 @@ def weekly(request: Request, week: str | None = None) -> HTMLResponse:
     return templates.TemplateResponse(
         request=request,
         name="boards.html",
-        context=_boards_context(
-            request, period="week", label=label, as_of=as_of, as_of_date=as_of_date, now=now, show_follows=True
-        ),
+        context=_boards_context(request, period="week", label=label, as_of=as_of, as_of_date=as_of_date, now=now),
     )
 
 
@@ -416,9 +476,7 @@ def quarterly(request: Request, quarter: str | None = None) -> HTMLResponse:
     return templates.TemplateResponse(
         request=request,
         name="boards.html",
-        context=_boards_context(
-            request, period="quarter", label=label, as_of=as_of, as_of_date=as_of_date, now=now, show_follows=False
-        ),
+        context=_boards_context(request, period="quarter", label=label, as_of=as_of, as_of_date=as_of_date, now=now),
     )
 
 
@@ -436,9 +494,39 @@ def total(request: Request) -> HTMLResponse:
             as_of=now.strftime(_ISO_FMT),
             as_of_date=now.date(),
             now=now,
-            show_follows=False,
         ),
     )
+
+
+@router.get("/follows", response_class=HTMLResponse)
+def follows_page(request: Request) -> HTMLResponse:
+    """P6 我的关注（v1.3 独立页）：关注仓库按语言分组，增量与当期周报同窗口（as_of=now 周口径）。
+
+    无期次概念（不跟周次切换走）；空关注时渲染空态引导（流程说明 §4），分组/排序口径在 _follow_groups。
+    """
+    now = datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        follow_rows = conn.execute(
+            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead"
+            " FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
+        ).fetchall()
+        cards = _follow_cards(conn, follow_rows, now.strftime(_ISO_FMT))
+        reasons, zh, tags = _display_maps(conn, now.date())
+        return templates.TemplateResponse(
+            request=request,
+            name="follows.html",
+            context={
+                "request": request,
+                "page": "follows",  # 顶栏 active 态
+                "title": "我的关注",
+                "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
+                "follow_count": len(follow_rows),
+                "groups": _follow_groups(cards, reasons, zh, tags),
+            },
+        )
+    finally:
+        conn.close()
 
 
 # ===== 关注 API（T-009；决策 9 动态入池；三态分流在 app.follows） =====
@@ -482,20 +570,12 @@ def _parse_as_of(raw: object) -> str | None:
     return raw
 
 
-def _follow_card_html(conn: sqlite3.Connection, repo_id: int, as_of: str) -> str | None:
-    """渲染单张关注卡（关注成功后前端局部插入关注区）：卡片数据与页面关注区同窗同口径。"""
-    row = conn.execute("SELECT r.id, r.full_name, r.dead FROM repos r WHERE r.id = ?", (repo_id,)).fetchone()
-    if row is None:
-        return None  # 防御：刚写入的行不会缺；缺了也不让关注请求整体失败
-    cards = _follow_cards(conn, [row], as_of)
-    return templates.get_template("_follow_card.html").render({"f": cards[0]})
-
-
 @router.post("/api/follows")
 async def api_follow(request: Request, client: GitHubClient = Depends(_github_client)) -> dict:
     """关注一个仓库（三态：已入池只补 follows / dead 复活＋基线 / 未入池动态入池）。
 
-    请求体 JSON：{"full_name": "owner/repo", "as_of": 可选（页面关注区同窗口径，缺省当前 UTC）}。
+    请求体 JSON：{"full_name": "owner/repo", "as_of": 可选（UTC 定长 ISO；v1.3 起仅受理校验、不再消费——
+    P1 关注区已移出，响应不带 card_html，as_of 不再用于局部渲染）}。
     幂等：重复关注返回 already_followed=true，库内零变化。
     """
     try:
@@ -505,7 +585,7 @@ async def api_follow(request: Request, client: GitHubClient = Depends(_github_cl
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo"}')
     full_name = _parse_full_name(payload.get("full_name"))
-    as_of = _parse_as_of(payload.get("as_of")) or datetime.now(timezone.utc).strftime(_ISO_FMT)
+    _parse_as_of(payload.get("as_of"))  # 校验形态保留（坏值仍 400）；值本身 v1.3 起不再消费
     conn = get_conn()
     try:
         try:
@@ -528,7 +608,6 @@ async def api_follow(request: Request, client: GitHubClient = Depends(_github_cl
             "state": outcome.state,
             "already_followed": outcome.already_followed,
             "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
-            "card_html": None if outcome.already_followed else _follow_card_html(conn, outcome.repo_id, as_of),
         }
     finally:
         conn.close()

@@ -249,14 +249,14 @@ def api(tmp_path, monkeypatch):
 
 
 def test_api_follow_new_repo(api):
-    """POST /api/follows 态③：200＋响应形态；库内 repos/follows/基线齐备；card_html 可局部插入关注区。"""
+    """POST /api/follows 态③：200＋响应形态；库内 repos/follows/基线齐备；v1.3 起响应不带 card_html（P1 无可插入区域）。"""
     client, fake, db = api
     resp = client.post("/api/follows", json={"full_name": "tiny/lib"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["followed"] is True and data["state"] == STATE_JOINED and data["already_followed"] is False
     assert data["follow_count"] == 1
-    assert "tiny/lib" in data["card_html"] and "下周起有数据" in data["card_html"]  # 新入池首周缺席口径
+    assert "card_html" not in data  # T-015：关注区移出为独立页 P6，响应不再带局部渲染卡
     conn = get_conn(db)
     try:
         assert conn.execute("SELECT source FROM repos WHERE full_name = 'tiny/lib'").fetchone()[0] == "follow"
@@ -268,13 +268,13 @@ def test_api_follow_new_repo(api):
 
 
 def test_api_repeat_follow_idempotent(api):
-    """重复 POST 幂等：already_followed=true、不重复渲染卡、计数不变、只打一次 GitHub。"""
+    """重复 POST 幂等：already_followed=true、计数不变、只打一次 GitHub。"""
     client, fake, _ = api
     client.post("/api/follows", json={"full_name": "tiny/lib"})
     resp = client.post("/api/follows", json={"full_name": "tiny/lib"})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["already_followed"] is True and data["card_html"] is None and data["follow_count"] == 1
+    assert data["already_followed"] is True and data["follow_count"] == 1
     assert fake.calls == ["tiny/lib"]
 
 
@@ -349,14 +349,17 @@ def test_api_unfollow(api):
     assert client.delete("/api/follows/oops").status_code == 400
 
 
-def test_api_follow_then_weekly_page_shows_card(api):
-    """四格尺"能操作/能延续"链路：API 关注后周报页关注区出卡、星标实心；页面刷新（重 GET）仍在。"""
+def test_api_follow_then_shows_on_follows_page(api):
+    """四格尺"能操作/能延续"链路（T-015 P6）：API 关注后 /follows 出该行、星标实心、计数徽标 1；P1 不再有关注区。"""
     client, _, _ = api
     client.post("/api/follows", json={"full_name": "tiny/lib"})
-    text = client.get("/").text
-    assert "我的关注（1）" in text
-    assert 'data-repo="tiny/lib"' in text  # 关注卡 + 榜单行星标（首期降级总星榜可上榜）
+    text = client.get("/follows").text
+    assert 'data-repo="tiny/lib"' in text  # P6 行渲染
     assert 'class="star on" data-repo="tiny/lib"' in text  # 星标实心态由 SSR 持久
+    assert "—— 下周起有数据" in text  # 新入池首周缺席口径（na 沉组尾）
+    assert '我的关注<i id="nav-follow-count">1</i>' in text  # 顶栏计数徽标 SSR 真值
+    home = client.get("/").text
+    assert "follows-sec" not in home  # v1.3：P1 顶部关注区已移出为独立页 P6
 
 
 def test_api_follow_dead_revives(api):

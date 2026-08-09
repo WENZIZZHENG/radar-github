@@ -7,7 +7,7 @@
 """
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -128,7 +128,7 @@ def test_empty_state_falls_back_to_total(fresh_client):
     assert "a/new" in resp.text  # 总星榜行确实渲染
     assert resp.text.count('class="board"') == 17
     assert "本期暂无数据" in resp.text  # 空榜板块照列
-    assert "暂无关注" in resp.text  # 关注区空态（follows 为空）
+    assert "follows-sec" not in resp.text  # v1.3：P1 顶部关注区已移出为独立页 P6
     # 默认全部展开（D1/D3 v1.1）：行即展开态、面板 open、aria 同步
     assert 'class="row expanded"' in resp.text
     assert 'class="panel open"' in resp.text
@@ -184,14 +184,15 @@ def test_total_page_content(client):
     assert 'class="star on"' in text  # a/go 已关注 → 实心星
     assert "按最新快照总星数降序" in text  # 元信息行口径说明
     assert 'class="up"' not in text  # 总星榜无增量概念：不渲染增量列
-    assert "我的关注" not in text  # 关注区仅属周报页（P3/P4 布局同 P1 榜单区，不含关注区）
+    assert "follow-boards" not in text  # v1.3：关注分组区只在 P6 独立页渲染（P3/P4 布局同 P1 榜单区，不含关注区）
 
 
-def test_follow_section_on_weekly(client):
-    """关注区置顶（周报页）：follows 有一条 → 渲染卡片与计数。"""
+def test_follow_section_moved_off_weekly(client):
+    """v1.3：P1 顶部关注区移出为独立页 P6；周报页不再有关注区，顶栏"我的关注"徽标显示真实关注数。"""
     text = client.get("/").text
-    assert "我的关注（1）" in text
-    assert "a/go" in text
+    assert "follows-sec" not in text
+    assert "fcard" not in text
+    assert '我的关注<i id="nav-follow-count">1</i>' in text  # _seed_full 有一条关注（a/go）
 
 
 def test_star_buttons_wired(client):
@@ -205,4 +206,101 @@ def test_star_buttons_wired(client):
     assert 'title="取消关注"' in text
     assert 'id="toasts"' in text  # toast 容器（关注/取消反馈）每页就位
     text = client.get("/").text
-    assert 'id="follows-sec" data-as-of="' in text  # 关注区带页面 as_of：API 渲染新卡沿用同窗口径
+    assert '<a href="/follows"' in text  # P6 入口（v1.3 顶栏 5 项："我的关注"在"本周报告"之后）
+    assert "follows-sec" not in text  # P1 关注区已移除，关注 API 不再向页面插卡（无 as_of 接线）
+
+
+# ---------- T-015：P6 我的关注独立页 ----------
+
+P6_NOW = datetime.now(timezone.utc)  # P6 增量口径 as_of=now（真实"今天"）：快照必须相对此刻造，否则滑出 5~9 天窗口
+
+
+def _iso_ago(*, days=0, hours=0):
+    """P6_NOW 之前指定偏移的定长 UTC 时间戳（与 schema 硬约定同格式）。"""
+    return (P6_NOW - timedelta(days=days, hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seed_follows(conn):
+    """P6 用例库：多语言关注集，覆盖正常增量/新入池 na/dead 三态与组内/组间排序。
+
+    增量窗口取名义 7 天两端（start=P6_NOW-7d，end=P6_NOW-1h，跨度 ≈7 天落在 5~9 天接受区间）。
+    """
+    rows = [
+        # (full_name, language, dead, snapshots)：TypeScript +500/+100，Python +300，Go 一 na 一 dead
+        ("f/ts-hot", "TypeScript", 0, [(_iso_ago(days=7), 100), (_iso_ago(hours=1), 600)]),
+        ("f/ts-mid", "TypeScript", 0, [(_iso_ago(days=7), 100), (_iso_ago(hours=1), 200)]),
+        ("f/py-up", "Python", 0, [(_iso_ago(days=7), 200), (_iso_ago(hours=1), 500)]),
+        ("f/go-new", "Go", 0, [(_iso_ago(hours=1), 66)]),  # 单张基线（首周缺席）→ na 行
+        ("f/go-dead", "Go", 1, [(_iso_ago(days=7), 100), (_iso_ago(hours=1), 120)]),  # dead 剔除出增量
+    ]
+    for i, (name, lang, dead, snaps) in enumerate(rows):
+        repo_id = _add_repo(conn, name, language=lang, description_en=f"{name} desc", snapshots=snaps)
+        if dead:
+            conn.execute("UPDATE repos SET dead = 1 WHERE id = ?", (repo_id,))
+        conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_id, f"2026-08-0{i + 1}T00:00:00Z"))
+    conn.execute("INSERT INTO tags (repo_id, tag) VALUES ((SELECT id FROM repos WHERE full_name = 'f/ts-hot'), '选型观察')")
+
+
+@pytest.fixture()
+def follows_client(tmp_path, monkeypatch):
+    with _make_client(tmp_path, monkeypatch, _seed_follows) as c:
+        yield c
+
+
+def test_follows_page_ok_and_nav(follows_client):
+    """P6 200：元信息行（窗口口径＋关注总数）、顶栏"我的关注"active＋计数徽标 SSR 真值、行形态同榜单行。"""
+    resp = follows_client.get("/follows")
+    assert resp.status_code == 200
+    text = resp.text
+    assert "与当期周报同口径" in text  # 元信息行窗口口径（v1.3 §2A 第 1 层）
+    assert 'id="follow-total">5</b>' in text  # 关注总数
+    assert '<a href="/follows" class="active" aria-current="page">我的关注<i id="nav-follow-count">5</i></a>' in text
+    assert 'class="row expanded"' in text and 'class="panel open"' in text  # 紧凑行＋详情默认展开
+    assert text.count('class="star on"') == 5  # P6 行恒金色★ on（点击即取消）
+    assert "f/ts-hot desc" in text  # 详情面板内容渲染
+    assert "选型观察" in text  # 标签区只读 chips（增删归 T-010）
+
+
+def test_follows_page_groups_and_empty_groups(follows_client):
+    """分组：关注按语言各归其组（classify_language 同口径）；组块头"N 个关注"；空组不渲染。"""
+    text = follows_client.get("/follows").text
+    assert "<h3>TypeScript<span" in text and "<h3>Python<span" in text and "<h3>Go<span" in text
+    assert text.count("2 个关注") == 2 and text.count("1 个关注") == 1  # TS/Go 各 2 行，Python 1 行
+    for key in ("f-java", "f-rust", "f-javascript", "f-other"):
+        assert f'id="{key}"' not in text  # 空组不渲染（v1.3 §2A）
+
+
+def test_follows_page_group_order(follows_client):
+    """组间按组内最大当周增量降序：TypeScript(+500) → Python(+300) → Go（仅 na/dead，按 0 沉后）。"""
+    text = follows_client.get("/follows").text
+    i_ts = text.index('id="f-typescript"')
+    i_py = text.index('id="f-python"')
+    i_go = text.index('id="f-go"')
+    assert i_ts < i_py < i_go
+
+
+def test_follows_page_row_order_within_group(follows_client):
+    """组内三态排序：正常行按增量降序（+500 在 +100 前）→ 无增量行（na）→ dead 行沉组尾。"""
+    text = follows_client.get("/follows").text
+    assert text.index("f/ts-hot") < text.index("f/ts-mid")
+    assert text.index("f/go-new") < text.index("f/go-dead")
+
+
+def test_follows_page_na_and_dead_row_marks(follows_client):
+    """三态标记：na 行灰字"—— 下周起有数据"；dead 行整行灰显＋"已失效"标；两行 up 列均为灰字 na 形态。"""
+    text = follows_client.get("/follows").text
+    assert "—— 下周起有数据" in text
+    assert text.count('class="up na"') == 2  # na 行"—— 下周起有数据"＋ dead 行"——"
+    assert 'class="row expanded dead"' in text  # dead 行灰显
+    assert '<span class="dead-tag">已失效</span>' in text
+
+
+def test_follows_page_empty_state(fresh_client):
+    """空关注空态（v1.3 §4）：引导文案＋回首页链接；分组区不渲染；计数徽标 0。"""
+    resp = fresh_client.get("/follows")
+    assert resp.status_code == 200
+    text = resp.text
+    assert "还没有关注任何项目：去榜单点行右侧 ☆，该项目每周增量会出现在这里" in text
+    assert '<a href="/">回首页</a>' in text
+    assert 'id="follow-boards"' not in text
+    assert '我的关注<i id="nav-follow-count">0</i>' in text

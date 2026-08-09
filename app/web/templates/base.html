@@ -25,6 +25,8 @@
     </h1>
     <nav class="tabs" aria-label="主导航">
       <a href="/"{% if page == "week" %} class="active" aria-current="page"{% endif %}>本周报告</a>
+      {# P6 我的关注（v1.3）：计数徽标为 SSR 真实关注数，关注/取消后由 radar.js 局部 +1/-1 #}
+      <a href="/follows"{% if page == "follows" %} class="active" aria-current="page"{% endif %}>我的关注<i id="nav-follow-count">{{ follow_count }}</i></a>
       <a href="/quarter"{% if page == "quarter" %} class="active" aria-current="page"{% endif %}>季度回顾</a>
       <a href="/total"{% if page == "total" %} class="active" aria-current="page"{% endif %}>总星榜</a>
       {# 标签页归 T-010：禁用必须给原因（流程说明 §0），原因放 title tooltip #}
