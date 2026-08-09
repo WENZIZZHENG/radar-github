@@ -1,0 +1,265 @@
+"""榜单口径测试：tmp_path 真实文件库（WAL 对 :memory: 不生效，与 test_db 同口径）。
+
+口径语义全部靠这里的构造数据覆盖（真实库快照历史太短，验证不了窗口语义）：
+滑动窗口 5~9 天两端取数、新入池首周缺席、负增量沉底、dead 剔除、Top N 不足按实际、
+跨主题重复、零命中进"其他"、"其它语言"归组、总星榜口径。
+"""
+
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.classify import LANGUAGES, load_topics
+from app.config import BASE_DIR
+from app.db import get_conn, init_db
+from app.report import _ENDPOINT_SQL, _START_AFTER_SQL, ABSENT_FIRST_WEEK, compute_boards, compute_repo_deltas
+
+TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"
+AS_OF = "2026-08-09T00:00:00Z"  # 固定基准时刻：窗口语义不依赖"今天"，测试可复现
+_AS_OF_DT = datetime(2026, 8, 9, tzinfo=timezone.utc)
+
+
+def _iso(days_before: float) -> str:
+    """as_of 之前 days_before 天的定长 UTC 时间戳。"""
+    return (_AS_OF_DT - timedelta(days=days_before)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _add_repo(conn, name, *, language=None, topics=(), dead=0, snapshots=()):
+    """插一个仓库及其快照，返回 repo_id；snapshots 为 (captured_at, stars) 列表。"""
+    cur = conn.execute(
+        "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (name, f"node-{name}", language, json.dumps(list(topics)), dead, "test", "2026-07-01T00:00:00Z"),
+    )
+    repo_id = cur.lastrowid
+    for captured_at, stars in snapshots:
+        conn.execute(
+            "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
+            (repo_id, captured_at, stars),
+        )
+    return repo_id
+
+
+def _board(boards, kind, key):
+    return next(b for b in boards if b.kind == kind and b.key == key)
+
+
+@pytest.fixture()
+def conn(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    c = get_conn(db)
+    yield c
+    c.close()
+
+
+@pytest.fixture()
+def topic_table():
+    return load_topics(TOPICS_PATH)
+
+
+def test_sliding_window_boundaries(conn, topic_table):
+    """5~9 天跨度接受并标注实际窗口，4/10 天缺席；取数用实际可得两端，不要求是名义端点。"""
+    repo_w5 = _add_repo(conn, "a/w5", language="Python", snapshots=[(_iso(5), 100), (_iso(0), 160)])
+    repo_w7 = _add_repo(conn, "a/w7", language="Python", snapshots=[(_iso(7), 100), (_iso(0), 180)])
+    repo_w9 = _add_repo(conn, "a/w9", language="Python", snapshots=[(_iso(9), 100), (_iso(0), 200)])
+    # 名义端点缺失滑动取数：end 缺 T 日快照（最近可得为 T-2d），start 准点 → 窗口 5 天
+    repo_slide = _add_repo(conn, "a/slide", language="Python", snapshots=[(_iso(7), 100), (_iso(2), 150)])
+    repo_narrow = _add_repo(conn, "a/too-narrow", language="Python", snapshots=[(_iso(4), 100), (_iso(0), 130)])
+    repo_wide = _add_repo(conn, "a/too-wide", language="Python", snapshots=[(_iso(10), 100), (_iso(0), 130)])
+    # 起点两侧候选都在窗口内：取离名义起点更近的一张（T-6 距 T-7 一天，T-9 距两天）
+    repo_two = _add_repo(
+        conn, "a/two-candidates", language="Python", snapshots=[(_iso(9), 100), (_iso(6), 200), (_iso(0), 500)]
+    )
+
+    deltas = compute_repo_deltas(conn, period="week", as_of=AS_OF)
+    assert deltas[repo_w5].delta == 60 and deltas[repo_w5].window_days == 5.0
+    assert deltas[repo_w7].delta == 80 and deltas[repo_w7].window_days == 7.0
+    assert deltas[repo_w9].delta == 100 and deltas[repo_w9].window_days == 9.0
+    # 滑动取数：增量必须是实际两端（T-2d 与 T-7d）之差，窗口标注实际跨度 5 天
+    assert deltas[repo_slide].delta == 50 and deltas[repo_slide].window_days == 5.0
+    # 跨度滑出 5~9 天区间一律缺席
+    assert deltas[repo_narrow].absent_reason == ABSENT_FIRST_WEEK
+    assert deltas[repo_wide].absent_reason == ABSENT_FIRST_WEEK
+    # 两候选择优：起点取 T-6d（增量 500-200=300，窗口 6 天），不是 T-9d
+    assert deltas[repo_two].delta == 300 and deltas[repo_two].window_days == 6.0
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    by_name = {r.full_name: r for r in _board(boards, "language", "python").rows}
+    assert set(by_name) == {"a/w5", "a/w7", "a/w9", "a/slide", "a/two-candidates"}
+    assert by_name["a/slide"].window_days == 5.0
+
+
+def test_first_week_absent(conn, topic_table):
+    """只有一个快照（不满 5 天跨度）的新入池项目当周缺席，不得以单日增量混排。"""
+    repo_new = _add_repo(conn, "a/newbie", language="Go", snapshots=[(_iso(1), 500)])
+    repo_old = _add_repo(conn, "a/veteran", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 300)])
+
+    deltas = compute_repo_deltas(conn, period="week", as_of=AS_OF)
+    assert deltas[repo_new].delta is None
+    assert deltas[repo_new].absent_reason == ABSENT_FIRST_WEEK
+    assert deltas[repo_old].absent_reason is None
+
+    go_rows = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "go").rows
+    assert [r.full_name for r in go_rows] == ["a/veteran"]
+
+
+def test_negative_delta_sinks_to_bottom(conn, topic_table):
+    """负增量允许上榜但降序下自然沉底。"""
+    _add_repo(conn, "a/up", language="Rust", snapshots=[(_iso(7), 100), (_iso(0), 300)])  # +200
+    _add_repo(conn, "a/flat-up", language="Rust", snapshots=[(_iso(7), 100), (_iso(0), 110)])  # +10
+    _add_repo(conn, "a/down", language="Rust", snapshots=[(_iso(7), 500), (_iso(0), 450)])  # -50
+
+    rows = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "rust").rows
+    assert [r.full_name for r in rows] == ["a/up", "a/flat-up", "a/down"]
+    assert rows[-1].delta == -50
+
+
+def test_dead_repo_excluded(conn, topic_table):
+    """dead=1 仓库即使两端快照齐全也剔除：不进 deltas、不进任何榜。"""
+    repo_dead = _add_repo(conn, "a/ghost", language="Java", dead=1, snapshots=[(_iso(7), 100), (_iso(0), 900)])
+    _add_repo(conn, "a/alive", language="Java", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+
+    assert repo_dead not in compute_repo_deltas(conn, period="week", as_of=AS_OF)
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    assert [r.full_name for r in _board(boards, "language", "java").rows] == ["a/alive"]
+    assert all(r.full_name != "a/ghost" for b in boards for r in b.rows)
+
+
+def test_top_n_short_board_and_limit(conn, topic_table):
+    """不足 30 有多少列多少；超过 30 截 Top 30，被截掉的是增量最小者。"""
+    for i in range(1, 32):  # 31 个 Python 仓库，增量 1..31
+        _add_repo(conn, f"a/py-{i:02d}", language="Python", snapshots=[(_iso(7), 1000), (_iso(0), 1000 + i)])
+    _add_repo(conn, "a/go-1", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+    _add_repo(conn, "a/go-2", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 150)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    py_rows = _board(boards, "language", "python").rows
+    assert len(py_rows) == 30
+    assert py_rows[0].delta == 31
+    assert {r.delta for r in py_rows} == set(range(2, 32))  # 增量 1 的被截掉
+    assert len(_board(boards, "language", "go").rows) == 2  # 不足 30 按实际数量
+
+
+def test_multi_topic_repo_repeats_across_boards(conn, topic_table):
+    """命中多主题的仓库在每个命中主题榜都出现（跨榜重复是口径，不是 bug）。"""
+    _add_repo(conn, "a/ai-react", topics=["ai", "react"], snapshots=[(_iso(7), 100), (_iso(0), 300)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    ai_names = [r.full_name for r in _board(boards, "topic", "ai").rows]
+    frontend_names = [r.full_name for r in _board(boards, "topic", "frontend").rows]
+    assert "a/ai-react" in ai_names and "a/ai-react" in frontend_names
+
+
+def test_zero_topic_hit_goes_to_other_board(conn, topic_table):
+    """topics 零命中（含空 topics）进"其他"主题榜，且不出现在 9 个词表主题榜。"""
+    _add_repo(conn, "a/niche", topics=["obscure-xyz"], snapshots=[(_iso(7), 100), (_iso(0), 300)])
+    _add_repo(conn, "a/notopics", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    other_names = [r.full_name for r in _board(boards, "topic", "other").rows]
+    assert set(other_names) == {"a/niche", "a/notopics"}
+    for key in topic_table:
+        assert all(r.full_name not in {"a/niche", "a/notopics"} for r in _board(boards, "topic", key).rows)
+
+
+def test_other_language_grouping(conn, topic_table):
+    """未列出语言与无语言仓库都归"其它语言"榜，不进 6 个指定语言榜。"""
+    _add_repo(conn, "a/kotlin-app", language="Kotlin", snapshots=[(_iso(7), 100), (_iso(0), 300)])
+    _add_repo(conn, "a/no-lang", language=None, snapshots=[(_iso(7), 100), (_iso(0), 200)])
+    _add_repo(conn, "a/java-app", language="Java", snapshots=[(_iso(7), 100), (_iso(0), 150)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    other_names = [r.full_name for r in _board(boards, "language", "other").rows]
+    assert set(other_names) == {"a/kotlin-app", "a/no-lang"}
+    for key in LANGUAGES.values():
+        rows = _board(boards, "language", key).rows
+        expected = ["a/java-app"] if key == "java" else []
+        assert [r.full_name for r in rows] == expected
+
+
+def test_total_board_semantics(conn, topic_table):
+    """总星榜：最新快照降序、无增量/窗口概念；单快照新项目照上；as_of 之后的快照不算。"""
+    _add_repo(conn, "a/big", language="Python", snapshots=[(_iso(7), 800), (_iso(0), 1000)])
+    _add_repo(conn, "a/newbie", language="Python", snapshots=[(_iso(1), 600)])  # 首周缺席口径不影响总星榜
+    _add_repo(conn, "a/small", language="Python", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+    _add_repo(conn, "a/future", language="Python", snapshots=[("2026-08-10T00:00:00Z", 9999)])  # as_of 之后
+
+    rows = _board(compute_boards(conn, topic_table, period="total", as_of=AS_OF), "language", "python").rows
+    assert [r.full_name for r in rows] == ["a/big", "a/newbie", "a/small"]
+    assert rows[0].stars == 1000
+    assert all(r.delta is None and r.window_days is None for r in rows)
+
+
+def test_quarter_window(conn, topic_table):
+    """季榜同口径、窗口 90 天（滑动 86~94 天）。"""
+    repo_q90 = _add_repo(conn, "a/q90", snapshots=[(_iso(90), 100), (_iso(0), 500)])
+    repo_q86 = _add_repo(conn, "a/q86", snapshots=[(_iso(86), 100), (_iso(0), 400)])
+    repo_q94 = _add_repo(conn, "a/q94", snapshots=[(_iso(94), 100), (_iso(0), 300)])
+    repo_q85 = _add_repo(conn, "a/q85", snapshots=[(_iso(85), 100), (_iso(0), 200)])
+
+    deltas = compute_repo_deltas(conn, period="quarter", as_of=AS_OF)
+    assert deltas[repo_q90].delta == 400 and deltas[repo_q90].window_days == 90.0
+    assert deltas[repo_q86].window_days == 86.0
+    assert deltas[repo_q94].window_days == 94.0
+    assert deltas[repo_q85].absent_reason == ABSENT_FIRST_WEEK
+
+
+def test_boards_structure_and_order(conn, topic_table):
+    """17 张榜齐备、顺序固定：语言 7 张（LANGUAGES 序+其它收尾）后接主题 10 张（词表序+其他收尾）。"""
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    assert len(boards) == 17
+    assert [(b.kind, b.key) for b in boards[:7]] == [("language", k) for k in (*LANGUAGES.values(), "other")]
+    assert [(b.kind, b.key) for b in boards[7:]] == [("topic", k) for k in (*topic_table, "other")]
+    assert boards[6].label == "其它语言" and boards[-1].label == "其他"
+    # 空库/全缺席时榜仍齐备、行为空列表（页面空态靠它，不抛异常）
+    assert all(isinstance(b.rows, list) for b in boards)
+
+
+def test_repo_without_snapshots_not_in_deltas(conn, topic_table):
+    """零快照仓库不进 deltas（docstring 承诺锁定）：无总星数可展示，任何榜都安放不了。"""
+    repo_empty = _add_repo(conn, "a/empty", language="Go")  # 无快照
+    _add_repo(conn, "a/normal", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+
+    assert repo_empty not in compute_repo_deltas(conn, period="week", as_of=AS_OF)
+    assert repo_empty not in compute_repo_deltas(conn, period="total", as_of=AS_OF)
+    go_rows = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "go").rows
+    assert [r.full_name for r in go_rows] == ["a/normal"]
+
+
+def test_quarter_window_wide_side_rejected(conn):
+    """季榜宽侧 >94 天同样缺席（周榜两侧已有覆盖，季榜补宽侧）。"""
+    repo_q95 = _add_repo(conn, "a/q95", snapshots=[(_iso(95), 100), (_iso(0), 500)])
+    assert compute_repo_deltas(conn, period="quarter", as_of=AS_OF)[repo_q95].absent_reason == ABSENT_FIRST_WEEK
+
+
+def test_future_snapshots_excluded_in_increment(conn):
+    """增量口径同样排除 as_of 之后的快照：与 total 共用端点查询，锁定同源行为。"""
+    repo = _add_repo(
+        conn,
+        "a/future-inc",
+        language="Rust",
+        snapshots=[(_iso(7), 100), (_iso(0), 300), ("2026-08-12T00:00:00Z", 9999)],
+    )
+    delta = compute_repo_deltas(conn, period="week", as_of=AS_OF)[repo]
+    assert delta.stars == 300 and delta.delta == 200  # end 仍是 T-0 快照，不取未来快照
+
+
+def test_sort_tiebreak_reproducible(conn, topic_table):
+    """次序键回归锁：增量相同按星数降序、再按 full_name 升序，同数据重复计算结果恒定。"""
+    _add_repo(conn, "a/b-same", language="Java", snapshots=[(_iso(7), 100), (_iso(0), 300)])  # +200
+    _add_repo(conn, "a/a-same", language="Java", snapshots=[(_iso(7), 100), (_iso(0), 300)])  # +200
+    _add_repo(conn, "a/c-more-stars", language="Java", snapshots=[(_iso(7), 900), (_iso(0), 1100)])  # +200
+
+    rows1 = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "java").rows
+    rows2 = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "java").rows
+    assert [r.full_name for r in rows1] == ["a/c-more-stars", "a/a-same", "a/b-same"]
+    assert [r.full_name for r in rows2] == [r.full_name for r in rows1]
+
+
+def test_endpoint_sql_uses_index_seek(conn):
+    """SQL 红线回归锁：两条端点 SQL 必须是 SEARCH 索引 seek，出现 SCAN 全表扫即变红。"""
+    _add_repo(conn, "a/x", snapshots=[(_iso(1), 100)])
+    for sql, params in ((_ENDPOINT_SQL, (1, AS_OF)), (_START_AFTER_SQL, (1, AS_OF, AS_OF))):
+        plan = [row["detail"] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)]
+        assert any("SEARCH" in detail for detail in plan), plan
+        assert not any("SCAN" in detail for detail in plan), plan
