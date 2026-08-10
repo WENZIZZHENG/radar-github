@@ -324,16 +324,22 @@ def test_new_week_regenerates_recommendation(conn):
     assert weeks == {WEEK1, WEEK2}
 
 
-def test_unlisted_repo_untouched(conn):
-    """懒口径：池内未上榜仓库（单快照首周缺席）不译不生成推荐语。"""
+def test_full_pool_translate_covers_unlisted_and_dead(conn):
+    """T-016 全池口径：未上榜仓库与 dead 仓库同样翻译（与上榜集解耦）；推荐语仍只给上榜集。"""
     _add_repo(conn, "a/listed", description_en="on board")
     _add_repo(conn, "a/newbie", description_en="off board", listed=False)
+    dead_id = _add_repo(conn, "a/dead", description_en="dead repo", listed=False)
+    conn.execute("UPDATE repos SET dead = 1 WHERE id = ?", (dead_id,))
+    conn.commit()
     fake = FakeDeepSeekClient()
     stats = _run_ensure(conn, fake)
     assert stats["listed"] == 1
-    assert fake.translate_calls == ["on board"]
+    # 全池翻译：上榜 + 未上榜 + dead 全部送译（T-016 决策 5 v2：dead 仓也译）
+    assert sorted(fake.translate_calls) == ["dead repo", "off board", "on board"]
     zh = _zh_map(conn)
-    assert zh["a/listed"] == "译文-on board" and zh["a/newbie"] is None
+    assert zh["a/listed"] == "译文-on board" and zh["a/newbie"] == "译文-off board" and zh["a/dead"] == "译文-dead repo"
+    assert stats["translated"] == 3 and stats["translate_failed"] == 0
+    # 推荐语口径一行未动：仍只对上榜集（dead/未上榜无推荐语）
     assert _recommend_names(conn) == {"a/listed"}
 
 

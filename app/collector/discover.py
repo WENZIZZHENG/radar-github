@@ -5,6 +5,9 @@
 - 快照走 GraphQL nodes(ids:) 分批（≤100/批）：核心池全量约 6.4 万仓库≈640 请求（架构决策 1），
   比逐仓 REST 省一个数量级；批内 null / isPrivate / isDisabled 是死库信号 → repos.dead=1，
   只停采不删历史快照（schema 注释口径）。
+- T-016 变更检测（决策 5 v2）：nodes 本已拉 description 字段，与库内 description_en 比对，
+  有变更 → 更新原文＋清 description_zh=NULL（当日 ensure 全池翻译自然重译）；无变更不动。
+  language/topics 漂移本次不处理（流程说明 §7.4 钉死边界，只覆盖 description_en）。
 - 整轮共享一个 captured_at（任务启动时刻 utc_now_iso()）：与 T-005 同批一致口径，
   "当日快照"后续按 <= 截止日取最近一行的榜单 SQL 不受影响。
 - 发现池每日只捞 stars:>=1000 按 updated 降序前 5 页（500 条）：星数榜头部常年固化，
@@ -71,13 +74,24 @@ def _apply_snapshot_batch(
     captured_at: str,
     stats: DailyStats,
 ) -> None:
-    """一批 nodes 落库：活库写当日快照（INSERT OR REPLACE，同秒重跑幂等覆盖），死库置 dead=1 停采。"""
+    """一批 nodes 落库：活库写当日快照（INSERT OR REPLACE，同秒重跑幂等覆盖），死库置 dead=1 停采。
+
+    T-016 变更检测：nodes 返回的 description 与库内 description_en 比对，有变更 → 更新原文并清旧译文
+    （description_zh=NULL，当日 ensure 全池翻译自然重译）；无变更不动。language/topics 漂移不处理
+    （流程说明 §7.4 钉死边界：只覆盖 description_en）。
+    """
     with conn:  # 一批一个事务：半批失败整体回滚，重跑整批幂等
         for row, node in zip(chunk, nodes):
             if node is None or node.get("isPrivate") or node.get("isDisabled"):
                 conn.execute("UPDATE repos SET dead = 1 WHERE id = ?", (row["id"],))
                 stats.dead_marked += 1
             else:
+                desc = node.get("description")  # GitHub 官方允许为空：None 与库内 None 相等视为无变更
+                if desc != row["description_en"]:
+                    conn.execute(
+                        "UPDATE repos SET description_en = ?, description_zh = NULL WHERE id = ?",
+                        (desc, row["id"]),
+                    )
                 conn.execute(
                     "INSERT OR REPLACE INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
                     (row["id"], captured_at, node["stargazerCount"]),
@@ -88,8 +102,11 @@ def _apply_snapshot_batch(
 async def _snapshot_all(
     client: GitHubClient, conn: sqlite3.Connection, *, captured_at: str, stats: DailyStats, log: logging.Logger
 ) -> None:
-    """每日快照：全部 dead=0 仓库按 node_id 分批走 nodes(ids:)；单批失败记日志跳过，不拖垮整轮。"""
-    rows = conn.execute("SELECT id, node_id FROM repos WHERE dead = 0").fetchall()
+    """每日快照：全部 dead=0 仓库按 node_id 分批走 nodes(ids:)；单批失败记日志跳过，不拖垮整轮。
+
+    SELECT 带 description_en 供 T-016 变更检测（_apply_snapshot_batch 内比对更新）。
+    """
+    rows = conn.execute("SELECT id, node_id, description_en FROM repos WHERE dead = 0").fetchall()
     for offset in range(0, len(rows), MAX_NODES_PER_QUERY):
         chunk = rows[offset : offset + MAX_NODES_PER_QUERY]
         try:

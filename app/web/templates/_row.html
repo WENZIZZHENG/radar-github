@@ -22,5 +22,8 @@
     {% for t in r.tags %}<span class="tag"><a class="tag-link" href="/tags/{{ t | quote_tag }}">{{ t }}</a><b title="删除标签" data-repo="{{ r.full_name }}" data-tag="{{ t }}">×</b></span>{% endfor %}
     {# 打标入口（P1/P3/P4/P6 四页共用本模板，全都有增删能力）：data-repo 供 JS 提交 POST /api/tags #}
     <button class="tag-add" data-repo="{{ r.full_name }}">＋ 标签</button>
+    {# 行内翻译按钮（T-016，§7.1：标签区右侧）：按态文案无译文"翻译"/有译文"重新翻译"；
+       data-has-zh 供 JS 失败恢复按态文案；成功后面板中文即时局部替换并切"重新翻译" #}
+    <button class="translate-btn" data-repo="{{ r.full_name }}" data-has-zh="{% if r.description_zh %}1{% else %}0{% endif %}">{% if r.description_zh %}重新翻译{% else %}翻译{% endif %}</button>
   </div>
 </div>

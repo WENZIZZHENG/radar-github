@@ -5,6 +5,8 @@
 // P6 页内点 ★ 取消 → 该行＋详情面板即时移除，组空连组块移除，全空 reload 出空态。
 // T-010 标签接线（§3.3）：chip 本体跳 /tags/<tag>（SSR 链接）；× 删除 → DELETE API 乐观移除失败插回；
 // "＋ 标签"→ 输入框（maxLength 20，Enter 提交/Escape·blur 还原）；非法输入不提交：红边＋内联提示。
+// T-016 翻译接线（§7）：行内按钮单个强制重译（成功 toast＋面板中文即时替换不刷新）；页脚批量补译全部缺失
+// （只补 NULL）；按钮置灰防连点，分支 toast 文案严格按 v1.4 §7.3（服务端 400 detail 即 §7.3 文案，直用）。
 const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 
@@ -103,6 +105,18 @@ document.addEventListener("click", (e) => {
   const tagAdd = e.target.closest(".tag-add");
   if (tagAdd) {
     startTagInput(tagAdd);
+    return;
+  }
+  // T-016 行内翻译按钮（§7.2）：单个强制重译，成功局部替换不刷新页面
+  const translateBtn = e.target.closest(".translate-btn");
+  if (translateBtn) {
+    translateRow(translateBtn);
+    return;
+  }
+  // T-016 页脚批量补译（§7.2）：全池只补 NULL；409/未配置 key 文案见 §7.3
+  const translateAll = e.target.closest("#translate-all");
+  if (translateAll) {
+    translateMissing(translateAll);
     return;
   }
   const row = e.target.closest(".row");
@@ -238,3 +252,81 @@ document.addEventListener("keydown", (e) => {
     toggleRow(e.target);
   }
 });
+
+// ---- T-016 翻译交互（§7.2 主路径 / §7.3 分支文案钉死，前端不发明文案） ----
+
+// 面板中文描述即时局部替换（不刷新页面）：有则覆写，无则插到英文简介之后；textContent 防 XSS（同 T-010 chip）
+function replaceDescZh(panel, zh) {
+  if (!panel) return;
+  let el = panel.querySelector(".desc-zh");
+  if (el) {
+    el.textContent = zh;
+    return;
+  }
+  el = document.createElement("div");
+  el.className = "desc-zh";
+  el.textContent = zh;
+  const descEn = panel.querySelector(".desc-en");
+  if (descEn) descEn.insertAdjacentElement("afterend", el);
+  else panel.insertBefore(el, panel.firstChild);
+}
+
+// 单个强制重译：按钮置灰"翻译中…"防连点（§7.2）；失败分支 toast 文案严格按 §7.3，按钮恢复按态文案
+async function translateRow(btn) {
+  if (btn.disabled) return; // 防连点（已置灰时忽略再次点击）
+  const repo = btn.dataset.repo;
+  const hadZh = btn.dataset.hasZh === "1"; // 失败恢复按态文案用（成功态固定"重新翻译"）
+  const panel = btn.closest(".panel");
+  btn.disabled = true;
+  btn.textContent = "翻译中…";
+  const restore = () => {
+    btn.disabled = false;
+    btn.textContent = hadZh ? "重新翻译" : "翻译";
+  };
+  let resp;
+  try {
+    resp = await fetch("/api/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ full_name: repo }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      // 400 两分支（无简介/原文含中文）：detail 即 §7.3 文案，直用；其余（AI/网络）统一"翻译失败，稍后再试"
+      toast(resp.status === 400 ? (data.detail || "无简介可译") : "翻译失败，稍后再试", true);
+      restore();
+      return;
+    }
+    toast("已更新翻译");
+    replaceDescZh(panel, data.description_zh);
+    btn.dataset.hasZh = "1"; // 现在已有译文：下次按态即"重新翻译"
+    btn.textContent = "重新翻译";
+    btn.disabled = false;
+  } catch (err) {
+    toast("翻译失败，稍后再试", true); // 网络层失败（§7.3"AI/网络失败"分支），旧译文保留（服务端未写库）
+    restore();
+  }
+}
+
+let batchTranslating = false; // 前端防连点（服务端另有 in-flight 锁 409 兜底，§7.3）
+
+// 页脚批量补译：置灰"补译中…"；完成/409/未配置 key 文案严格按 §7.3
+async function translateMissing(btn) {
+  if (batchTranslating) return;
+  batchTranslating = true;
+  btn.disabled = true;
+  btn.textContent = "补译中…";
+  try {
+    const resp = await fetch("/api/translate-missing", { method: "POST" });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 409) toast("补译进行中…");
+    else if (!resp.ok) toast("未配置 DeepSeek API key", true); // 批量失败只可能是账户类确定性错误（key 空/无效/余额）
+    else toast("补译完成：新译 " + data.translated + " 条");
+  } catch (err) {
+    toast("补译失败，稍后再试", true); // 网络层失败：§7.3 未钉死该分支，沿用单个失败同款兜底文案
+  } finally {
+    batchTranslating = false;
+    btn.disabled = false;
+    btn.textContent = "补译全部缺失";
+  }
+}

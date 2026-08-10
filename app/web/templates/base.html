@@ -39,6 +39,8 @@
   {% block content %}{% endblock %}
   <footer class="note">
     新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成（失败时该行无推荐语块） · 榜单本地 SQL 实时计算（不物化） · 数据：GitHub 官方 API 每日 UTC 快照
+    {# T-016 页脚批量补译按钮（§7.1：所有榜单页共用页脚 meta 行区域）：全池只补 NULL；防连点见 radar.js #}
+    <button class="translate-all" id="translate-all">补译全部缺失</button>
   </footer>
 </div>
 

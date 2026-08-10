@@ -17,13 +17,19 @@ from app.main import app
 NOW = "2026-08-09T00:00:00Z"
 
 
-def make_node(full_name: str, *, stars: int = 1500, private: bool = False, disabled: bool = False) -> dict:
-    """造一条 GraphQL Repository 节点（字段对齐每日任务用到的子集）。"""
+def make_node(
+    full_name: str, *, stars: int = 1500, private: bool = False, disabled: bool = False, description: str | None = None
+) -> dict:
+    """造一条 GraphQL Repository 节点（字段对齐每日任务用到的子集）。
+
+    description 默认 None：既有用例库里 description_en 也是 NULL，两值相等 → 不触发 T-016 变更检测。
+    """
     return {
         "nameWithOwner": full_name,
         "stargazerCount": stars,
         "isPrivate": private,
         "isDisabled": disabled,
+        "description": description,
     }
 
 
@@ -355,4 +361,66 @@ def test_same_captured_at_rerun_idempotent(tmp_path):
     _run(client, conn, logger)
     _run(client, conn, logger)  # now_iso 固定 NOW：同 captured_at 再跑一轮
     assert conn.execute("SELECT COUNT(*) FROM star_snapshots WHERE repo_id = ?", (id_live,)).fetchone()[0] == 1
+    conn.close()
+
+
+# ---------- T-016 变更检测：description_en 比对更新（§7.4 钉死：只覆盖 description_en） ----------
+
+
+def _seed_repo_with_desc(conn, *, description_en, description_zh=None):
+    """插一个带简介/译文（可空）的仓库，返回 repo_id。"""
+    cur = conn.execute(
+        "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at)"
+        " VALUES (?, ?, ?, ?, 'Python', '[\"ai\"]', 0, 'initial', ?)",
+        ("a/live", "nid-live", description_en, description_zh, "2026-08-08T00:00:00Z"),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_snapshot_description_change_updates_en_and_clears_zh(tmp_path):
+    """原文变更 → UPDATE description_en 新值＋description_zh=NULL（当日 ensure 全池翻译自然重译）；language/topics 不动。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_desc(conn, description_en="old desc", description_zh="旧译")
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc")})
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    row = conn.execute(
+        "SELECT description_en, description_zh, language, topics, dead FROM repos WHERE full_name = 'a/live'"
+    ).fetchone()
+    assert row["description_en"] == "new desc"  # 原文更新为 nodes 现值
+    assert row["description_zh"] is None  # 清旧译文：当日 ensure 重译
+    assert row["language"] == "Python" and row["topics"] == '["ai"]'  # language/topics 漂移不处理（§7.4 边界留痕）
+    assert row["dead"] == 0
+    # 快照照常写入（变更检测是附带更新，不改变快照行为）
+    repo_id = conn.execute("SELECT id FROM repos WHERE full_name = 'a/live'").fetchone()["id"]
+    assert conn.execute("SELECT COUNT(*) FROM star_snapshots WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 1
+    conn.close()
+
+
+def test_snapshot_description_unchanged_keeps_translation(tmp_path):
+    """原文无变更 → 不动原文不动译文（§7.3 自动分支口径）。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_desc(conn, description_en="same desc", description_zh="已译")
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc")})
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    row = conn.execute("SELECT description_en, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["description_en"] == "same desc" and row["description_zh"] == "已译"
+    conn.close()
+
+
+def test_snapshot_description_removed_clears_en_and_zh(tmp_path):
+    """简介被删除（nodes 返回 None）→ 原文清 NULL＋清译文；快照照写（简介删除也是变更）。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_desc(conn, description_en="was here", description_zh="已译")
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description=None)})
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    row = conn.execute("SELECT description_en, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["description_en"] is None and row["description_zh"] is None
+    assert conn.execute("SELECT COUNT(*) FROM star_snapshots").fetchone()[0] == 1
     conn.close()

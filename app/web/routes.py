@@ -8,14 +8,18 @@
 - 关注写操作（T-009）：三态分流与动态入池在 app.follows / app.collector.snapshot，本层只做输入校验与 HTTP 状态码映射
   （v1.3 起响应不再带 card_html——P1 关注区已移出，无可插入区域）；
 - 标签写操作与 P5 筛选页（T-010）：tags 表增删在本层（幂等/校验/404 口径见 /api/tags 路由），行内交互在 radar.js；
+- 翻译写端点（T-016）：单个强制重译 / 批量只补 NULL（见 /api/translate、/api/translate-missing，
+  《交互流程说明》§7.4 钉死口径；不触碰 recommendations 表）；
 - 本层对 recommendations 表只读展示（T-011 才接线生成）。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
+import threading
 from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from app.ai import DeepSeekAuthError, DeepSeekClient, has_cjk
 from app.classify import LANGUAGES, OTHER_LANGUAGE_KEY, classify_language, load_topics
 from app.collector.github import (
     GitHubAuthError,
@@ -40,6 +45,8 @@ from app.report import Board, ReportRow, compute_boards, compute_repo_deltas
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"  # 供 app.main 挂载 StaticFiles（/static）
 TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"
+
+logger = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory=_WEB_DIR / "templates")
 router = APIRouter()
@@ -812,3 +819,112 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
         )
     finally:
         conn.close()
+
+
+# ===== 翻译 API（T-016；口径《交互流程说明》§7.4 钉死：单个强制重译 / 批量只补 NULL，不触碰 recommendations 表） =====
+
+_batch_translating_lock = threading.Lock()  # in-flight 锁：批量补译防重入（§7.3 409）；S 档单进程跨请求共享
+
+
+async def _ai_client() -> AsyncIterator[DeepSeekClient]:
+    """请求级 DeepSeek 客户端（翻译写端点唯一外呼点）：key 空/无效由客户端在使用点报清晰错误。
+
+    依赖注入形态（Depends）：单测用 app.dependency_overrides 换假 client，不打真 API（同 _github_client）。
+    """
+    client = DeepSeekClient(get_settings().deepseek_api_key)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+async def _parse_translate_payload(request: Request) -> str:
+    """/api/translate 请求体解析：JSON dict + full_name 形态校验（fail-loud，同 /api/follows 口径）。"""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo"}') from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail='请求体须为 JSON：{"full_name": "owner/repo"}')
+    return _parse_full_name(payload.get("full_name"))
+
+
+def _translate_error_to_http(exc: Exception) -> HTTPException:
+    """AI 调用异常 → HTTP 错误映射：账户类（key 空/无效/余额）→ 500 带修复指引（同关注 API 的 GitHubAuthError 姿态）；
+    其余（超时/5xx/畸形）→ 502。失败时库内未写入，旧译文天然保留（§7.3）。
+    """
+    if isinstance(exc, DeepSeekAuthError):
+        return HTTPException(status_code=500, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"翻译失败：{exc}")
+
+
+@router.post("/api/translate")
+async def api_translate(request: Request, client: DeepSeekClient = Depends(_ai_client)) -> dict:
+    """单个强制重译（§7.2 第 1 步）：不管现值覆盖写 repos.description_zh，不触碰 recommendations。
+
+    400 两分支的 detail 即 §7.3 前端 toast 文案（"无简介可译" / "原文已是中文，无需翻译"），前端按 status 直用；
+    repo 不在跟踪池 → 404；AI/网络失败 → 502（旧译文保留，前端 toast"翻译失败，稍后再试"）。
+    """
+    full_name = await _parse_translate_payload(request)
+    conn = get_conn()
+    try:
+        repo = conn.execute("SELECT id, description_en FROM repos WHERE full_name = ?", (full_name,)).fetchone()
+        if repo is None:
+            raise HTTPException(status_code=404, detail=f"仓库不在跟踪池：{full_name}")
+        text_en = repo["description_en"]
+        if not text_en or not text_en.strip():
+            raise HTTPException(status_code=400, detail="无简介可译")
+        if has_cjk(text_en):
+            raise HTTPException(status_code=400, detail="原文已是中文，无需翻译")
+        try:
+            zh = await client.translate(text_en)
+        except Exception as exc:  # 不写库：失败旧译文保留（§7.3）；HTTP 映射见 _translate_error_to_http
+            raise _translate_error_to_http(exc) from None
+        conn.execute("UPDATE repos SET description_zh = ? WHERE id = ?", (zh, repo["id"]))
+        conn.commit()
+        return {"full_name": full_name, "translated": True, "description_zh": zh}
+    finally:
+        conn.close()
+
+
+@router.post("/api/translate-missing")
+async def api_translate_missing(client: DeepSeekClient = Depends(_ai_client)) -> dict:
+    """批量补译（§7.2 第 2 步）：全池 description_zh IS NULL 且英文非空无 CJK（含 dead）只补 NULL 不覆盖；
+    in-flight 锁防重入——进行中重复触发 409（§7.3）；不触碰 recommendations 表。
+
+    降级口径（与 T-011 ensure 同链）：单条失败记 WARNING 跳过计入 failed，不中断整批（次日/再触发自然补缺）；
+    DeepSeekAuthError（key 未配置/无效/余额）是确定性配置错误 → 直通 500，前端 toast"未配置 DeepSeek API key"。
+    每批整体响应 200 后前端 toast"补译完成：新译 N 条"。
+    """
+    if not _batch_translating_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="补译任务进行中，请稍后再试")
+    conn = get_conn()
+    try:
+        pending = conn.execute(
+            "SELECT id, full_name, description_en FROM repos WHERE description_zh IS NULL"
+        ).fetchall()
+        translated = 0
+        failed = 0
+        for row in pending:
+            text_en = row["description_en"]
+            if not text_en or not text_en.strip():
+                continue  # GitHub 官方允许无简介：空描述跳过
+            if has_cjk(text_en):
+                continue  # 原文已含中文（含中英混排），不送译
+            try:
+                zh = await client.translate(text_en)
+            except DeepSeekAuthError as exc:
+                # 账户类确定性错误（key 空/无效/余额）：直通整轮 handler——detail 带修复指引，
+                # 前端按非 200 统一 toast"未配置 DeepSeek API key"（§7.3）
+                raise HTTPException(status_code=500, detail=str(exc)) from None
+            except Exception as exc:
+                logger.warning("AI 批量补译失败，跳过 %s：%s", row["full_name"], exc)
+                failed += 1
+                continue
+            conn.execute("UPDATE repos SET description_zh = ? WHERE id = ?", (zh, row["id"]))
+            conn.commit()
+            translated += 1
+        return {"translated": translated, "failed": failed}
+    finally:
+        conn.close()
+        _batch_translating_lock.release()

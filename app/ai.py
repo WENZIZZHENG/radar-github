@@ -1,11 +1,12 @@
-"""AI 服务（T-011）：DeepSeek 懒翻译＋周榜推荐理由生成＋全程降级（《架构决策记录》决策 5/6）。
+"""AI 服务（T-011＋T-016）：DeepSeek 全池翻译＋周榜推荐理由生成＋全程降级（《架构决策记录》决策 5 v2/6）。
 
 口径（任务书钉死，勿自由发挥）：
-- 懒翻译（决策 5）：只对当周上榜集（17 张周榜 Top30 去重）且 description_zh IS NULL、英文简介非空、
-  不含 CJK 的仓库逐条调翻译回填 repos.description_zh；未上榜项目一律不动——AI 成本只花在看得见的地方；
+- 全池翻译（决策 5 v2，T-016）：翻译目标 = 全池未译仓库（description_zh IS NULL 且英文简介非空、
+  不含 CJK 的逐条翻译回填 repos.description_zh，含 dead=1）；原文变更时采集层已清 description_zh
+  （discover.py T-016 变更检测），当日本轮自然重译；翻译本身幂等——译过的不重译；
 - 推荐理由（决策 6）：对上榜集逐仓生成 2~3 句中文推荐语（按项目生成一次、跨榜复用），
   按 (repo_id, ISO 周标签) 写入 recommendations；同周已存在跳过（幂等），跨周自然生成新行——
-  "每周重新生成"靠周标签区分实现，不覆盖历史周；
+  "每周重新生成"靠周标签区分实现，不覆盖历史周（T-016 一行未动）；
 - 降级：DEEPSEEK_API_KEY 未配置 → 记 INFO 返回零统计，服务照常；单条 translate/recommend 失败 →
   记 WARNING 跳过该条计入统计，绝不抛出；AI 整段异常由调用方（daily_job）吞掉记 ERROR——
   任何情况下快照主流程不受影响。
@@ -222,11 +223,12 @@ async def ensure_weekly_ai(
     now: datetime,
     log: logging.Logger | None = None,
 ) -> dict[str, int]:
-    """当周上榜集的懒翻译＋推荐理由生成（幂等，可断点续跑），返回统计 dict。
+    """全池未译翻译＋当周上榜集推荐理由生成（幂等，可断点续跑），返回统计 dict。
 
-    步骤：load_topics → compute_boards(period="week", as_of=now) 算 17 榜 → 去重上榜集 S →
-    a) S 中未译且英文非空无 CJK 的逐条翻译回填 repos.description_zh；
-    b) S 中缺 (repo_id, 当周 ISO 周标签) 的逐条生成推荐语 INSERT recommendations；
+    步骤：a) 全池翻译（T-016：目标 = 全池 description_zh IS NULL 且英文非空无 CJK 的仓库，含 dead=1，
+    与当周上榜集解耦——采集层原文变更已清译文，此处自然重译；译过的不重译）；
+    b) compute_boards(period="week", as_of=now) 算 17 榜 → 去重上榜集 S →
+    S 中缺 (repo_id, 当周 ISO 周标签) 的逐条生成推荐语 INSERT recommendations（决策 6 口径一行未动）；
     c) 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效）是确定性配置错误，
        逐条重试无意义，直通抛出由调用方整轮捕获（与采集层 GitHubAuthError 同姿态）；
     d) key 未配置记 INFO 直接返回零统计。
@@ -241,9 +243,32 @@ async def ensure_weekly_ai(
     log = log or logger
     stats = {"listed": 0, "translated": 0, "translate_failed": 0, "recommended": 0, "recommend_failed": 0}
     if not get_settings().deepseek_api_key:
-        log.info("DEEPSEEK_API_KEY 未配置：跳过本周 AI 翻译与推荐语生成（降级，榜单服务照常）")
+        log.info("DEEPSEEK_API_KEY 未配置：跳过 AI 翻译与推荐语生成（降级，榜单服务照常）")
         return stats
 
+    # a) 全池翻译（T-016）：全池未译逐条翻译回填；已译/中文/空描述一律跳过；与上榜集解耦
+    pending = conn.execute(
+        "SELECT id, full_name, description_en FROM repos WHERE description_zh IS NULL"
+    ).fetchall()
+    for row in pending:
+        text_en = row["description_en"]
+        if not text_en or not text_en.strip():
+            continue  # GitHub 官方允许无简介：空描述跳过
+        if has_cjk(text_en):
+            continue  # 原文已含中文（含中英混排），不重复译
+        try:
+            zh = await client.translate(text_en)
+        except DeepSeekAuthError:
+            raise  # 账户类确定性错误（401/402/403）：逐条重试只会刷爆日志，直通整轮 handler
+        except Exception as exc:
+            log.warning("AI 翻译失败，跳过 %s：%s", row["full_name"], exc)
+            stats["translate_failed"] += 1
+            continue
+        conn.execute("UPDATE repos SET description_zh = ? WHERE id = ?", (zh, row["id"]))
+        conn.commit()
+        stats["translated"] += 1
+
+    # b) 推荐理由（决策 6 口径，T-016 一行未动）：同周已存在跳过（幂等）；跨周周标签不同自然生成新行
     topic_table = load_topics(TOPICS_PATH)
     boards = compute_boards(conn, topic_table, period="week", as_of=now.strftime(_ISO_FMT), top_n=30)
     listed: dict[str, _ListedItem] = {}  # full_name → 行信息＋分类榜名；dict 保序，结果可复现
@@ -259,32 +284,8 @@ async def ensure_weekly_ai(
         return stats
 
     week = _week_label(now.date())
+    # 查询在翻译段之后：本轮刚译好的 description_zh 进推荐语输入
     repo_info = _load_repo_info(conn, list(listed))
-
-    # a) 懒翻译：已译/中文/空描述一律跳过
-    for full_name, item in listed.items():
-        info = repo_info.get(full_name)
-        if info is None or info["description_zh"] is not None:
-            continue  # 防御：榜上仓库必在 repos（compute_boards 同源），查不到跳过；已译跳过
-        text_en = item.row.description_en
-        if not text_en or not text_en.strip():
-            continue  # GitHub 官方允许无简介：空描述跳过
-        if has_cjk(text_en):
-            continue  # 原文已含中文（含中英混排），不重复译
-        try:
-            zh = await client.translate(text_en)
-        except DeepSeekAuthError:
-            raise  # 账户类确定性错误（401/402/403）：逐条重试只会刷爆日志，直通整轮 handler
-        except Exception as exc:
-            log.warning("AI 翻译失败，跳过 %s：%s", full_name, exc)
-            stats["translate_failed"] += 1
-            continue
-        conn.execute("UPDATE repos SET description_zh = ? WHERE full_name = ?", (zh, full_name))
-        conn.commit()
-        stats["translated"] += 1
-
-    # b) 推荐理由：同周已存在跳过（幂等）；跨周周标签不同自然生成新行
-    repo_info = _load_repo_info(conn, list(listed))  # 重查一次：让本轮刚译好的 description_zh 进推荐语输入
     done_ids = {
         row["repo_id"] for row in conn.execute("SELECT repo_id FROM recommendations WHERE report_week = ?", (week,))
     }

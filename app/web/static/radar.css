@@ -338,3 +338,24 @@ nav.tabs a.active i { color: var(--text-2); }
   font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
   background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px;
 }
+
+/* ===== T-016 追加（翻译按钮/批量按钮；复用既有 token，视觉同 .tag-add 一族） ===== */
+
+/* 行内翻译按钮：与"＋ 标签"同族视觉（虚线 pill），disabled 态降饱和（"翻译中…"防连点，§7.2） */
+.translate-btn {
+  font-size: 12px; color: var(--text-3); border: 1px dashed var(--line-strong); border-radius: var(--r-pill);
+  padding: 3px 12px; background: none; cursor: pointer;
+  transition: color var(--t-fast) ease, border-color var(--t-fast) ease, opacity var(--t-fast) ease;
+}
+.translate-btn:hover:not(:disabled) { color: var(--text-1); border-color: var(--text-3); }
+.translate-btn:disabled { opacity: .55; cursor: default; }
+
+/* 页脚批量补译按钮（§7.1：页脚 meta 行区域）：小字链接钮，与 footer 弱文字和谐 */
+footer.note .translate-all {
+  display: inline-flex; align-items: center; gap: 4px; margin-left: 8px;
+  font-size: 12px; color: var(--blue); background: none;
+  border: 1px solid rgba(88,166,255,.32); border-radius: var(--r-pill); padding: 2px 10px; cursor: pointer;
+  transition: background var(--t-fast) ease, border-color var(--t-fast) ease, opacity var(--t-fast) ease;
+}
+footer.note .translate-all:hover:not(:disabled) { background: rgba(88,166,255,.1); border-color: var(--blue); }
+footer.note .translate-all:disabled { opacity: .55; cursor: default; }
