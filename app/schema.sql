@@ -48,12 +48,19 @@ CREATE TABLE IF NOT EXISTS tags (
 -- 主键服务"仓库 → 标签"方向；分主题榜单走"标签 → 仓库"反查，需独立索引
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags (tag);
 
--- 推荐理由：按周重新生成，同一仓库同一周只保留最新一条（重新生成用 INSERT OR REPLACE 覆盖）
+-- 推荐理由（T-017 三口径分维度）：同一仓库按"榜单维度 × 期次标签"各存一条——周/季文本带增量语境
+--（期次标签换行/REPLACE，每周重生），总星文本存量语境（period_label 固定 'all'，懒生成＋README 变更重生）。
+-- readme_sha 存 README blob sha 指纹供每日 ensure 比对（NULL＝未拉取过；NULL 仓后续出现 README 视为变更自愈）；
+-- generated_week 写生成时所在 ISO 周（周/季文本"本周已生成"幂等与季内每周 REPLACE 判断用）。
+-- 旧结构 (repo_id, report_week, text) 的幂等迁移在 db.py init_db（PRAGMA table_info 探列），本定义只服务新装库。
 CREATE TABLE IF NOT EXISTS recommendations (
     repo_id INTEGER NOT NULL REFERENCES repos (id),
-    report_week TEXT NOT NULL,             -- ISO 周，格式如 2026-W32
+    dimension TEXT NOT NULL CHECK (dimension IN ('week', 'quarter', 'total')),
+    period_label TEXT NOT NULL,             -- 周标签（2026-W32）/ 季标签（2026-Q3）/ 总星固定 'all'
     text TEXT NOT NULL,
-    PRIMARY KEY (repo_id, report_week)
+    readme_sha TEXT,                        -- README blob sha：未拉取过保持 NULL
+    generated_week TEXT NOT NULL,           -- 生成时所在 ISO 周，格式如 2026-W32
+    PRIMARY KEY (repo_id, dimension, period_label)
 );
--- 周报展示按周取全量推荐理由
-CREATE INDEX IF NOT EXISTS idx_recommendations_week ON recommendations (report_week);
+-- 按维度×期次取全量推荐理由（周报页按周取、季页按季取、总星/关注页取 total/'all'）
+CREATE INDEX IF NOT EXISTS idx_recommendations_dim_period ON recommendations (dimension, period_label);

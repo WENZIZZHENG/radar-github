@@ -424,3 +424,48 @@ def test_snapshot_description_removed_clears_en_and_zh(tmp_path):
     assert row["description_en"] is None and row["description_zh"] is None
     assert conn.execute("SELECT COUNT(*) FROM star_snapshots").fetchone()[0] == 1
     conn.close()
+
+
+# ---------- T-017：简介变更连带清全部维度推荐语（与译文清除同一检测点，当日 ensure 范围内重生） ----------
+
+
+def test_snapshot_description_change_clears_all_recommendations(tmp_path):
+    """description_en 变更 → 同事务 DELETE 该仓全部维度推荐语（可再生数据）；译文同样清除。"""
+    conn = _open_db(tmp_path)
+    repo_id = _seed_repo_with_desc(conn, description_en="old desc", description_zh="旧译")
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'week', '2026-W32', '周文本', NULL, '2026-W32'),"
+        " (?, 'total', 'all', '总星文本', 'sha-1', '2026-W32')",
+        (repo_id, repo_id),
+    )
+    conn.commit()
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc")})
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    row = conn.execute("SELECT description_en, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["description_en"] == "new desc" and row["description_zh"] is None
+    # 全部维度推荐语同事务清除（简介变更 → 当日 ensure 对范围内仓重生自愈）
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 0
+    conn.close()
+
+
+def test_snapshot_description_unchanged_keeps_recommendations(tmp_path):
+    """简介无变更 → 不动推荐语（README 变更检测是 ensure 的事，采集层不碰）。"""
+    conn = _open_db(tmp_path)
+    repo_id = _seed_repo_with_desc(conn, description_en="same desc", description_zh="已译")
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '总星文本', 'sha-1', '2026-W32')",
+        (repo_id,),
+    )
+    conn.commit()
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc")})
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    row = conn.execute("SELECT description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["description_zh"] == "已译"
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 1
+    conn.close()

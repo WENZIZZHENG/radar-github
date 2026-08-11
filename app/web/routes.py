@@ -10,7 +10,10 @@
 - 标签写操作与 P5 筛选页（T-010）：tags 表增删在本层（幂等/校验/404 口径见 /api/tags 路由），行内交互在 radar.js；
 - 翻译写端点（T-016）：单个强制重译 / 批量只补 NULL（见 /api/translate、/api/translate-missing，
   《交互流程说明》§7.4 钉死口径；不触碰 recommendations 表）；
-- 本层对 recommendations 表只读展示（T-011 才接线生成）。
+- 推荐语写端点（T-017）：单个强制重生 / 批量只补缺失（见 /api/recommend、/api/recommend-missing，
+  《交互流程说明》§8.4 钉死口径；不触碰 repos 翻译字段）；
+- 本层对 recommendations 表展示映射按 (dimension, period_label) 取（§8.1：周页→周文本、季页→季文本、
+  总星/关注/标签页→总星文本），缺则该行无推荐语块（AI 降级形态）。
 """
 
 from __future__ import annotations
@@ -30,7 +33,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from app.ai import DeepSeekAuthError, DeepSeekClient, has_cjk
+from app.ai import (
+    DeepSeekAuthError,
+    DeepSeekClient,
+    _ReadmeState,
+    _scope_sets,
+    has_cjk,
+    recommend_missing,
+)
 from app.classify import LANGUAGES, OTHER_LANGUAGE_KEY, classify_language, load_topics
 from app.collector.github import (
     GitHubAuthError,
@@ -336,6 +346,10 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
                     "reason": reasons.get(r["full_name"]),  # None → 无推荐语块（AI 降级形态）
                     "tags": tags.get(r["full_name"], []),
                     "window_note": r["window_note"],
+                    # T-017（§8.1/§8.2）：关注页长期盯梢语境 → 总星维度文本；行内按钮按 total 操作
+                    "reason_dim": "total",
+                    "reason_period_label": "all",
+                    "show_recommend": True,
                 }
             )
         groups.append(
@@ -350,17 +364,20 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
     return groups
 
 
-def _display_maps(conn: sqlite3.Connection, as_of_date: date) -> tuple[dict, dict, dict]:
+def _display_maps(
+    conn: sqlite3.Connection, *, dimension: str, period_label: str
+) -> tuple[dict, dict, dict]:
     """详情面板展示映射（recommendations / description_zh / tags 三张表全部只读）：
-    - 推荐理由 recommendations：按 as_of 所在 ISO 周取（周报页即该周；季/总星页取 as_of 当周，T-011 接线时可再调）；
+    - 推荐理由 recommendations：按 (维度, 期次标签) 取（§8.1 展示映射）——周页 ('week', 当周标签)、
+      季页 ('quarter', 当季标签)、总星榜/关注页/标签结果页 ('total', 'all')；缺则该行无推荐语块（AI 降级）；
     - 中文描述 description_zh：懒写入，当前全 NULL → 只显示英文（AI 降级口径，流程说明 §4）；
     - 标签 tags：每行 chips 数据源（行内增删走 /api/tags、结果页跳转 /tags/<tag>，T-010 接线）。
     """
-    week_key = _week_label(as_of_date)
     reasons = dict(
         conn.execute(
-            "SELECT r.full_name, c.text FROM recommendations c JOIN repos r ON r.id = c.repo_id WHERE c.report_week = ?",
-            (week_key,),
+            "SELECT r.full_name, c.text FROM recommendations c JOIN repos r ON r.id = c.repo_id"
+            " WHERE c.dimension = ? AND c.period_label = ?",
+            (dimension, period_label),
         ).fetchall()
     )
     zh = dict(conn.execute("SELECT full_name, description_zh FROM repos WHERE description_zh IS NOT NULL").fetchall())
@@ -370,8 +387,37 @@ def _display_maps(conn: sqlite3.Connection, as_of_date: date) -> tuple[dict, dic
     return reasons, zh, tags
 
 
-def _row_view(rank: int, row: ReportRow, *, period: str, followed: set, reasons: dict, zh: dict, tags: dict) -> dict:
-    """榜单行 + 详情面板的模板视图：模板只负责渲染，一切格式化在本层完成。"""
+def _page_recommend_ctx(period: str, as_of_date: date) -> dict:
+    """页面展示维度 → 推荐语 (dimension, period_label)（§8.1 展示映射）＋行内按钮参数。
+
+    period 用实际展示期次（周/季页首期空态降级为 total 时按 total 取——页面行即总星榜行，
+    按钮维度与展示一致）。周/季按页面语境日期推导标签：历史周页取该周标签，手动重生写回同一期。
+    """
+    if period == "week":
+        return {"reason_dim": "week", "reason_period_label": _week_label(as_of_date), "show_recommend": True}
+    if period == "quarter":
+        return {"reason_dim": "quarter", "reason_period_label": _quarter_label(as_of_date), "show_recommend": True}
+    return {"reason_dim": "total", "reason_period_label": "all", "show_recommend": True}
+
+
+def _row_view(
+    rank: int,
+    row: ReportRow,
+    *,
+    period: str,
+    followed: set,
+    reasons: dict,
+    zh: dict,
+    tags: dict,
+    reason_dim: str = "total",
+    reason_period_label: str = "all",
+    show_recommend: bool = False,
+) -> dict:
+    """榜单行 + 详情面板的模板视图：模板只负责渲染，一切格式化在本层完成。
+
+    reason_dim/reason_period_label/show_recommend 为 T-017 行内推荐语按钮参数（§8.2：只在有推荐语
+    展示位的页面出现，按当前页维度操作）；标签结果页行（_tag_row_view）传 show_recommend=False 不渲染按钮。
+    """
     delta_text = None
     delta_neg = False
     if period != "total" and row.delta is not None:  # 出席行 delta 恒非 None；None 防御性保留
@@ -398,6 +444,9 @@ def _row_view(rank: int, row: ReportRow, *, period: str, followed: set, reasons:
         "reason": reasons.get(row.full_name),  # None → 无推荐语块（AI 降级形态，不留空框）
         "tags": tags.get(row.full_name, []),
         "window_note": window_note,
+        "reason_dim": reason_dim,
+        "reason_period_label": reason_period_label,
+        "show_recommend": show_recommend,
     }
 
 
@@ -438,8 +487,22 @@ def _boards_context(
         follow_rows = conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id").fetchall()
         followed = {r["full_name"] for r in follow_rows}
 
-        reasons, zh, tags = _display_maps(conn, as_of_date)
-        row_ctx = {"period": effective_period, "followed": followed, "reasons": reasons, "zh": zh, "tags": tags}
+        # T-017 展示映射（§8.1）：按实际展示期次取 (dimension, period_label)——首期空态降级为 total
+        # 时按 total 取（页面行即总星榜行，按钮维度与展示一致）
+        rec_ctx = _page_recommend_ctx(effective_period, as_of_date)
+        reasons, zh, tags = _display_maps(
+            conn, dimension=rec_ctx["reason_dim"], period_label=rec_ctx["reason_period_label"]
+        )
+        row_ctx = {
+            "period": effective_period,
+            "followed": followed,
+            "reasons": reasons,
+            "zh": zh,
+            "tags": tags,
+            "reason_dim": rec_ctx["reason_dim"],
+            "reason_period_label": rec_ctx["reason_period_label"],
+            "show_recommend": rec_ctx["show_recommend"],
+        }
         lang_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "language"]
         topic_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "topic"]
 
@@ -527,7 +590,8 @@ def follows_page(request: Request) -> HTMLResponse:
             " FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
         ).fetchall()
         cards = _follow_cards(conn, follow_rows, now.strftime(_ISO_FMT))
-        reasons, zh, tags = _display_maps(conn, now.date())
+        # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块
+        reasons, zh, tags = _display_maps(conn, dimension="total", period_label="all")
         return templates.TemplateResponse(
             request=request,
             name="follows.html",
@@ -725,10 +789,20 @@ def _tag_cloud(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def _tag_row_view(rank: int, row: sqlite3.Row, stars: int | None, *, followed: set, reasons: dict, zh: dict, tags: dict) -> dict:
+def _tag_row_view(
+    rank: int,
+    row: sqlite3.Row,
+    stars: int | None,
+    *,
+    followed: set,
+    reasons: dict,
+    zh: dict,
+    tags: dict,
+) -> dict:
     """标签结果页行视图：与 _row_view 同字段契约（_row.html 共用），无增量列（按总星排序口径）。
 
     dead 仓库保留展示（打过的标签仍在）：整行灰显＋"已失效"（_row.html 既有分支），up 列退化"——"。
+    T-017：推荐语按总星维度展示（同总星榜语境）；行内推荐按钮不渲染（§8.2 只在周/季/总星/关注四页出现）。
     """
     return {
         "rank": rank,
@@ -746,6 +820,9 @@ def _tag_row_view(rank: int, row: sqlite3.Row, stars: int | None, *, followed: s
         "reason": reasons.get(row["full_name"]),  # None → 无推荐语块（AI 降级形态，不留空框）
         "tags": tags.get(row["full_name"], []),
         "window_note": None,
+        "reason_dim": "total",
+        "reason_period_label": "all",
+        "show_recommend": False,
     }
 
 
@@ -798,7 +875,8 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
             starred.append((_endpoint_stars(conn, r["id"], as_of), r))
         starred.sort(key=lambda t: (-(t[0] or 0), t[1]["full_name"]))  # 无快照行按 0 沉底，同星按名稳定
 
-        reasons, zh, tags = _display_maps(conn, now.date())
+        # T-017（§8.1）：标签结果页同总星榜语境 → 总星维度文本；行内推荐按钮不渲染（_tag_row_view）
+        reasons, zh, tags = _display_maps(conn, dimension="total", period_label="all")
         follow_rows = conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id").fetchall()
         followed = {r["full_name"] for r in follow_rows}
         view_rows = [
@@ -901,8 +979,9 @@ async def api_translate(request: Request, client: DeepSeekClient = Depends(_ai_c
 
 @router.post("/api/translate-missing", status_code=202)
 async def api_translate_missing() -> dict:
-    """批量补译（§7.2 第 2 步，后台任务形态）：锁内原子检查＋占位 running → 统计待译 total（description_zh IS NULL
-    且英文非空无 CJK，含 dead；SQL 预过滤 NULL/空串，Python 过 has_cjk）→ asyncio.create_task 起 worker（模块级
+    """批量补译（§7.2 第 2 步，后台任务形态）：锁内原子检查＋占位 running → 统计待译 total（范围集 S
+    = 三口径榜 Top30 去重 ∪ 关注集内 description_zh IS NULL 且英文非空无 CJK 的仓——T-017 决策 5 v3
+    收窄，S 之外不送译；SQL 预过滤 NULL/空串，Python 过 has_cjk）→ asyncio.create_task 起 worker（模块级
     持有防 GC）→ 立即返回 202 {"started": true, "total": T}；running 时重复触发 409（detail 即 §7.3 前端 toast
     文案）；不触碰 recommendations 表。进度/结果由 worker 写入 _batch_state，前端轮询 /status 读取。
     """
@@ -912,16 +991,40 @@ async def api_translate_missing() -> dict:
         with _batch_state_lock:
             if _batch_state["running"]:
                 raise HTTPException(status_code=409, detail="补译任务进行中，请稍后再试")
-            pending = conn.execute(
-                "SELECT id, full_name, description_en FROM repos"
-                " WHERE description_zh IS NULL AND description_en IS NOT NULL AND trim(description_en) != ''"
-            ).fetchall()
-            pending = [row for row in pending if not has_cjk(row["description_en"])]
+            # T-017 收窄（决策 5 v3，评审 F1-1）：翻译目标 = 范围集 S（三口径榜 Top30 去重 ∪ 关注集），
+            # S 之外（未上榜未关注）的仓不送译——与每日 ensure 翻译段同源口径
+            pending = _pending_translate_in_scope(conn)
             _batch_state.update(running=True, translated=0, failed=0, total=len(pending), finished=False, error=None)
     finally:
         conn.close()
     _batch_task = asyncio.create_task(_run_batch_translate(pending))
     return {"started": True, "total": len(pending)}
+
+
+def _pending_translate_in_scope(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """批量补译候选：范围集 S 内 description_zh IS NULL 且英文非空无 CJK 的仓库（评审 F1-1 收窄）。
+
+    与每日 ensure 翻译段同一范围口径（_scope_sets：三口径榜 Top30 去重 ∪ 关注集）；空描述/CJK 跳过
+    口径照旧（SQL 预过滤 NULL/空串，Python 过 has_cjk）；分块防旧 SQLite 变量上限。
+    """
+    listed_by_period, follow_names = _scope_sets(conn, now=datetime.now(timezone.utc))
+    scope_names = list(follow_names)
+    for period in ("week", "quarter", "total"):
+        for full_name in listed_by_period[period]:
+            if full_name not in scope_names:
+                scope_names.append(full_name)
+    pending: list[sqlite3.Row] = []
+    for offset in range(0, len(scope_names), _NAME_LOOKUP_CHUNK):
+        chunk = scope_names[offset : offset + _NAME_LOOKUP_CHUNK]
+        placeholders = ", ".join("?" * len(chunk))
+        rows = conn.execute(
+            "SELECT id, full_name, description_en FROM repos"
+            " WHERE full_name IN ({}) AND description_zh IS NULL"
+            " AND description_en IS NOT NULL AND trim(description_en) != ''".format(placeholders),
+            chunk,
+        ).fetchall()
+        pending.extend(row for row in rows if not has_cjk(row["description_en"]))
+    return pending
 
 
 async def _run_batch_translate(pending: list[sqlite3.Row]) -> None:
@@ -954,8 +1057,15 @@ async def _run_batch_translate(pending: list[sqlite3.Row]) -> None:
                 with _batch_state_lock:
                     _batch_state["failed"] += 1
                 continue
-            conn.execute("UPDATE repos SET description_zh = ? WHERE id = ?", (zh, row["id"]))
+            # 低-6 收口（T-017 顺带）：UPDATE 带护栏（id + 现值仍 NULL + 原文未变）——
+            # 写库前不重查现值的竞态防护（并发单个翻译 API 或当轮 ensure 已写入则本条跳过，不重复计数）
+            cur = conn.execute(
+                "UPDATE repos SET description_zh = ? WHERE id = ? AND description_zh IS NULL AND description_en = ?",
+                (zh, row["id"], text_en),
+            )
             conn.commit()
+            if cur.rowcount == 0:
+                continue  # 并发窗口内已被写入：本条不再计数，重跑幂等自然收敛
             with _batch_state_lock:
                 _batch_state["translated"] += 1
     except Exception:
@@ -980,3 +1090,284 @@ async def api_translate_missing_status() -> dict:
     """批量补译进度查询（§7.2）：前端每 2s 轮询；不依赖 AI client，无任务史时全零/false/None。"""
     with _batch_state_lock:
         return dict(_batch_state)
+
+
+# ===== 推荐语 API（T-017；口径《交互流程说明》§8.4 钉死：单个强制重生 / 批量只补缺失，不触碰翻译字段） =====
+
+# 批量补齐推荐语后台任务状态（§8.2 后台形态；与翻译批量 _batch_state 并列独立不共用——语义/失败域/
+# 状态文案/节奏不同）：POST 原子占位 running → 起 worker 立即 202 → 前端 2s 轮询 /status；
+# error ∈ None | "auth"（key 未配置/无效/余额，确定性配置错误）| "unknown"（其余未知异常）；
+# S 档单进程跨请求共享，线程锁保护读写
+_rec_batch_state: dict = {
+    "running": False,
+    "recommended": 0,
+    "failed": 0,
+    "total": 0,
+    "finished": False,
+    "error": None,
+}
+_rec_batch_state_lock = threading.Lock()  # 保护 _rec_batch_state 读写；防重入语义（running 时 POST → 409）
+_rec_batch_task: asyncio.Task | None = None  # 模块级持有后台任务引用，防 GC 意外回收
+
+_REC_DIMENSIONS = ("week", "quarter", "total")
+_NAME_LOOKUP_CHUNK = 500  # 批量补缺反查 id 的分块大小：防御旧编译 SQLite 的 999 变量上限（与 app.report 同口径）
+
+
+def _make_github_client() -> GitHubClient:
+    """批量推荐 worker 自造 GitHub client（README 输入拉取）：后台任务无请求生命周期；
+    单测 monkeypatch 本工厂注入假 client（同 _make_ai_client 手法，不打真 API）。"""
+    return GitHubClient(get_settings().github_token)
+
+
+def _validate_recommend_params(dimension: object, period_label: object) -> tuple[str, str]:
+    """推荐语维度/期次标签入参校验（fail-loud）：dimension ∈ 三口径；period_label 按维度格式
+    （周 ISO / 季 2026-Q3 / total 固定 'all'）。"""
+    if dimension not in _REC_DIMENSIONS:
+        raise HTTPException(status_code=400, detail=f"dimension 应为 week/quarter/total，收到：{dimension!r}")
+    if not isinstance(period_label, str):
+        raise HTTPException(status_code=400, detail=f"period_label 应为字符串，收到：{period_label!r}")
+    if dimension == "total":
+        if period_label != "all":
+            raise HTTPException(status_code=400, detail="total 维度期次标签固定为 all")
+    elif dimension == "week":
+        if not _WEEK_RE.fullmatch(period_label):
+            raise HTTPException(status_code=400, detail=f"周次格式应为 ISO 周（如 2026-W32），收到：{period_label!r}")
+    else:
+        if not _QUARTER_RE.fullmatch(period_label):
+            raise HTTPException(status_code=400, detail=f"季度格式应为 2026-Q3，收到：{period_label!r}")
+    return dimension, period_label
+
+
+async def _parse_recommend_payload(request: Request) -> tuple[str, str, str]:
+    """/api/recommend 请求体解析：JSON dict + full_name/dimension/period_label 校验（fail-loud）。"""
+    hint = '请求体须为 JSON：{"full_name": "...", "dimension": "...", "period_label": "..."}'
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail=hint) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=hint)
+    full_name = _parse_full_name(payload.get("full_name"))
+    dimension, period_label = _validate_recommend_params(payload.get("dimension"), payload.get("period_label"))
+    return full_name, dimension, period_label
+
+
+def _as_of_for_label(dimension: str, period_label: str, now: datetime) -> str | None:
+    """单个重生按当前页期次换算 as_of（增量语境口径，与 _resolve_week/_resolve_quarter 同姿态）：
+    历史周/季取期末 23:59:59Z，当前期取 now（不预支未来）；total 无增量概念返回 None。"""
+    if dimension == "week":
+        monday = _parse_week_param(period_label)
+        if period_label == _week_label(now.date()):
+            return now.strftime(_ISO_FMT)
+        return f"{(monday + timedelta(days=6)).isoformat()}T23:59:59Z"
+    if dimension == "quarter":
+        year, q = _parse_quarter_param(period_label)
+        if period_label == _quarter_label(now.date()):
+            return now.strftime(_ISO_FMT)
+        return f"{_quarter_end_date(year, q).isoformat()}T23:59:59Z"
+    return None
+
+
+def _recommend_error_to_http(exc: Exception) -> HTTPException:
+    """AI 调用异常 → HTTP 错误映射（同翻译 API 姿态）：账户类（key 空/无效/余额）→ 500 带修复指引；
+    其余（超时/5xx/畸形）→ 502。失败时库内未写入，旧文本天然保留（§8.3）。"""
+    if isinstance(exc, DeepSeekAuthError):
+        return HTTPException(status_code=500, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"推荐语生成失败：{exc}")
+
+
+@router.post("/api/recommend")
+async def api_recommend(
+    request: Request,
+    client: DeepSeekClient = Depends(_ai_client),
+    github: GitHubClient = Depends(_github_client),
+) -> dict:
+    """单个强制重生（§8.2 第 1 步 / §8.4）：按当前页维度覆盖同维度当期行（INSERT OR REPLACE 新文本）。
+
+    README 正文随生成拉取入输入（失败/空退化元数据输入，不阻塞）；total 行同时更新 readme_sha
+    （避免次日 ensure 把手动写入的 sha 当作变更误触发重生），week/quarter 行 readme_sha 保持 NULL。
+    周/季增量语境按当前页期次换算（历史周页重生即该周窗口口径，出席才带增量行）；
+    repo 不在跟踪池 → 404；AI/网络失败 → 502（旧文本保留，前端 toast"推荐语生成失败，稍后再试"）；
+    DeepSeekAuthError（key 未配置/无效/余额）→ 500 带修复指引（§8.3 前端 toast"未配置 DeepSeek API key"）。
+    """
+    full_name, dimension, period_label = await _parse_recommend_payload(request)
+    now = datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        repo = conn.execute(
+            "SELECT id, description_en, description_zh, language FROM repos WHERE full_name = ?", (full_name,)
+        ).fetchone()
+        if repo is None:
+            raise HTTPException(status_code=404, detail=f"仓库不在跟踪池：{full_name}")
+        # README 输入（失败/空退化，绝不抛出阻塞）；stats 传占位 dict：单条不计 readme_fetched 计数
+        readme_state = _ReadmeState(github, logger)
+        readme_text, readme_sha = await readme_state.get(full_name, {"readme_fetched": 0})
+        delta = stars = None
+        if dimension != "total":
+            as_of = _as_of_for_label(dimension, period_label, now)
+            info = compute_repo_deltas(conn, period=dimension, as_of=as_of, repo_ids=[repo["id"]]).get(repo["id"])
+            if info is not None:
+                delta, stars = info.delta, info.stars  # 缺席（dead/首周）→ None：prompt 不写增星/总星行
+        try:
+            text = await client.recommend(
+                full_name=full_name,
+                description=repo["description_zh"] or repo["description_en"] or "（无简介）",
+                language=repo["language"] or "未知",
+                delta=delta,
+                stars=stars,
+                categories=[],
+                dimension=dimension,
+                readme=readme_text,
+            )
+        except Exception as exc:  # 不写库：失败旧文本保留（§8.3）；HTTP 映射见 _recommend_error_to_http
+            raise _recommend_error_to_http(exc) from None
+        week = _week_label(now.date())
+        if dimension == "total":
+            # F2-1 修复：本次 README 拉取失败（sha=None）不清指纹——保留旧值，防次日 ensure
+            # 把手动重生的行误判为 README 变更再触发重生（拉取成功才更新 sha）
+            prev_sha = conn.execute(
+                "SELECT readme_sha FROM recommendations"
+                " WHERE repo_id = ? AND dimension = 'total' AND period_label = 'all'",
+                (repo["id"],),
+            ).fetchone()
+            stored_sha = readme_sha if readme_sha is not None else (prev_sha["readme_sha"] if prev_sha else None)
+            conn.execute(
+                "INSERT OR REPLACE INTO recommendations (repo_id, dimension, period_label, text, readme_sha,"
+                " generated_week) VALUES (?, 'total', 'all', ?, ?, ?)",
+                (repo["id"], text, stored_sha, week),
+            )
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO recommendations (repo_id, dimension, period_label, text, readme_sha,"
+                " generated_week) VALUES (?, ?, ?, ?, NULL, ?)",
+                (repo["id"], dimension, period_label, text, week),
+            )
+        conn.commit()
+        return {
+            "full_name": full_name,
+            "recommended": True,
+            "text": text,
+            "dimension": dimension,
+            "period_label": period_label,
+        }
+    finally:
+        conn.close()
+
+
+def _recommend_missing_count(conn: sqlite3.Connection) -> int:
+    """批量补缺 total：S × 适用维度中 (repo_id, dimension, period_label) 行缺失数。
+
+    纯 DB 判定（不含 README sha 变更重生——那是每日 ensure 自动口径；批量 refresh=False 只补缺失），
+    与 worker 实际补缺判定一致，保证进度 X ≤ T 恒成立。
+    """
+    now = datetime.now(timezone.utc)
+    listed_by_period, follow_names = _scope_sets(conn, now=now)
+    periods = [("week", _week_label(now.date())), ("quarter", _quarter_label(now.date())), ("total", "all")]
+    existing = {
+        (r["repo_id"], r["dimension"], r["period_label"])
+        for r in conn.execute("SELECT repo_id, dimension, period_label FROM recommendations")
+    }
+    all_names = list(follow_names)
+    for period in ("week", "quarter", "total"):
+        for name in listed_by_period[period]:
+            if name not in all_names:
+                all_names.append(name)
+    id_by_name: dict[str, int] = {}
+    for offset in range(0, len(all_names), _NAME_LOOKUP_CHUNK):
+        chunk = all_names[offset : offset + _NAME_LOOKUP_CHUNK]
+        placeholders = ", ".join("?" * len(chunk))
+        for r in conn.execute(f"SELECT id, full_name FROM repos WHERE full_name IN ({placeholders})", chunk):
+            id_by_name[r["full_name"]] = r["id"]
+    total = 0
+    for period, label in periods:
+        names = list(follow_names) if period == "total" else list(listed_by_period[period])
+        if period == "total":
+            for name in listed_by_period["total"]:
+                if name not in names:
+                    names.append(name)
+        for full_name in names:
+            rid = id_by_name.get(full_name)
+            if rid is not None and (rid, period, label) not in existing:
+                total += 1
+    return total
+
+
+@router.post("/api/recommend-missing", status_code=202)
+async def api_recommend_missing() -> dict:
+    """批量补齐推荐语（§8.2 第 2 步，后台任务形态；与翻译批量并列独立不共用）：锁内原子检查＋占位
+    running → 统计补缺 total（S = 三口径榜 Top30 去重 ∪ 关注集 × 适用维度行缺失）→
+    asyncio.create_task 起 worker（模块级持有防 GC）→ 立即返回 202；running 时重复触发 409
+    （detail 即 §8.3 前端 toast 文案）；不触碰翻译字段。进度/结果由 worker 写入 _rec_batch_state。
+    """
+    global _rec_batch_task
+    conn = get_conn()
+    try:
+        with _rec_batch_state_lock:
+            if _rec_batch_state["running"]:
+                raise HTTPException(status_code=409, detail="补齐推荐语任务进行中，请稍后再试")
+            total = _recommend_missing_count(conn)
+            _rec_batch_state.update(running=True, recommended=0, failed=0, total=total, finished=False, error=None)
+    finally:
+        conn.close()
+    _rec_batch_task = asyncio.create_task(_run_batch_recommend())
+    return {"started": True, "total": total}
+
+
+async def _run_batch_recommend() -> None:
+    """后台批量补齐推荐语 worker（§8.2/§8.4）：只补范围内缺失（S × 适用维度，不强制重生；
+    README sha 变更重生归每日 ensure 自动口径）；自开 DB 连接与 AI/GitHub client（不依赖请求生命周期，
+    finally 双双关闭）；逐条生成沿用 ensure 推荐段同口径——README 失败退化输入、单条失败记 WARNING
+    计入 failed 继续整批、每条写库＋commit 立即落库、进度经 on_progress 渐进更新 state（前端"已补 X/T 条"）；
+    DeepSeekAuthError（key 未配置/无效/余额）→ error="auth" 终止整批（已生成保留）；
+    其余未知异常 → logger.exception＋error="unknown"；结束一律 running=False、finished=True
+    （state 保留供查询；下次 POST 时重置计数与 error）。
+    """
+    conn = ai_client = github_client = None
+    try:
+        conn = get_conn()
+        ai_client = _make_ai_client()
+        github_client = _make_github_client()
+
+        def _progress(stats: dict) -> None:
+            with _rec_batch_state_lock:
+                _rec_batch_state["recommended"] = stats["recommended"]
+
+        stats = await recommend_missing(
+            conn,
+            ai_client,
+            now=datetime.now(timezone.utc),
+            log=logger,
+            github_client=github_client,
+            refresh=False,
+            on_progress=_progress,
+        )
+        with _rec_batch_state_lock:
+            _rec_batch_state["failed"] = stats["recommend_failed"]
+    except DeepSeekAuthError as exc:
+        logger.warning("AI 批量补齐推荐语终止（账户类错误）：%s", exc)
+        with _rec_batch_state_lock:
+            _rec_batch_state["error"] = "auth"
+        return
+    except Exception:
+        logger.exception("AI 批量补齐推荐语异常终止")
+        with _rec_batch_state_lock:
+            _rec_batch_state["error"] = "unknown"
+    finally:
+        for obj in (ai_client, github_client):
+            if obj is not None:
+                try:
+                    await obj.aclose()
+                except Exception:  # 清理失败不阻断终端状态落盘（防假 client 无 aclose 等）
+                    logger.exception("批量推荐 client 关闭失败")
+        if conn is not None:
+            conn.close()
+        with _rec_batch_state_lock:
+            _rec_batch_state["running"] = False
+            _rec_batch_state["finished"] = True
+
+
+@router.get("/api/recommend-missing/status")
+async def api_recommend_missing_status() -> dict:
+    """批量补齐推荐语进度查询（§8.2）：前端每 2s 轮询；不依赖 AI/GitHub client，无任务史时全零/false/None。"""
+    with _rec_batch_state_lock:
+        return dict(_rec_batch_state)

@@ -8,6 +8,9 @@
 // T-016 翻译接线（§7）：行内按钮单个强制重译（成功 toast＋面板中文即时替换不刷新）；顶栏批量补译全部缺失
 // （只补 NULL，后台任务：POST 202 → 2s 轮询 /status 进度）；按钮置灰防连点，分支 toast 文案严格按 v1.5 §7.3
 // （服务端 400 detail 即 §7.3 文案，直用）。
+// T-017 推荐语接线（§8）：行内按钮单个强制重生（按当前页维度，成功 toast＋面板推荐语块即时替换不刷新）；
+// 顶栏批量补齐推荐语（只补范围内缺失，独立后台任务不共用翻译的：POST 202 → 2s 轮询 /recommend-missing/status）；
+// 分支 toast 文案严格按 §8.3 文案表。推荐语生成中按钮置灰"生成中…"防连点。
 const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 
@@ -118,6 +121,18 @@ document.addEventListener("click", (e) => {
   const translateAll = e.target.closest("#translate-all");
   if (translateAll) {
     translateMissing(translateAll);
+    return;
+  }
+  // T-017 行内推荐语按钮（§8.2）：单个强制重生（按当前页维度），成功局部替换不刷新页面
+  const recommendBtn = e.target.closest(".recommend-btn");
+  if (recommendBtn) {
+    recommendRow(recommendBtn);
+    return;
+  }
+  // T-017 顶栏批量补齐推荐语（§8.2）：只补范围内缺失，独立后台任务＋进度轮询；409/auth 文案见 §8.3
+  const recommendAll = e.target.closest("#recommend-all");
+  if (recommendAll) {
+    recommendMissing(recommendAll);
     return;
   }
   const row = e.target.closest(".row");
@@ -409,6 +424,173 @@ async function translateMissing(btn) {
     btn.disabled = true;
     btn.textContent = batchProgress(state);
     pollBatchStatus(btn);
+  } catch (err) {
+    /* 接管查询网络异常：安静忽略，不影响页面 */
+  }
+})();
+
+// ---- T-017 推荐语交互（§8.2 主路径 / §8.3 分支文案钉死，前端不发明文案） ----
+
+// 面板推荐语块即时局部替换（不刷新页面）：有则覆写文本，无则插到操作区之前（模板顺序 desc→reason→acts）；
+// 全部走 textContent 防 XSS（同 T-010/T-016 口径）
+function replaceReason(panel, text) {
+  if (!panel) return;
+  let el = panel.querySelector(".reason");
+  if (el) {
+    const b = el.querySelector("b");
+    el.textContent = "";
+    if (b) el.appendChild(b);
+    el.appendChild(document.createTextNode(text));
+    return;
+  }
+  el = document.createElement("div");
+  el.className = "reason";
+  const b = document.createElement("b");
+  b.textContent = "推荐理由";
+  el.appendChild(b);
+  el.appendChild(document.createTextNode(text));
+  const acts = panel.querySelector(".acts");
+  if (acts) acts.insertAdjacentElement("beforebegin", el);
+  else panel.appendChild(el);
+}
+
+// 单个强制重生（§8.2）：按当前页维度（data-dim/data-period-label，历史周页即该周标签）覆盖写；
+// 按钮置灰"生成中…"防连点；失败分支 toast 文案严格按 §8.3，按钮恢复按态文案、旧文本保留（服务端未写库）
+async function recommendRow(btn) {
+  if (btn.disabled) return; // 防连点（已置灰时忽略再次点击）
+  const repo = btn.dataset.repo;
+  const hadReason = btn.dataset.hasReason === "1"; // 失败恢复按态文案用（成功态固定"重新生成"）
+  const panel = btn.closest(".panel");
+  btn.disabled = true;
+  btn.textContent = "生成中…";
+  const restore = () => {
+    btn.disabled = false;
+    btn.textContent = hadReason ? "重新生成" : "生成推荐语";
+  };
+  try {
+    const resp = await fetch("/api/recommend", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ full_name: repo, dimension: btn.dataset.dim, period_label: btn.dataset.periodLabel }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      // 500 = DeepSeek 账户类（key 未配置/无效/余额，§8.3 钉死文案）；其余（AI/网络）统一"推荐语生成失败，稍后再试"
+      toast(resp.status === 500 ? "未配置 DeepSeek API key" : "推荐语生成失败，稍后再试", true);
+      restore();
+      return;
+    }
+    toast("已更新推荐语");
+    replaceReason(panel, data.text);
+    btn.dataset.hasReason = "1"; // 现在已有推荐语：下次按态即"重新生成"
+    btn.textContent = "重新生成";
+    btn.disabled = false;
+  } catch (err) {
+    toast("推荐语生成失败，稍后再试", true); // 网络层失败（§8.3"AI/网络失败"分支），旧文本保留（服务端未写库）
+    restore();
+  }
+}
+
+let recBatchTranslating = false; // 前端防连点（服务端另有 running 态 409 兜底，§8.3）
+let recBatchPollTimer = null; // 批量推荐进度轮询句柄（409/202/页面加载接管共用单轮询）
+
+// 批量推荐进度文案（§8.3 钉死）：T=0 时保持"补齐中…"，避免 0/0 歧义
+function recBatchProgress(state) {
+  return state.total > 0 ? "补齐中…（已补 " + state.recommended + "/" + state.total + " 条）" : "补齐中…";
+}
+
+// 恢复按钮常态并解锁防连点
+function restoreRecBatch(btn) {
+  recBatchTranslating = false;
+  btn.disabled = false;
+  btn.textContent = "补齐推荐语";
+}
+
+// 停止批量推荐进度轮询（页面卸载自然停止；显式停止用于完成/轮询失败）
+function stopRecBatchPolling() {
+  if (recBatchPollTimer) {
+    clearInterval(recBatchPollTimer);
+    recBatchPollTimer = null;
+  }
+}
+
+// 2s 轮询批量推荐进度（§8.2 后台形态）：running → 按钮进度文案；finished → 停轮询＋按钮恢复＋按 error/failed 分支 toast
+function pollRecBatchStatus(btn) {
+  if (recBatchPollTimer) return; // 已在轮询：409/202/页面接管共用同一轮询
+  const tick = async () => {
+    try {
+      const resp = await fetch("/api/recommend-missing/status");
+      const state = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      // 响应畸形（resp.ok 但 JSON 非预期/缺判态字段）：无法判态，按失败兜底（不误报完成）
+      if (typeof state !== "object" || state === null || !("running" in state) || !("finished" in state)) {
+        stopRecBatchPolling();
+        restoreRecBatch(btn);
+        toast("补齐失败，稍后再试", true);
+        return;
+      }
+      if (state.running === true) {
+        btn.textContent = recBatchProgress(state);
+        return; // 任务进行中：下一周期再查
+      }
+      if (state.finished === true) {
+        stopRecBatchPolling();
+        restoreRecBatch(btn);
+        if (state.error === "auth") toast("未配置 DeepSeek API key", true);
+        else if (state.error === "unknown") toast("补齐失败，稍后再试", true);
+        else if (state.failed > 0) toast("补齐完成：新生成 " + state.recommended + " 条，失败 " + state.failed + " 条");
+        else toast("补齐完成：新生成 " + state.recommended + " 条");
+        return;
+      }
+      // running/finished 双假（如服务端重启丢内存态）：非完成终态，不误报"补齐完成"，按失败兜底
+      stopRecBatchPolling();
+      restoreRecBatch(btn);
+      toast("补齐失败，稍后再试", true);
+    } catch (err) {
+      stopRecBatchPolling();
+      restoreRecBatch(btn);
+      toast("补齐失败，稍后再试", true); // 轮询网络层失败：停轮询恢复常态（服务端任务仍在跑，可再点，409 会接管）
+    }
+  };
+  recBatchPollTimer = setInterval(tick, 2000);
+  tick(); // 立即查一次：POST 202 后秒级反馈进度
+}
+
+// 顶栏批量补齐推荐语（§8.2 后台形态，与翻译批量并列独立不共用）：点击置灰 → POST（202 起任务 / 409 已有任务）
+// → 2s 轮询 /status 显示进度；完成/进行中/auth/网络失败文案严格按 §8.3，轮询期间 recBatchTranslating 保持锁防连点
+async function recommendMissing(btn) {
+  if (recBatchTranslating) return;
+  recBatchTranslating = true;
+  btn.disabled = true;
+  btn.textContent = "补齐中…";
+  try {
+    const resp = await fetch("/api/recommend-missing", { method: "POST" });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 409) {
+      toast("补齐进行中…"); // 服务端已有任务在跑：不另起，直接进轮询看它
+      pollRecBatchStatus(btn);
+      return;
+    }
+    if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status); // 其余异常（如 500）按失败兜底
+    pollRecBatchStatus(btn); // 202：后台任务已起
+  } catch (err) {
+    toast("补齐失败，稍后再试", true); // 网络层失败（§8.3 兜底文案），按钮恢复可重试
+    restoreRecBatch(btn);
+  }
+}
+
+// ---- T-017 页面加载接管在跑批量推荐任务（§8.2：按钮在顶栏、各页通用，与翻译批量各自接管） ----
+(async () => {
+  const btn = document.getElementById("recommend-all");
+  if (!btn) return;
+  try {
+    const resp = await fetch("/api/recommend-missing/status");
+    const state = await resp.json().catch(() => ({}));
+    if (!resp.ok || !state.running) return; // 无在跑任务/查询失败：安静忽略（finished 态不 toast 不动按钮）
+    recBatchTranslating = true; // 接管在跑任务：锁防连点，轮询接手进度显示
+    btn.disabled = true;
+    btn.textContent = recBatchProgress(state);
+    pollRecBatchStatus(btn);
   } catch (err) {
     /* 接管查询网络异常：安静忽略，不影响页面 */
   }

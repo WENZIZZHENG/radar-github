@@ -326,3 +326,72 @@ def test_dotenv_gbk_raises_clear_error(tmp_path):
     env_file.write_bytes("RADAR_TEST_KEY=中文\n".encode("gbk"))
     with pytest.raises(ValueError, match="UTF-8"):
         _load_dotenv(env_file)
+
+
+# ---------- T-017：fetch_readme（README 正文与 blob sha；404/畸形退化，不抛） ----------
+
+
+def _readme_payload(content: str, sha: str) -> dict:
+    """REST readme 响应 JSON（content 为 base64 的 UTF-8 字节，与 GitHub 实际一致）。"""
+    return {"type": "file", "encoding": "base64", "sha": sha, "content": __import__("base64").b64encode(content.encode("utf-8")).decode("ascii")}
+
+
+def test_fetch_readme_returns_text_and_sha():
+    """正常路径：正文 UTF-8 解码（剥首尾空白）＋ blob sha 返回；URL 为 /repos/{full_name}/readme。"""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=_readme_payload("# Radar\n\n一个 GitHub 雷达\n", "sha-abc"))
+
+    client = _make_client(handler, [])
+    text, sha = asyncio.run(client.fetch_readme("octocat/hello"))
+    assert text == "# Radar\n\n一个 GitHub 雷达"
+    assert sha == "sha-abc"
+    assert seen["url"].endswith("/repos/octocat/hello/readme")
+    asyncio.run(client.aclose())
+
+
+def test_fetch_readme_missing_404_returns_none():
+    """无 README（404）→ (None, None) 退化，不抛（GitHub 允许空仓库，调用方按元数据输入降级）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="Not Found")
+
+    client = _make_client(handler, [])
+    assert asyncio.run(client.fetch_readme("octocat/empty")) == (None, None)
+    asyncio.run(client.aclose())
+
+
+def test_fetch_readme_malformed_degrades():
+    """响应畸形（缺 content/sha）→ (None, None) 退化；base64 非法同样退化。"""
+    for payload in ({}, {"content": "abc"}, {"sha": "x"}, {"content": "!!!not-base64!!!", "sha": "x"}):
+        def handler(request: httpx.Request, payload=payload) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = _make_client(handler, [])
+        assert asyncio.run(client.fetch_readme("o/r")) == (None, None)
+        asyncio.run(client.aclose())
+
+
+def test_fetch_readme_empty_content_keeps_sha():
+    """README 文件存在但正文为空 → (None, sha)：正文退化但 sha 照记（变更检测仍生效）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_readme_payload("   ", "sha-empty"))
+
+    client = _make_client(handler, [])
+    assert asyncio.run(client.fetch_readme("o/r")) == (None, "sha-empty")
+    asyncio.run(client.aclose())
+
+
+def test_fetch_readme_auth_error_passes_through():
+    """401（token 无效）→ GitHubAuthError 上抛（调用方 _ReadmeState 统一停拉降级，不在客户端吞）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="Bad credentials")
+
+    client = _make_client(handler, [])
+    with pytest.raises(GitHubAuthError):
+        asyncio.run(client.fetch_readme("o/r"))
+    asyncio.run(client.aclose())

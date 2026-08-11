@@ -1,6 +1,6 @@
 """进程内调度（架构决策 7：SSR + SQLite + 进程内 APScheduler，不引独立调度进程）。
 
-每日 UTC 00:00 跑一次全日任务（快照＋发现池，逻辑全在 app.collector.discover；T-011 串行接 AI 周度生成）：
+每日 UTC 00:00 跑一次全日任务（快照＋发现池，逻辑全在 app.collector.discover；T-011/T-017 串行接 AI 每日生成）：
 - misfire_grace_time=1 小时：进程重启错过整点，1 小时内醒来补跑一次；
 - coalesce=True：多次错过合并成一次，不连刷配额（共识 §8 允许数据空洞，没必要补）；
 - 时区钉死 UTC：服务器本地时区不可控，采集口径全部 UTC（与 UTC 定长时间戳硬约定一致）。
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.ai import DeepSeekClient, ensure_weekly_ai
+from app.ai import DeepSeekClient, ensure_daily_ai
 from app.collector.discover import get_job_logger, run_daily
 from app.collector.github import GitHubClient
 from app.config import get_settings
@@ -26,9 +26,12 @@ MISFIRE_GRACE_SECONDS = 3600
 async def daily_job() -> None:
     """调度入口：自带连接与客户端生命周期；run_daily 内部已吞异常记日志，调度器侧无需再兜。
 
-    T-011：快照/发现之后串行跑 AI 周度生成（推荐理由；T-016 起翻译段扩为全池未译补译，同一 conn 复用 WAL 读写不互阻）。
+    T-011/T-017：快照/发现之后串行跑 AI 每日生成（翻译收窄范围为三口径榜∪关注集＋三维度推荐语；
+    同一 conn 复用 WAL 读写不互阻；github_client 复用 run_daily 的 GitHub 连接拉 README——token 缺失时
+    ensure 内部降级跳过 README 拉取、输入退化元数据、新行 readme_sha 保持 NULL；旧行指纹不被失败拉取
+    清除（F2-1：拉取失败不触发重生），不报错）。
     AI 整段 try/except 吞掉记 ERROR 不抛出——AI 失败永不阻断快照主流程（key 缺失在
-    ensure_weekly_ai 内部降级返回零统计，此路径行为与接线前一致）。
+    ensure_daily_ai 内部降级返回零统计，此路径行为与接线前一致）。
     """
     settings = get_settings()
     init_db()  # schema 全量 IF NOT EXISTS：调度进程可能与 uvicorn 分开发育，各自保证库表存在
@@ -39,9 +42,11 @@ async def daily_job() -> None:
             await run_daily(client, conn, log=log)
         try:
             async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
-                await ensure_weekly_ai(conn, ai_client, now=datetime.now(timezone.utc), log=log)
+                await ensure_daily_ai(
+                    conn, ai_client, now=datetime.now(timezone.utc), log=log, github_client=client
+                )
         except Exception:
-            log.exception("AI 周度生成整轮异常：吞掉不抛出（AI 降级不阻断快照主流程），次日调度自然重试")
+            log.exception("AI 每日生成整轮异常：吞掉不抛出（AI 降级不阻断快照主流程），次日调度自然重试")
     finally:
         conn.close()
 

@@ -28,10 +28,55 @@ def get_conn(db_path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_recommendations(conn: sqlite3.Connection) -> None:
+    """T-017 幂等迁移：recommendations 旧结构 (repo_id, report_week, text) → 新结构
+    (repo_id, dimension, period_label, text, readme_sha, generated_week)。
+
+    旧行映射 dimension='week'、period_label=generated_week=report_week 搬入（T-011 生成的按周推荐语
+    即周维度行，语义无损；真实库现 0 行但迁移逻辑必须正确）；已迁移（有 dimension 列）/表不存在/
+    未知结构（无 report_week）一律跳过。必须在 schema.sql 之前执行：新 schema 的
+    CREATE INDEX IF NOT EXISTS idx_recommendations_dim_period 引用新列，旧表未换新会因列不存在报错。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(recommendations)")}
+    if "dimension" in cols:
+        return  # 已迁移（新装库直接新结构，或此前已迁移过）：幂等跳过
+    if not cols or "report_week" not in cols:
+        return  # 表不存在（新装库走 schema.sql）或未知结构：防御，宁可留旧表也不猜
+    conn.execute("ALTER TABLE recommendations RENAME TO recommendations_legacy")
+    conn.execute(
+        """
+        CREATE TABLE recommendations (
+            repo_id INTEGER NOT NULL REFERENCES repos (id),
+            dimension TEXT NOT NULL CHECK (dimension IN ('week', 'quarter', 'total')),
+            period_label TEXT NOT NULL,
+            text TEXT NOT NULL,
+            readme_sha TEXT,
+            generated_week TEXT NOT NULL,
+            PRIMARY KEY (repo_id, dimension, period_label)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)
+        SELECT repo_id, 'week', report_week, text, NULL, report_week FROM recommendations_legacy
+        """
+    )
+    conn.execute("DROP TABLE recommendations_legacy")  # 旧索引 idx_recommendations_week 随表一并删除
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_recommendations_dim_period ON recommendations (dimension, period_label)"
+    )
+
+
 def init_db(db_path: str | Path | None = None) -> None:
-    """执行 schema.sql 建表；schema 全量 IF NOT EXISTS，重复执行安全。"""
+    """执行 schema.sql 建表；schema 全量 IF NOT EXISTS，重复执行安全。
+
+    T-017：先跑 recommendations 幂等迁移（旧表换新结构），再 executescript——
+    否则新 schema 的 CREATE INDEX 会撞上旧表缺列报错。
+    """
     conn = get_conn(db_path)
     try:
+        _migrate_recommendations(conn)
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.commit()
     finally:

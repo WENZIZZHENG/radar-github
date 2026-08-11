@@ -58,11 +58,18 @@ def _seed_full(conn):
         snapshots=[("2026-05-11T00:00:00Z", 50), ("2026-08-02T00:00:00Z", 150), (f"{SNAP_DAY}T00:00:00Z", 200)],
     )
     conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_go, "2026-08-02T00:00:00Z"))
-    # 推荐语按 as_of 所在 ISO 周取数：周 key 必须与"今天"同周，否则 /total 面板取不到
-    iso = datetime.now(timezone.utc).date().isocalendar()  # UTC 口径锁死：与应用 routes.py now(timezone.utc) 一致；本地 date.today() 在周一清晨（UTC 仍周日）会错开一周必红
+    # T-017 推荐语按 (dimension, period_label) 展示：总星行文本供 /total（时间稳健）断言；
+    # 周/季行按"今天"所处期次标签插入（_display_maps 维度映射单测另行覆盖）
+    now = datetime.now(timezone.utc)
+    iso = now.date().isocalendar()
+    week_label = f"{iso.year}-W{iso.week:02d}"
+    quarter_label = f"{now.year}-Q{(now.month - 1) // 3 + 1}"
     conn.execute(
-        "INSERT INTO recommendations (repo_id, report_week, text) VALUES (?, ?, ?)",
-        (repo_py, f"{iso.year}-W{iso.week:02d}", "本周亮点：测试推荐语"),
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '本周亮点：测试推荐语', NULL, ?),"
+        " (?, 'week', ?, '周报亮点：周推荐语', NULL, ?),"
+        " (?, 'quarter', ?, '季报亮点：季推荐语', NULL, ?)",
+        (repo_py, week_label, repo_py, week_label, week_label, repo_py, quarter_label, week_label),
     )
     conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, ?)", (repo_py, "选型观察"))
 
@@ -304,3 +311,59 @@ def test_follows_page_empty_state(fresh_client):
     assert '<a href="/">回首页</a>' in text
     assert 'id="follow-boards"' not in text
     assert '我的关注<i id="nav-follow-count">0</i>' in text
+
+
+# ---------- T-017：_display_maps 维度映射与页面推荐语展示 ----------
+
+
+def test_display_maps_dimension_mapping(tmp_path, monkeypatch):
+    """_display_maps 按 (dimension, period_label) 取推荐语：周/季/总星各取各的，互不串维度。"""
+    from app.web.routes import _display_maps
+
+    db = tmp_path / "map.db"
+    init_db(db)
+    conn = get_conn(db)
+    try:
+        now = datetime.now(timezone.utc)
+        iso = now.date().isocalendar()
+        week_label = f"{iso.year}-W{iso.week:02d}"
+        quarter_label = f"{now.year}-Q{(now.month - 1) // 3 + 1}"
+        repo_id = _add_repo(
+            conn,
+            "a/one",
+            language="Python",
+            description_en="desc",
+            snapshots=[(f"{SNAP_DAY}T00:00:00Z", 100)],
+        )
+        conn.execute(
+            "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+            " VALUES (?, 'week', ?, '周文本', NULL, ?), (?, 'quarter', ?, '季文本', NULL, ?),"
+            " (?, 'total', 'all', '总星文本', NULL, ?)",
+            (repo_id, week_label, week_label, repo_id, quarter_label, week_label, repo_id, week_label),
+        )
+        conn.commit()
+        reasons_w, _, _ = _display_maps(conn, dimension="week", period_label=week_label)
+        assert reasons_w == {"a/one": "周文本"}
+        reasons_q, _, _ = _display_maps(conn, dimension="quarter", period_label=quarter_label)
+        assert reasons_q == {"a/one": "季文本"}
+        reasons_t, _, _ = _display_maps(conn, dimension="total", period_label="all")
+        assert reasons_t == {"a/one": "总星文本"}
+        # 缺该维度行 → 无推荐语块（dict 空，降级形态）
+        reasons_empty, _, _ = _display_maps(conn, dimension="week", period_label="2026-W01")
+        assert reasons_empty == {}
+    finally:
+        conn.close()
+
+
+def test_total_page_shows_total_dimension_reason(client):
+    """总星榜页展示 ('total','all') 维度文本（§8.1）；行内推荐按钮按 total 维度渲染。"""
+    text = client.get("/total").text
+    assert "本周亮点：测试推荐语" in text  # total 行文本（_seed_full 插入）
+    assert 'class="recommend-btn" data-repo="a/py" data-dim="total" data-period-label="all" data-has-reason="1">重新生成</button>' in text
+    assert 'data-has-reason="0">生成推荐语</button>' in text  # a/go 无推荐语 → "生成推荐语"
+
+
+def test_follows_page_has_recommend_button(follows_client):
+    """关注页 P6 行内推荐按钮就位（§8.2：total 维度操作）；无推荐语时按钮按态"生成推荐语"。"""
+    text = follows_client.get("/follows").text
+    assert 'class="recommend-btn" data-repo="f/ts-hot" data-dim="total" data-period-label="all" data-has-reason="0">生成推荐语</button>' in text

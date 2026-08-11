@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -191,6 +192,32 @@ class GitHubClient:
         """
         response = await self._request("GET", f"{REPOS_URL}/{full_name}")
         return response.json()
+
+    async def fetch_readme(self, full_name: str) -> tuple[str | None, str | None]:
+        """README 正文（UTF-8 解码）与 blob sha（T-017 推荐语输入与变更检测用）。
+
+        REST GET /repos/{owner}/{repo}/readme（JSON 形态：content 为 base64）；正文截断归调用方。
+        无 README（404，GitHub 允许空仓库）→ (None, None)，调用方退化元数据输入不抛；
+        响应畸形/解码失败 → (None, None)；空正文 → (None, sha)（README 文件存在但为空，sha 照记，
+        变更检测仍生效）；其余传输/HTTP 异常按 _request 既有映射抛出（调用方降级包装，绝不阻塞快照）。
+        """
+        try:
+            response = await self._request("GET", f"{REPOS_URL}/{full_name}/readme")
+        except GitHubNotFoundError:
+            return None, None
+        try:
+            payload = response.json()
+            content = payload.get("content")
+            sha = payload.get("sha")
+        except (ValueError, AttributeError):
+            return None, None
+        if not isinstance(content, str) or not isinstance(sha, str) or not sha:
+            return None, None
+        try:
+            text = base64.b64decode(content).decode("utf-8", errors="replace")
+        except (ValueError, TypeError):
+            return None, None
+        return (text.strip() or None), sha
 
     async def _pace_search(self) -> None:
         now = time.monotonic()

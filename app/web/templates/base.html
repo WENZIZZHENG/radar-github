@@ -34,6 +34,8 @@
     {% block switcher %}{% endblock %}
     {# T-016 顶栏批量补译按钮（§7.1：全页面共用顶栏右端）：全池只补 NULL；后台任务＋进度轮询见 radar.js #}
     <button class="translate-all" id="translate-all">补译全部缺失</button>
+    {# T-017 顶栏批量补齐推荐语按钮（§8.2：翻译批量按钮旁并列独立不共用）：补范围内缺失；独立后台任务＋进度轮询 #}
+    <button class="translate-all recommend-all" id="recommend-all">补齐推荐语</button>
   </div>
 </header>
 

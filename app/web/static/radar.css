@@ -246,6 +246,8 @@ footer.note { margin-top: var(--s6); font-size: 12px; line-height: 1.7; color: v
   .week-switch { width: 100%; margin-left: 0; justify-content: space-between; }
   /* 窄屏 switcher 独占一行后，批量按钮换行仍右对齐（与无 switcher 页一致；覆盖上方桌面端 margin-left:0 那条） */
   header.top .week-switch ~ .translate-all { margin-left: auto; }
+  /* T-017：批量推荐按钮与翻译按钮并列成组贴右——flex 下两个 margin-left:auto 会平分剩余空间挤开成组，第二个不 auto */
+  header.top .week-switch ~ .recommend-all { margin-left: 0; }
   /* 窄屏锚点 chip 的分组标签独占一行，语言/主题两组成块，便于扫读 */
   .chips .grp { flex-basis: 100%; margin-left: 0 !important; }
   .row { padding: 10px 8px; gap: 5px; }
@@ -342,15 +344,19 @@ nav.tabs a.active i { color: var(--text-2); }
 }
 
 /* ===== T-016 追加（翻译按钮/批量按钮；复用既有 token，视觉同 .tag-add 一族） ===== */
+/* T-017：行内推荐语按钮（.recommend-btn）与翻译按钮同族视觉（并列独立不共用，语义/文案各管各的） */
 
-/* 行内翻译按钮：与"＋ 标签"同族视觉（虚线 pill），disabled 态降饱和（"翻译中…"防连点，§7.2） */
-.translate-btn {
+/* 行内翻译/推荐语按钮：与"＋ 标签"同族视觉（虚线 pill），disabled 态降饱和（"翻译中…/生成中…"防连点，§7.2/§8.2） */
+.translate-btn,
+.recommend-btn {
   font-size: 12px; color: var(--text-3); border: 1px dashed var(--line-strong); border-radius: var(--r-pill);
   padding: 3px 12px; background: none; cursor: pointer;
   transition: color var(--t-fast) ease, border-color var(--t-fast) ease, opacity var(--t-fast) ease;
 }
-.translate-btn:hover:not(:disabled) { color: var(--text-1); border-color: var(--text-3); }
-.translate-btn:disabled { opacity: .55; cursor: default; }
+.translate-btn:hover:not(:disabled),
+.recommend-btn:hover:not(:disabled) { color: var(--text-1); border-color: var(--text-3); }
+.translate-btn:disabled,
+.recommend-btn:disabled { opacity: .55; cursor: default; }
 
 /* 顶栏批量补译按钮（§7.1：顶栏右端，全页面共用）：小字链接钮，与顶栏弱文字和谐；margin-left:auto 靠右 */
 header.top .translate-all {
@@ -364,3 +370,7 @@ header.top .translate-all:disabled { opacity: .55; cursor: default; }
 /* 有期次切换控件的页面（周报/季度）：switcher 是顶栏唯一贴右元素（示意图基线），批量按钮紧随其右成组；
    无 switcher 页面（总星榜/关注/标签）仍 margin-left:auto 贴右；header.top 前缀保证特异性反超上方规则 */
 header.top .week-switch ~ .translate-all { margin-left: 0; }
+/* F2-2 修复（评审）：补齐推荐语按钮（class 含 translate-all）在无 switcher 页面会继承 margin-left:auto，
+   flex 下两个 auto 平分剩余空间把按钮组挤开（T-016 中-2 同类残留）——第一个按钮 auto 吸收全部剩余、
+   第二个紧跟成组；有 switcher/窄屏场景与上方 .week-switch 规则同值（0），不冲突 */
+header.top .translate-all ~ .recommend-all { margin-left: 0; }

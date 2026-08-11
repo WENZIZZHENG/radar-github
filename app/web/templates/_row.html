@@ -25,5 +25,12 @@
     {# 行内翻译按钮（T-016，§7.1：标签区右侧）：按态文案无译文"翻译"/有译文"重新翻译"；
        data-has-zh 供 JS 失败恢复按态文案；成功后面板中文即时局部替换并切"重新翻译" #}
     <button class="translate-btn" data-repo="{{ r.full_name }}" data-has-zh="{% if r.description_zh %}1{% else %}0{% endif %}">{% if r.description_zh %}重新翻译{% else %}翻译{% endif %}</button>
+    {# 行内推荐语按钮（T-017，§8.2：翻译按钮旁并列）：按态文案无当前页维度推荐语"生成推荐语"/已有"重新生成"；
+       data-has-reason 供 JS 失败恢复按态文案；成功后面板推荐语块即时局部替换并切"重新生成"。
+       只在有推荐语展示位的页面（周/季/总星/关注四页）渲染（r.show_recommend）；按当前页维度操作
+       （data-dim/data-period-label，历史周页即该周标签，手动重生写回同一期） #}
+    {% if r.show_recommend %}
+    <button class="recommend-btn" data-repo="{{ r.full_name }}" data-dim="{{ r.reason_dim }}" data-period-label="{{ r.reason_period_label }}" data-has-reason="{% if r.reason %}1{% else %}0{% endif %}">{% if r.reason %}重新生成{% else %}生成推荐语{% endif %}</button>
+    {% endif %}
   </div>
 </div>

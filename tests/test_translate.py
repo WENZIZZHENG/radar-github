@@ -403,3 +403,72 @@ def test_row_translate_button_ssr_states(tmp_path, monkeypatch):
     footer_section = text.split("<footer", 1)[1].split("</footer>", 1)[0]  # footer 元素本体（meta 行说明文字）
     assert '<button class="translate-all" id="translate-all">补译全部缺失</button>' in header_section  # 顶栏批量按钮
     assert "translate-all" not in footer_section  # 页脚不再有批量按钮（§7.1 页脚→顶栏）
+
+
+# ---------- 低-6 收口（T-017 顺带）：批量 worker 写库护栏（并发现值竞态防护） ----------
+
+
+def test_api_translate_missing_scope_excludes_outside_repos(tmp_path, monkeypatch):
+    """F1-1 修复（T-017 决策 5 v3 收窄）：批量补译只送译范围集 S（三口径榜 ∪ 关注集）内未译仓；
+    范围外（未上榜未关注，如 dead）不送译、不计入 total。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    def seed(conn):
+        _add_repo(conn, "a/onboard", description_en="english text")
+        dead_id = _add_repo(conn, "a/dead", description_en="dead english")
+        conn.execute("UPDATE repos SET dead = 1 WHERE id = ?", (dead_id,))
+        conn.commit()
+
+    fake = FakeAiClient()
+    with _make_client(tmp_path, monkeypatch, seed=seed) as client:
+        monkeypatch.setattr(routes, "_make_ai_client", lambda: fake)
+        resp = client.post("/api/translate-missing")
+        assert resp.status_code == 202
+        assert resp.json() == {"started": True, "total": 1}  # 只计范围内未译（a/dead 不在 S）
+        state = _wait_batch_finished(client)
+        assert state["translated"] == 1 and state["failed"] == 0
+    assert fake.calls == ["english text"]  # 只送译范围内一条
+    zh = _zh_map(tmp_path / "tr.db")
+    assert zh["a/onboard"] == "译文-english text"
+    assert zh["a/dead"] is None  # 范围外不译
+
+
+def test_api_translate_missing_guard_skips_concurrent_write(tmp_path, monkeypatch):
+    """worker UPDATE 带护栏（id + description_zh IS NULL + description_en 原值）：worker 拎起本条后、
+    UPDATE 落库前被并发写入的仓库 → rowcount=0 跳过不重复计数、不覆盖并发写入值（写库前不重查现值的竞态防护）。
+
+    确定性编排水闸：fake.translate 进入即 set entered、阻塞等 release——保证并发写入严格落在
+    worker 的 SELECT 之后、UPDATE 之前（直接 POST 后裸写库是赛跑，worker 快一步就误绿/误红）。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    def seed(conn):
+        _add_repo(conn, "a/one", description_en="english text")
+
+    entered = threading.Event()  # worker 已进入 translate（SELECT 已过、UPDATE 未到）
+    release = threading.Event()  # 测试线程并发写入完成后放行 worker
+
+    class BlockingFakeAiClient(FakeAiClient):
+        async def translate(self, text: str) -> str:
+            entered.set()
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+            return await super().translate(text)
+
+    fake = BlockingFakeAiClient()
+    with _make_client(tmp_path, monkeypatch, seed=seed) as client:
+        monkeypatch.setattr(routes, "_make_ai_client", lambda: fake)
+        resp = client.post("/api/translate-missing")
+        assert resp.status_code == 202
+        assert entered.wait(timeout=5), "worker 未在 5s 内拎起待译条目"
+        # worker 已被水闸拦在 translate 内（SELECT 之后）：此刻并发写入（模拟单个翻译 API 抢先落库）
+        conn = get_conn(tmp_path / "tr.db")
+        try:
+            conn.execute("UPDATE repos SET description_zh = '并发写入' WHERE full_name = 'a/one'")
+            conn.commit()
+        finally:
+            conn.close()
+        release.set()  # 放行 worker：其 UPDATE 护栏应命中跳过本条
+        state = _wait_batch_finished(client)
+        assert state["finished"] is True and state["error"] is None
+        assert state["translated"] == 0 and state["failed"] == 0  # 护栏命中：本条不计成功不计失败
+    assert _zh_map(tmp_path / "tr.db") == {"a/one": "并发写入"}  # 不覆盖并发写入值

@@ -5,9 +5,9 @@
 - 快照走 GraphQL nodes(ids:) 分批（≤100/批）：核心池全量约 6.4 万仓库≈640 请求（架构决策 1），
   比逐仓 REST 省一个数量级；批内 null / isPrivate / isDisabled 是死库信号 → repos.dead=1，
   只停采不删历史快照（schema 注释口径）。
-- T-016 变更检测（决策 5 v2）：nodes 本已拉 description 字段，与库内 description_en 比对，
-  有变更 → 更新原文＋清 description_zh=NULL（当日 ensure 全池翻译自然重译）；无变更不动。
-  language/topics 漂移本次不处理（流程说明 §7.4 钉死边界，只覆盖 description_en）。
+- T-016/T-017 变更检测（决策 5 v2）：nodes 本已拉 description 字段，与库内 description_en 比对，
+  有变更 → 更新原文＋清 description_zh=NULL＋DELETE 该仓全部维度推荐语（当日 ensure 对范围内仓自然重译/重生）；
+  无变更不动。language/topics 漂移本次不处理（流程说明 §7.4 钉死边界，只覆盖 description_en）。
 - 整轮共享一个 captured_at（任务启动时刻 utc_now_iso()）：与 T-005 同批一致口径，
   "当日快照"后续按 <= 截止日取最近一行的榜单 SQL 不受影响。
 - 发现池每日只捞 stars:>=1000 按 updated 降序前 5 页（500 条）：星数榜头部常年固化，
@@ -76,9 +76,10 @@ def _apply_snapshot_batch(
 ) -> None:
     """一批 nodes 落库：活库写当日快照（INSERT OR REPLACE，同秒重跑幂等覆盖），死库置 dead=1 停采。
 
-    T-016 变更检测：nodes 返回的 description 与库内 description_en 比对，有变更 → 更新原文并清旧译文
-    （description_zh=NULL，当日 ensure 全池翻译自然重译）；无变更不动。language/topics 漂移不处理
-    （流程说明 §7.4 钉死边界：只覆盖 description_en）。
+    T-016/T-017 变更检测：nodes 返回的 description 与库内 description_en 比对，有变更 → 更新原文并清旧译文
+    （description_zh=NULL）＋DELETE 该仓全部维度推荐语（recommendations，可再生数据；当日 ensure 对范围内仓
+    重生自愈，与译文清除同一检测点）；无变更不动。language/topics 漂移不处理（流程说明 §7.4 钉死边界：
+    只覆盖 description_en）。
     """
     with conn:  # 一批一个事务：半批失败整体回滚，重跑整批幂等
         for row, node in zip(chunk, nodes):
@@ -92,6 +93,8 @@ def _apply_snapshot_batch(
                         "UPDATE repos SET description_en = ?, description_zh = NULL WHERE id = ?",
                         (desc, row["id"]),
                     )
+                    # T-017：简介变更 → 当日清该仓全部维度推荐语（可再生数据；当日 ensure 范围内重生自愈）
+                    conn.execute("DELETE FROM recommendations WHERE repo_id = ?", (row["id"],))
                 conn.execute(
                     "INSERT OR REPLACE INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
                     (row["id"], captured_at, node["stargazerCount"]),

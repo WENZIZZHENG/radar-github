@@ -1,15 +1,25 @@
-"""AI 服务（T-011＋T-016）：DeepSeek 全池翻译＋周榜推荐理由生成＋全程降级（《架构决策记录》决策 5 v2/6）。
+"""AI 服务（T-011→T-017）：范围内翻译＋三口径分维度推荐语生成＋全程降级（共识 §7 v4 / 决策 5 v2 / 决策 6 v2）。
 
 口径（任务书钉死，勿自由发挥）：
-- 全池翻译（决策 5 v2，T-016）：翻译目标 = 全池未译仓库（description_zh IS NULL 且英文简介非空、
-  不含 CJK 的逐条翻译回填 repos.description_zh，含 dead=1）；原文变更时采集层已清 description_zh
-  （discover.py T-016 变更检测），当日本轮自然重译；翻译本身幂等——译过的不重译；
-- 推荐理由（决策 6）：对上榜集逐仓生成 2~3 句中文推荐语（按项目生成一次、跨榜复用），
-  按 (repo_id, ISO 周标签) 写入 recommendations；同周已存在跳过（幂等），跨周自然生成新行——
-  "每周重新生成"靠周标签区分实现，不覆盖历史周（T-016 一行未动）；
+- 范围集 S（T-017 收窄，v3 全池口径作废）：三口径榜（周/季/总星 Top30）去重 ∪ 关注集——
+  S 之外的仓库永远不译不生成（已译译文保留不清除；新上榜/新关注仓由每日 job 自动补译，自愈）；
+- 翻译段：只译 S 内 description_zh IS NULL 的仓（英文非空、不含 CJK 逐条翻译回填 repos.description_zh）；
+  原文变更时采集层已清 description_zh（discover.py 变更检测连带清推荐语），当日本轮自然重译；
+  手动单个翻译 API 不受范围限（任何池内仓可手动触发）；
+- 推荐语三维度（输入含 README 正文截断，拉取失败/空退化元数据输入、不持久化；按
+  (repo_id, dimension, period_label) 写入 recommendations）：
+  * week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
+  * quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
+  * total：(repo_id, 'total', 'all') 缺失或 README blob sha 变化 → 生成/REPLACE（README 变更当日重生，
+    总星文本懒口径不每周重刷；prompt 不引用具体星数/排名数字，防 evergreen 数字陈旧）；
+    README 拉取失败（sha 未取到，含 404/auth 停拉）不触发重生、保留旧行旧指纹——防失败制造每日 churn
+    （README 被删除的 404 场景因此不再触发，属探测能力边界）；
+  * README sha 比对仅每日 ensure 对 S 内仓进行；sha NULL 仓后续出现 README 视为变更自愈；
+    周/季维度不随 README 触发；
 - 降级：DEEPSEEK_API_KEY 未配置 → 记 INFO 返回零统计，服务照常；单条 translate/recommend 失败 →
-  记 WARNING 跳过该条计入统计，绝不抛出；AI 整段异常由调用方（daily_job）吞掉记 ERROR——
-  任何情况下快照主流程不受影响。
+  记 WARNING 跳过该条计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额）直通整轮 handler；
+  GitHub token 缺失/无效 → README 全量退化（readme_sha 保持 NULL），不报错；
+  AI 整段异常由调用方（daily_job）吞掉记 ERROR——任何情况下快照主流程不受影响。
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ from datetime import date, datetime
 import httpx
 
 from app.classify import load_topics
+from app.collector.github import GitHubAuthError, GitHubClient
 from app.config import BASE_DIR, get_settings
 from app.report import ReportRow, compute_boards
 
@@ -35,6 +46,10 @@ TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"  # 与 web 层同一路径来�
 DEFAULT_MAX_RETRIES = 1  # 任务书口径：重试一次后仍失败 → 抛清晰异常
 RETRY_WAIT_SECONDS = 1.0  # 仅重试一次，固定等 1 秒即可，不引指数退避
 REQUEST_TIMEOUT_SECONDS = 60.0  # LLM 响应慢于普通 REST，放宽到 60 秒
+
+# README 正文截断入 prompt 的字符上限（T-017 本人拍板授权实施）：≈2000~3000 tokens，
+# 覆盖 README 头部核心信息且不撑爆上下文；截断点取前部（README 惯例：开头即项目定位）
+README_HEAD_CHARS = 8000
 
 _ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长（与 app.report 同口径）
 
@@ -48,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 
 class DeepSeekError(RuntimeError):
-    """DeepSeek 调用失败的基类：单条失败由 ensure_weekly_ai 捕获跳过，不阻断整轮。"""
+    """DeepSeek 调用失败的基类：单条失败由 ensure_daily_ai 捕获跳过，不阻断整轮。"""
 
 
 class DeepSeekAuthError(DeepSeekError):
@@ -68,6 +83,11 @@ def _week_label(d: date) -> str:
     """
     iso = d.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
+
+
+def _quarter_label(d: date) -> str:
+    """date → 季度标签（2026-Q3）；与 app/web/routes.py 的 _quarter_label 同一口径（内联同构）。"""
+    return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
 
 
 def _extract_content(response: httpx.Response) -> str | None:
@@ -124,24 +144,55 @@ class DeepSeekClient:
         )
 
     async def recommend(
-        self, *, full_name: str, description: str, language: str, delta: int, stars: int, categories: list[str]
+        self,
+        *,
+        full_name: str,
+        description: str,
+        language: str,
+        categories: list[str],
+        dimension: str,
+        delta: int | None = None,
+        stars: int | None = None,
+        readme: str | None = None,
     ) -> str:
-        """上榜推荐理由：2~3 句中文推荐语本体（prompt 钉死无引号包裹、无"推荐理由："前缀、不用列表）。"""
-        user = (
-            f"仓库：{full_name}\n"
-            f"简介：{description}\n"
-            f"主语言：{language}\n"
-            f"本周新增星数：{delta}\n"
-            f"总星数：{stars}\n"
-            f"上榜分类：{'、'.join(categories)}"
-        )
-        return await self._chat(
-            system=(
-                "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 周榜上榜项目的推荐理由。"
+        """维度感知推荐语（T-017）：周/季增量语境（输入含当期增量）；总星存量语境"是什么＋领域地位"。
+
+        prompt 两条钉死口径（本人拍板）：周/季输入必须带当期增量（"本周/本季新增 X 星，为什么火"）；
+        total 维度不引用任何具体星数/排名数字（数字由页面行内数据展示，防 evergreen 陈旧）。
+        README 正文截断入输入（无则省略该行）；只输出 2~3 句中文推荐语本体。
+        """
+        if dimension not in ("week", "quarter", "total"):
+            raise ValueError(f"dimension 非法：{dimension!r}")
+        lines = [f"仓库：{full_name}", f"简介：{description}", f"主语言：{language}"]
+        if readme:
+            lines.append(f"README 要点：\n{readme}")
+        if dimension == "total":
+            user = "\n".join(lines + [f"上榜分类：{'、'.join(categories)}"])
+            system = (
+                "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的推荐理由。"
                 "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
-                "其余说明为什么本周值得关注（结合本周增星、总星数与上榜分类），有选型参考价值时点明。"
+                "其余说明它在所属领域中的地位（存量语境，写给长期关注的人看，不追热点）。"
+                "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
                 "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
-            ),
+            )
+        else:
+            delta_word = "本周" if dimension == "week" else "本季"
+            if delta is not None:
+                lines.append(f"{delta_word}新增星数：{delta}")
+            if stars is not None:
+                lines.append(f"总星数：{stars}")
+            lines.append(f"上榜分类：{'、'.join(categories)}")
+            user = "\n".join(lines)
+            board_word = "周榜" if dimension == "week" else "季榜"
+            system = (
+                f"你是技术雷达的编辑，为一位资深开发者读者写 GitHub {board_word}上榜项目的推荐理由。"
+                f"根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+                f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类），"
+                "有选型参考价值时点明。"
+                "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+            )
+        return await self._chat(
+            system=system,
             user=user,
             temperature=0.3,  # 低温度：推荐语允许一点措辞空间，但不许发散
         )
@@ -174,7 +225,7 @@ class DeepSeekClient:
             status = response.status_code
             if status in (401, 402, 403):
                 # 账户类确定性错误（401 key 无效 / 402 余额不足 / 403 无权限）：逐条重试无意义只会刷爆
-                # 日志且次日重演，与空 key 同姿态直通整轮 handler（评审低-3：401 之外的账户类 4xx 并入）
+                # 日志且次日重演，与空 key 同姿态直通整轮 handler
                 hint = "请更新项目根 .env 中的 DEEPSEEK_API_KEY 后重试" if status == 401 else "请检查 DeepSeek 账户余额与权限"
                 raise DeepSeekAuthError(f"DeepSeek 账户类错误（HTTP {status}）：{hint}；响应：{response.text[:200]}")
             if status >= 500:
@@ -203,55 +254,328 @@ class _ListedItem:
 
 
 def _load_repo_info(conn: sqlite3.Connection, full_names: list[str]) -> dict[str, sqlite3.Row]:
-    """按 full_name 反查 id/description_zh（recommendations 外键与已译判定用）；分块防旧 SQLite 变量上限。"""
+    """按 full_name 反查 id/description_en/description_zh/language（recommendations 外键与翻译/推荐语输入用）；
+    分块防旧 SQLite 变量上限。"""
     info: dict[str, sqlite3.Row] = {}
     for offset in range(0, len(full_names), _NAME_LOOKUP_CHUNK):
         chunk = full_names[offset : offset + _NAME_LOOKUP_CHUNK]
         placeholders = ", ".join("?" * len(chunk))
         rows = conn.execute(
-            f"SELECT id, full_name, description_zh FROM repos WHERE full_name IN ({placeholders})", chunk
+            "SELECT id, full_name, description_en, description_zh, language FROM repos WHERE full_name IN "
+            f"({placeholders})",
+            chunk,
         ).fetchall()
         for row in rows:
             info[row["full_name"]] = row
     return info
 
 
-async def ensure_weekly_ai(
+def _scope_sets(
+    conn: sqlite3.Connection, *, now: datetime
+) -> tuple[dict[str, dict[str, _ListedItem]], list[str]]:
+    """T-017 覆盖口径 S：三口径榜（week/quarter/total 各 Top30）去重 ∪ 关注集。
+
+    返回 (listed_by_period, follow_names)：listed_by_period[period] = full_name → _ListedItem（榜单序保序）；
+    follow_names 按 follows.created_at 序（页面关注序）。S 之外的仓库永远不译不生成（共识 §7 v4）。
+    """
+    topic_table = load_topics(TOPICS_PATH)
+    as_of_iso = now.strftime(_ISO_FMT)
+    listed_by_period: dict[str, dict[str, _ListedItem]] = {}
+    for period in ("week", "quarter", "total"):
+        boards = compute_boards(conn, topic_table, period=period, as_of=as_of_iso, top_n=30)
+        listed: dict[str, _ListedItem] = {}
+        for board in boards:
+            for row in board.rows:
+                item = listed.get(row.full_name)
+                if item is None:
+                    listed[row.full_name] = _ListedItem(row=row, categories=[board.label])
+                else:
+                    item.categories.append(board.label)  # 同一项目多榜出现：分类榜名累加（跨榜复用一条推荐语）
+        listed_by_period[period] = listed
+    follow_names = [
+        r["full_name"]
+        for r in conn.execute(
+            "SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
+        )
+    ]
+    return listed_by_period, follow_names
+
+
+class _ReadmeState:
+    """README 拉取会话（T-017）：逐仓缓存 + 账户类错误后停拉降级（token 缺失/无效不再逐仓重试）。
+
+    get() 对拉取失败/空一律返回 (None, None) 退化输入，绝不抛出阻塞；成功（拉到 sha）时
+    stats["readme_fetched"] 计数（缓存命中不计）。
+    """
+
+    def __init__(self, github_client: GitHubClient | None, log: logging.Logger) -> None:
+        self._client = github_client
+        self._log = log
+        self._auth_stopped = False
+        self._cache: dict[str, tuple[str | None, str | None]] = {}
+
+    async def get(self, full_name: str, stats: dict[str, int]) -> tuple[str | None, str | None]:
+        """拉取并截断 README 正文与 blob sha；client 缺失/已停拉/失败/空 → (None, None) 退化。"""
+        if self._client is None or self._auth_stopped:
+            return None, None
+        if full_name in self._cache:
+            return self._cache[full_name]
+        try:
+            text, sha = await self._client.fetch_readme(full_name)
+        except GitHubAuthError as exc:
+            # token 缺失/无效是确定性配置错误：逐仓重试只会刷爆日志，停拉全量退化（任务书钉死口径）
+            self._auth_stopped = True
+            self._log.warning("GitHub README 拉取终止（账户类错误）：%s（后续推荐语退化元数据输入）", exc)
+            return None, None
+        except Exception as exc:
+            self._log.warning("README 拉取失败，退化元数据输入 %s：%s", full_name, exc)
+            return None, None
+        if text is not None:
+            text = text[:README_HEAD_CHARS]  # 截断入 prompt（授权实施：取前部，README 惯例开头即定位）
+        self._cache[full_name] = (text, sha)
+        if sha:
+            stats["readme_fetched"] += 1
+        return text, sha
+
+
+async def recommend_missing(
     conn: sqlite3.Connection,
     client: DeepSeekClient,
     *,
     now: datetime,
     log: logging.Logger | None = None,
+    github_client: GitHubClient | None = None,
+    refresh: bool = True,
+    scope: tuple[dict[str, dict[str, _ListedItem]], list[str]] | None = None,
+    on_progress: Callable[[dict[str, int]], None] | None = None,
 ) -> dict[str, int]:
-    """全池未译翻译＋当周上榜集推荐理由生成（幂等，可断点续跑），返回统计 dict。
+    """三维度推荐语补缺（T-017）：S = 三口径榜（week/quarter/total Top30）去重 ∪ 关注集。
 
-    步骤：a) 全池翻译（T-016：目标 = 全池 description_zh IS NULL 且英文非空无 CJK 的仓库，含 dead=1，
-    与当周上榜集解耦——采集层原文变更已清译文，此处自然重译；译过的不重译）；
-    b) compute_boards(period="week", as_of=now) 算 17 榜 → 去重上榜集 S →
-    S 中缺 (repo_id, 当周 ISO 周标签) 的逐条生成推荐语 INSERT recommendations（决策 6 口径一行未动）；
-    c) 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效）是确定性配置错误，
-       逐条重试无意义，直通抛出由调用方整轮捕获（与采集层 GitHubAuthError 同姿态）；
-    d) key 未配置记 INFO 直接返回零统计。
+    - week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
+    - quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
+    - total：(repo_id, 'total', 'all') 缺失则生成（懒口径）；refresh=True（每日 ensure）时 README blob sha
+      变化 → REPLACE 重生并更新 sha（README 变更当日重生，自愈）；总星文本不每周重刷、prompt 不引用数字；
+    - 输入含 README 正文（截断；拉取失败/空退化元数据，不持久化）；README 拉取失败绝不抛出阻塞
+      （GitHub token 缺失/无效 → 全量退化、readme_sha 保持 NULL）；
+    - 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError 直通整轮 handler；
+    - 单条写入即 commit（崩溃不丢已花配额，重跑幂等补缺）。
 
-    事务选择：单条写入即 commit（不开整体事务）——后台串行、量级小（≤510 条），
-    崩溃时已完成写入不丢（不浪费已花的 API 配额），重跑靠"已译/同周已存在"幂等跳过自然补缺；
-    代价是极端情况下两表进度不一致（译了没推荐），次日重跑即收敛，可接受。
+    被每日 ensure_daily_ai 与手动批量补缺 worker（refresh=False，只补缺失不重生）共用。
+    on_progress 在每条写库后回调 stats 快照（批量 worker 渐进更新进度用）。
 
-    返回 {"listed", "translated", "translate_failed", "recommended", "recommend_failed"}：
-    listed＝上榜集去重仓库数，其余为各步成功/失败计数。
+    返回 {"listed", "recommended", "recommend_failed", "readme_fetched"}：
+    listed＝S 去重仓库数；recommended＝新写/覆盖条数；其余为各步成功/失败计数。
     """
     log = log or logger
-    stats = {"listed": 0, "translated": 0, "translate_failed": 0, "recommended": 0, "recommend_failed": 0}
+    stats = {"listed": 0, "recommended": 0, "recommend_failed": 0, "readme_fetched": 0}
+    if scope is None:
+        scope = _scope_sets(conn, now=now)
+    listed_by_period, follow_names = scope
+    all_names = list(follow_names)
+    for period in ("week", "quarter", "total"):
+        for full_name in listed_by_period[period]:
+            if full_name not in all_names:
+                all_names.append(full_name)
+    stats["listed"] = len(all_names)
+    if not all_names:
+        return stats
+
+    repo_info = _load_repo_info(conn, all_names)
+    week_label = _week_label(now.date())
+    quarter_label = _quarter_label(now.date())
+
+    # 预取现有行（(repo_id, dimension, period_label) → 行），避免逐仓查询；手动 API 写入后本轮不重判
+    existing: dict[tuple[int, str, str], sqlite3.Row] = {}
+    for row in conn.execute(
+        "SELECT repo_id, dimension, period_label, readme_sha, generated_week FROM recommendations"
+    ):
+        existing[(row["repo_id"], row["dimension"], row["period_label"])] = row
+
+    readme_state = _ReadmeState(github_client, log)
+
+    # --- 周维度：缺 (repo_id, 'week', 当周标签) 则生成；同周已存在跳过（幂等，跨周标签不同自然生成新行） ---
+    for full_name, item in listed_by_period["week"].items():
+        info = repo_info.get(full_name)
+        if info is None:
+            continue
+        key = (info["id"], "week", week_label)
+        if key in existing:
+            continue
+        readme_text, _ = await readme_state.get(full_name, stats)
+        try:
+            text = await client.recommend(
+                full_name=full_name,
+                description=info["description_zh"] or info["description_en"] or "（无简介）",
+                language=info["language"] or "未知",
+                delta=item.row.delta if item.row.delta is not None else 0,  # 周榜出席行 delta 恒非 None；防御兜底
+                stars=item.row.stars,
+                categories=item.categories,
+                dimension="week",
+                readme=readme_text,
+            )
+        except DeepSeekAuthError:
+            raise  # 同翻译段：账户类确定性错误直通
+        except Exception as exc:
+            log.warning("AI 推荐语生成失败，跳过 %s（week）：%s", full_name, exc)
+            stats["recommend_failed"] += 1
+            continue
+        conn.execute(
+            "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+            " VALUES (?, 'week', ?, ?, NULL, ?)",
+            (info["id"], week_label, text, week_label),
+        )
+        conn.commit()
+        stats["recommended"] += 1
+        existing[key] = None  # 防御：同轮不重复判定
+        if on_progress is not None:
+            on_progress(stats)
+
+    # --- 季维度：缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季文本季内每周重生；季榜 90 天窗口
+    #     未满时自然为空，实现照做，不许为"看到效果"改榜单口径） ---
+    for full_name, item in listed_by_period["quarter"].items():
+        info = repo_info.get(full_name)
+        if info is None:
+            continue
+        key = (info["id"], "quarter", quarter_label)
+        cur = existing.get(key)
+        if cur is not None and (not refresh or cur["generated_week"] == week_label):
+            continue
+        readme_text, _ = await readme_state.get(full_name, stats)
+        try:
+            text = await client.recommend(
+                full_name=full_name,
+                description=info["description_zh"] or info["description_en"] or "（无简介）",
+                language=info["language"] or "未知",
+                delta=item.row.delta if item.row.delta is not None else 0,
+                stars=item.row.stars,
+                categories=item.categories,
+                dimension="quarter",
+                readme=readme_text,
+            )
+        except DeepSeekAuthError:
+            raise
+        except Exception as exc:
+            log.warning("AI 推荐语生成失败，跳过 %s（quarter）：%s", full_name, exc)
+            stats["recommend_failed"] += 1
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO recommendations (repo_id, dimension, period_label, text, readme_sha,"
+            " generated_week) VALUES (?, 'quarter', ?, ?, NULL, ?)",
+            (info["id"], quarter_label, text, week_label),
+        )
+        conn.commit()
+        stats["recommended"] += 1
+        existing[key] = None
+        if on_progress is not None:
+            on_progress(stats)
+
+    # --- 总星维度：S_total = total 榜 ∪ 关注集（关注未上榜仓生成总星文本，供关注页展示）；
+    #     缺失则生成；refresh=True 时 README sha 变化 → REPLACE 重生并更新 sha（懒口径不每周重刷） ---
+    total_names = list(follow_names)
+    for full_name in listed_by_period["total"]:
+        if full_name not in total_names:
+            total_names.append(full_name)
+    for full_name in total_names:
+        info = repo_info.get(full_name)
+        if info is None:
+            continue
+        rid = info["id"]
+        key = (rid, "total", "all")
+        cur = existing.get(key)
+        readme_text, sha = await readme_state.get(full_name, stats)
+        # F2-1 修复：本次未拉到 sha（拉取失败/404/账户类停拉）不触发重生——保留旧行与旧指纹，
+        # 防拉取失败制造每日 churn；README 被删除（404）的场景因此不再触发重生，属探测能力边界
+        # （无 README 的仓 sha 恒 NULL，懒口径下不动）；sha 非空且变化才视为 README 变更
+        if cur is not None and (not refresh or sha is None or cur["readme_sha"] == sha):
+            continue  # 已有且未触发重生：总星文本懒口径不重刷
+        item = listed_by_period["total"].get(full_name)
+        try:
+            text = await client.recommend(
+                full_name=full_name,
+                description=info["description_zh"] or info["description_en"] or "（无简介）",
+                language=info["language"] or "未知",
+                delta=None,  # 总星维度无增量概念；prompt 不引用数字
+                stars=None,
+                categories=item.categories if item is not None else [],
+                dimension="total",
+                readme=readme_text,
+            )
+        except DeepSeekAuthError:
+            raise
+        except Exception as exc:
+            log.warning("AI 推荐语生成失败，跳过 %s（total）：%s", full_name, exc)
+            stats["recommend_failed"] += 1
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO recommendations (repo_id, dimension, period_label, text, readme_sha,"
+            " generated_week) VALUES (?, 'total', 'all', ?, ?, ?)",
+            (rid, text, sha, week_label),
+        )
+        conn.commit()
+        stats["recommended"] += 1
+        existing[key] = None
+        if on_progress is not None:
+            on_progress(stats)
+
+    return stats
+
+
+async def ensure_daily_ai(
+    conn: sqlite3.Connection,
+    client: DeepSeekClient,
+    *,
+    now: datetime,
+    log: logging.Logger | None = None,
+    github_client: GitHubClient | None = None,
+) -> dict[str, int]:
+    """每日 AI 生成（T-017 重写，原名 ensure_weekly_ai）：范围集翻译收窄＋三维度推荐语补缺/刷新。
+
+    步骤：a) 计算范围集 S = 三口径榜（week/quarter/total Top30）去重 ∪ 关注集；
+    b) 翻译段收窄：只译 S 内 description_zh IS NULL 且英文非空无 CJK 的仓（原文变更采集层已清译文，
+    当日本轮自然重译；译过的不重译；S 之外永不翻译——v3 全池口径作废）；
+    c) 推荐语三维度（口径详见 recommend_missing docstring）；
+    d) 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效）是确定性配置错误，
+    直通抛出由调用方整轮捕获（与采集层 GitHubAuthError 同姿态）；
+    e) key 未配置记 INFO 直接返回零统计；GitHub token 缺失/无效 → README 全量退化不报错。
+
+    事务选择：单条写入即 commit（不开整体事务）——后台串行、量级小（S ≤ 数百仓），
+    崩溃时已完成写入不丢（不浪费已花的 API 配额），重跑靠"已译/同维度同期已存在"幂等跳过自然补缺。
+
+    返回 {"listed", "translated", "translate_failed", "recommended", "recommend_failed", "readme_fetched"}：
+    listed＝S 去重仓库数，其余为各步成功/失败计数。
+    """
+    log = log or logger
+    stats = {
+        "listed": 0,
+        "translated": 0,
+        "translate_failed": 0,
+        "recommended": 0,
+        "recommend_failed": 0,
+        "readme_fetched": 0,
+    }
     if not get_settings().deepseek_api_key:
         log.info("DEEPSEEK_API_KEY 未配置：跳过 AI 翻译与推荐语生成（降级，榜单服务照常）")
         return stats
 
-    # a) 全池翻译（T-016）：全池未译逐条翻译回填；已译/中文/空描述一律跳过；与上榜集解耦
-    pending = conn.execute(
-        "SELECT id, full_name, description_en FROM repos WHERE description_zh IS NULL"
-    ).fetchall()
-    for row in pending:
-        text_en = row["description_en"]
+    # a) 范围集 S（三口径榜一次算齐，翻译段与推荐段共用，避免重复计算）
+    scope = _scope_sets(conn, now=now)
+    listed_by_period, follow_names = scope
+    all_names = list(follow_names)
+    for period in ("week", "quarter", "total"):
+        for full_name in listed_by_period[period]:
+            if full_name not in all_names:
+                all_names.append(full_name)
+    stats["listed"] = len(all_names)
+    if not all_names:
+        return stats
+
+    # b) 翻译段（T-017 收窄：只译 S 内未译；手动单个翻译 API 不受此限，任何池内仓可手动触发）
+    repo_info = _load_repo_info(conn, all_names)
+    for full_name in all_names:
+        info = repo_info.get(full_name)
+        if info is None or info["description_zh"] is not None:
+            continue
+        text_en = info["description_en"]
         if not text_en or not text_en.strip():
             continue  # GitHub 官方允许无简介：空描述跳过
         if has_cjk(text_en):
@@ -261,68 +585,34 @@ async def ensure_weekly_ai(
         except DeepSeekAuthError:
             raise  # 账户类确定性错误（401/402/403）：逐条重试只会刷爆日志，直通整轮 handler
         except Exception as exc:
-            log.warning("AI 翻译失败，跳过 %s：%s", row["full_name"], exc)
+            log.warning("AI 翻译失败，跳过 %s：%s", full_name, exc)
             stats["translate_failed"] += 1
             continue
-        conn.execute("UPDATE repos SET description_zh = ? WHERE id = ?", (zh, row["id"]))
-        conn.commit()
-        stats["translated"] += 1
-
-    # b) 推荐理由（决策 6 口径，T-016 一行未动）：同周已存在跳过（幂等）；跨周周标签不同自然生成新行
-    topic_table = load_topics(TOPICS_PATH)
-    boards = compute_boards(conn, topic_table, period="week", as_of=now.strftime(_ISO_FMT), top_n=30)
-    listed: dict[str, _ListedItem] = {}  # full_name → 行信息＋分类榜名；dict 保序，结果可复现
-    for board in boards:
-        for row in board.rows:
-            item = listed.get(row.full_name)
-            if item is None:
-                listed[row.full_name] = _ListedItem(row=row, categories=[board.label])
-            else:
-                item.categories.append(board.label)  # 同一项目多榜出现：分类榜名累加（决策 6 跨榜复用一条推荐语）
-    stats["listed"] = len(listed)
-    if not listed:
-        return stats
-
-    week = _week_label(now.date())
-    # 查询在翻译段之后：本轮刚译好的 description_zh 进推荐语输入
-    repo_info = _load_repo_info(conn, list(listed))
-    done_ids = {
-        row["repo_id"] for row in conn.execute("SELECT repo_id FROM recommendations WHERE report_week = ?", (week,))
-    }
-    for full_name, item in listed.items():
-        info = repo_info.get(full_name)
-        if info is None or info["id"] in done_ids:
-            continue
-        row = item.row
-        try:
-            text = await client.recommend(
-                full_name=full_name,
-                description=info["description_zh"] or row.description_en or "（无简介）",  # 优先中文（含本轮刚译的）
-                language=row.language or "未知",
-                delta=row.delta if row.delta is not None else 0,  # 周榜出席行 delta 恒非 None；防御兜底
-                stars=row.stars,
-                categories=item.categories,
-            )
-        except DeepSeekAuthError:
-            raise  # 同翻译段：账户类确定性错误直通
-        except Exception as exc:
-            log.warning("AI 推荐语生成失败，跳过 %s：%s", full_name, exc)
-            stats["recommend_failed"] += 1
-            continue
-        conn.execute(
-            "INSERT INTO recommendations (repo_id, report_week, text) VALUES (?, ?, ?)",
-            (info["id"], week, text),
+        # 低-6 护栏：写库前不重查现值的竞态防护（并发单个翻译 API 已写入则本条跳过不计）
+        cur = conn.execute(
+            "UPDATE repos SET description_zh = ? WHERE id = ? AND description_zh IS NULL AND description_en = ?",
+            (zh, info["id"], text_en),
         )
         conn.commit()
-        stats["recommended"] += 1
+        if cur.rowcount:
+            stats["translated"] += 1
+
+    # c) 推荐语三维度（refresh=True：quarter 每周 REPLACE、total README 变更重生）
+    sub = await recommend_missing(
+        conn, client, now=now, log=log, github_client=github_client, refresh=True, scope=scope
+    )
+    stats["recommended"] += sub["recommended"]
+    stats["recommend_failed"] += sub["recommend_failed"]
+    stats["readme_fetched"] += sub["readme_fetched"]
 
     log.info(
-        "AI 周度生成汇总（%s）：上榜 %d、新译 %d（失败 %d）、新推荐 %d（失败 %d）",
-        week,
+        "AI 每日生成汇总（%s）：覆盖 %d、新译 %d（失败 %d）、新推荐 %d（失败 %d）、README 拉取 %d",
+        _week_label(now.date()),
         stats["listed"],
         stats["translated"],
         stats["translate_failed"],
         stats["recommended"],
         stats["recommend_failed"],
+        stats["readme_fetched"],
     )
     return stats
