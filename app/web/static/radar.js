@@ -5,8 +5,9 @@
 // P6 页内点 ★ 取消 → 该行＋详情面板即时移除，组空连组块移除，全空 reload 出空态。
 // T-010 标签接线（§3.3）：chip 本体跳 /tags/<tag>（SSR 链接）；× 删除 → DELETE API 乐观移除失败插回；
 // "＋ 标签"→ 输入框（maxLength 20，Enter 提交/Escape·blur 还原）；非法输入不提交：红边＋内联提示。
-// T-016 翻译接线（§7）：行内按钮单个强制重译（成功 toast＋面板中文即时替换不刷新）；页脚批量补译全部缺失
-// （只补 NULL）；按钮置灰防连点，分支 toast 文案严格按 v1.4 §7.3（服务端 400 detail 即 §7.3 文案，直用）。
+// T-016 翻译接线（§7）：行内按钮单个强制重译（成功 toast＋面板中文即时替换不刷新）；顶栏批量补译全部缺失
+// （只补 NULL，后台任务：POST 202 → 2s 轮询 /status 进度）；按钮置灰防连点，分支 toast 文案严格按 v1.5 §7.3
+// （服务端 400 detail 即 §7.3 文案，直用）。
 const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 
@@ -113,7 +114,7 @@ document.addEventListener("click", (e) => {
     translateRow(translateBtn);
     return;
   }
-  // T-016 页脚批量补译（§7.2）：全池只补 NULL；409/未配置 key 文案见 §7.3
+  // T-016 顶栏批量补译（§7.2）：全池只补 NULL，后台任务＋进度轮询；409/auth 文案见 §7.3
   const translateAll = e.target.closest("#translate-all");
   if (translateAll) {
     translateMissing(translateAll);
@@ -308,9 +309,73 @@ async function translateRow(btn) {
   }
 }
 
-let batchTranslating = false; // 前端防连点（服务端另有 in-flight 锁 409 兜底，§7.3）
+let batchTranslating = false; // 前端防连点（服务端另有 running 态 409 兜底，§7.3）
+let batchPollTimer = null; // 批量进度轮询句柄（409/202/页面加载接管共用单轮询）
 
-// 页脚批量补译：置灰"补译中…"；完成/409/未配置 key 文案严格按 §7.3
+// 批量进度文案（§7.3 钉死）：T=0 时保持"补译中…"，避免 0/0 歧义
+function batchProgress(state) {
+  return state.total > 0 ? "补译中…（已补 " + state.translated + "/" + state.total + " 条）" : "补译中…";
+}
+
+// 恢复按钮常态并解锁防连点
+function restoreBatch(btn) {
+  batchTranslating = false;
+  btn.disabled = false;
+  btn.textContent = "补译全部缺失";
+}
+
+// 停止进度轮询（页面卸载自然停止；显式停止用于完成/轮询失败）
+function stopBatchPolling() {
+  if (batchPollTimer) {
+    clearInterval(batchPollTimer);
+    batchPollTimer = null;
+  }
+}
+
+// 2s 轮询批量进度（§7.2 后台形态）：running → 按钮进度文案；finished → 停轮询＋按钮恢复＋按 error/failed 分支 toast
+function pollBatchStatus(btn) {
+  if (batchPollTimer) return; // 已在轮询：409/202/页面接管共用同一轮询
+  const tick = async () => {
+    try {
+      const resp = await fetch("/api/translate-missing/status");
+      const state = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      // 响应畸形（resp.ok 但 JSON 非预期/缺判态字段）：无法判态，按失败兜底（不误报完成）
+      if (typeof state !== "object" || state === null || !("running" in state) || !("finished" in state)) {
+        stopBatchPolling();
+        restoreBatch(btn);
+        toast("补译失败，稍后再试", true);
+        return;
+      }
+      if (state.running === true) {
+        btn.textContent = batchProgress(state);
+        return; // 任务进行中：下一周期再查
+      }
+      if (state.finished === true) {
+        stopBatchPolling();
+        restoreBatch(btn);
+        if (state.error === "auth") toast("未配置 DeepSeek API key", true);
+        else if (state.error === "unknown") toast("补译失败，稍后再试", true);
+        else if (state.failed > 0) toast("补译完成：新译 " + state.translated + " 条，失败 " + state.failed + " 条");
+        else toast("补译完成：新译 " + state.translated + " 条");
+        return;
+      }
+      // running/finished 双假（如服务端重启丢内存态）：非完成终态，不误报"补译完成"，按失败兜底
+      stopBatchPolling();
+      restoreBatch(btn);
+      toast("补译失败，稍后再试", true);
+    } catch (err) {
+      stopBatchPolling();
+      restoreBatch(btn);
+      toast("补译失败，稍后再试", true); // 轮询网络层失败：停轮询恢复常态（服务端任务仍在跑，可再点，409 会接管）
+    }
+  };
+  batchPollTimer = setInterval(tick, 2000);
+  tick(); // 立即查一次：POST 202 后秒级反馈进度
+}
+
+// 顶栏批量补译（§7.2 后台形态）：点击置灰 → POST（202 起任务 / 409 已有任务）→ 2s 轮询 /status 显示进度；
+// 完成/进行中/auth/网络失败文案严格按 §7.3，轮询期间 batchTranslating 保持锁防连点
 async function translateMissing(btn) {
   if (batchTranslating) return;
   batchTranslating = true;
@@ -319,14 +384,32 @@ async function translateMissing(btn) {
   try {
     const resp = await fetch("/api/translate-missing", { method: "POST" });
     const data = await resp.json().catch(() => ({}));
-    if (resp.status === 409) toast("补译进行中…");
-    else if (!resp.ok) toast("未配置 DeepSeek API key", true); // 批量失败只可能是账户类确定性错误（key 空/无效/余额）
-    else toast("补译完成：新译 " + data.translated + " 条");
+    if (resp.status === 409) {
+      toast("补译进行中…"); // 服务端已有任务在跑：不另起，直接进轮询看它
+      pollBatchStatus(btn);
+      return;
+    }
+    if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status); // 其余异常（如 500）按失败兜底
+    pollBatchStatus(btn); // 202：后台任务已起
   } catch (err) {
-    toast("补译失败，稍后再试", true); // 网络层失败：§7.3 未钉死该分支，沿用单个失败同款兜底文案
-  } finally {
-    batchTranslating = false;
-    btn.disabled = false;
-    btn.textContent = "补译全部缺失";
+    toast("补译失败，稍后再试", true); // 网络层失败（§7.3 兜底文案），按钮恢复可重试
+    restoreBatch(btn);
   }
 }
+
+// ---- T-016 页面加载接管在跑批量任务（§7.2：按钮在顶栏、各页通用） ----
+(async () => {
+  const btn = document.getElementById("translate-all");
+  if (!btn) return;
+  try {
+    const resp = await fetch("/api/translate-missing/status");
+    const state = await resp.json().catch(() => ({}));
+    if (!resp.ok || !state.running) return; // 无在跑任务/查询失败：安静忽略（finished 态不 toast 不动按钮）
+    batchTranslating = true; // 接管在跑任务：锁防连点，轮询接手进度显示
+    btn.disabled = true;
+    btn.textContent = batchProgress(state);
+    pollBatchStatus(btn);
+  } catch (err) {
+    /* 接管查询网络异常：安静忽略，不影响页面 */
+  }
+})();

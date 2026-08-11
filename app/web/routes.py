@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -823,7 +824,18 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
 
 # ===== 翻译 API（T-016；口径《交互流程说明》§7.4 钉死：单个强制重译 / 批量只补 NULL，不触碰 recommendations 表） =====
 
-_batch_translating_lock = threading.Lock()  # in-flight 锁：批量补译防重入（§7.3 409）；S 档单进程跨请求共享
+# 批量补译后台任务状态（§7.2 后台形态，对齐共识§7"后台执行、防重复触发"）：POST 原子占位 running →
+# 起 worker 立即 202 → 前端 2s 轮询 /status；error ∈ None | "auth"（key 未配置/无效/余额，确定性配置错误）|
+# "unknown"（其余未知异常）；S 档单进程跨请求共享，线程锁保护读写
+_batch_state: dict = {"running": False, "translated": 0, "failed": 0, "total": 0, "finished": False, "error": None}
+_batch_state_lock = threading.Lock()  # 保护 _batch_state 读写；防重入语义（running 时 POST → 409）沿用 in-flight 锁口径
+_batch_task: asyncio.Task | None = None  # 模块级持有后台任务引用，防 GC 意外回收
+
+
+def _make_ai_client() -> DeepSeekClient:
+    """批量 worker 自造 DeepSeek client：后台任务无请求生命周期，不能复用请求级 _ai_client 依赖（响应结束即关闭）；
+    单测 monkeypatch 本工厂注入假 client（不走 dependency_overrides）。"""
+    return DeepSeekClient(get_settings().deepseek_api_key)
 
 
 async def _ai_client() -> AsyncIterator[DeepSeekClient]:
@@ -887,24 +899,42 @@ async def api_translate(request: Request, client: DeepSeekClient = Depends(_ai_c
         conn.close()
 
 
-@router.post("/api/translate-missing")
-async def api_translate_missing(client: DeepSeekClient = Depends(_ai_client)) -> dict:
-    """批量补译（§7.2 第 2 步）：全池 description_zh IS NULL 且英文非空无 CJK（含 dead）只补 NULL 不覆盖；
-    in-flight 锁防重入——进行中重复触发 409（§7.3）；不触碰 recommendations 表。
-
-    降级口径（与 T-011 ensure 同链）：单条失败记 WARNING 跳过计入 failed，不中断整批（次日/再触发自然补缺）；
-    DeepSeekAuthError（key 未配置/无效/余额）是确定性配置错误 → 直通 500，前端 toast"未配置 DeepSeek API key"。
-    每批整体响应 200 后前端 toast"补译完成：新译 N 条"。
+@router.post("/api/translate-missing", status_code=202)
+async def api_translate_missing() -> dict:
+    """批量补译（§7.2 第 2 步，后台任务形态）：锁内原子检查＋占位 running → 统计待译 total（description_zh IS NULL
+    且英文非空无 CJK，含 dead；SQL 预过滤 NULL/空串，Python 过 has_cjk）→ asyncio.create_task 起 worker（模块级
+    持有防 GC）→ 立即返回 202 {"started": true, "total": T}；running 时重复触发 409（detail 即 §7.3 前端 toast
+    文案）；不触碰 recommendations 表。进度/结果由 worker 写入 _batch_state，前端轮询 /status 读取。
     """
-    if not _batch_translating_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="补译任务进行中，请稍后再试")
+    global _batch_task
     conn = get_conn()
     try:
-        pending = conn.execute(
-            "SELECT id, full_name, description_en FROM repos WHERE description_zh IS NULL"
-        ).fetchall()
-        translated = 0
-        failed = 0
+        with _batch_state_lock:
+            if _batch_state["running"]:
+                raise HTTPException(status_code=409, detail="补译任务进行中，请稍后再试")
+            pending = conn.execute(
+                "SELECT id, full_name, description_en FROM repos"
+                " WHERE description_zh IS NULL AND description_en IS NOT NULL AND trim(description_en) != ''"
+            ).fetchall()
+            pending = [row for row in pending if not has_cjk(row["description_en"])]
+            _batch_state.update(running=True, translated=0, failed=0, total=len(pending), finished=False, error=None)
+    finally:
+        conn.close()
+    _batch_task = asyncio.create_task(_run_batch_translate(pending))
+    return {"started": True, "total": len(pending)}
+
+
+async def _run_batch_translate(pending: list[sqlite3.Row]) -> None:
+    """后台批量补译 worker（§7.2）：只补 NULL 不覆盖（pending 已在 POST 侧按口径筛好）；自开 DB 连接与 AI client
+    （不依赖请求生命周期，finally 双双关闭）；逐条翻译沿用现口径——空描述/CJK 跳过、单条失败记 WARNING 计入 failed
+    继续整批、每条 UPDATE＋commit 立即落库；DeepSeekAuthError（key 未配置/无效/余额）是确定性配置错误 →
+    error="auth" 终止整批（已译保留）；其余未知异常 → logger.exception＋error="unknown"；
+    结束一律 running=False、finished=True（state 保留供查询；下次 POST 时重置计数与 error）。
+    """
+    conn = client = None
+    try:
+        conn = get_conn()
+        client = _make_ai_client()
         for row in pending:
             text_en = row["description_en"]
             if not text_en or not text_en.strip():
@@ -914,17 +944,39 @@ async def api_translate_missing(client: DeepSeekClient = Depends(_ai_client)) ->
             try:
                 zh = await client.translate(text_en)
             except DeepSeekAuthError as exc:
-                # 账户类确定性错误（key 空/无效/余额）：直通整轮 handler——detail 带修复指引，
-                # 前端按非 200 统一 toast"未配置 DeepSeek API key"（§7.3）
-                raise HTTPException(status_code=500, detail=str(exc)) from None
+                # 账户类确定性错误（key 空/无效/余额）：终止整批，已译保留；error="auth" 供前端 toast（§7.3）
+                logger.warning("AI 批量补译终止（账户类错误）：%s", exc)
+                with _batch_state_lock:
+                    _batch_state["error"] = "auth"
+                return
             except Exception as exc:
                 logger.warning("AI 批量补译失败，跳过 %s：%s", row["full_name"], exc)
-                failed += 1
+                with _batch_state_lock:
+                    _batch_state["failed"] += 1
                 continue
             conn.execute("UPDATE repos SET description_zh = ? WHERE id = ?", (zh, row["id"]))
             conn.commit()
-            translated += 1
-        return {"translated": translated, "failed": failed}
+            with _batch_state_lock:
+                _batch_state["translated"] += 1
+    except Exception:
+        logger.exception("AI 批量补译异常终止")
+        with _batch_state_lock:
+            _batch_state["error"] = "unknown"
     finally:
-        conn.close()
-        _batch_translating_lock.release()
+        try:
+            if client is not None:
+                await client.aclose()
+        except Exception:  # 清理失败不阻断终端状态落盘（防假 client 无 aclose 等）
+            logger.exception("AI 批量补译 client 关闭失败")
+        if conn is not None:
+            conn.close()
+        with _batch_state_lock:
+            _batch_state["running"] = False
+            _batch_state["finished"] = True
+
+
+@router.get("/api/translate-missing/status")
+async def api_translate_missing_status() -> dict:
+    """批量补译进度查询（§7.2）：前端每 2s 轮询；不依赖 AI client，无任务史时全零/false/None。"""
+    with _batch_state_lock:
+        return dict(_batch_state)
