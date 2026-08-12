@@ -18,11 +18,19 @@ NOW = "2026-08-09T00:00:00Z"
 
 
 def make_node(
-    full_name: str, *, stars: int = 1500, private: bool = False, disabled: bool = False, description: str | None = None
+    full_name: str,
+    *,
+    stars: int = 1500,
+    private: bool = False,
+    disabled: bool = False,
+    description: str | None = None,
+    language: str | None = None,
+    topics: tuple[str, ...] = (),
 ) -> dict:
     """造一条 GraphQL Repository 节点（字段对齐每日任务用到的子集）。
 
-    description 默认 None：既有用例库里 description_en 也是 NULL，两值相等 → 不触发 T-016 变更检测。
+    description/language 默认 None：既有用例库里对应字段也是 NULL，两值相等 → 不触发变更检测；
+    topics 默认空：与 schema 默认 '[]' 相等（T-025 起比对 language/topics，默认值即"无漂移"，不误伤既有用例）。
     """
     return {
         "nameWithOwner": full_name,
@@ -30,6 +38,8 @@ def make_node(
         "isPrivate": private,
         "isDisabled": disabled,
         "description": description,
+        "primaryLanguage": {"name": language} if language is not None else None,
+        "repositoryTopics": {"nodes": [{"topic": {"name": t}} for t in topics]},
     }
 
 
@@ -379,10 +389,12 @@ def _seed_repo_with_desc(conn, *, description_en, description_zh=None):
 
 
 def test_snapshot_description_change_updates_en_and_clears_zh(tmp_path):
-    """原文变更 → UPDATE description_en 新值＋description_zh=NULL（当日 ensure 全池翻译自然重译）；language/topics 不动。"""
+    """原文变更 → UPDATE description_en 新值＋description_zh=NULL（当日 ensure 全池翻译自然重译）；language/topics 与 nodes 一致不动。"""
     conn = _open_db(tmp_path)
     _seed_repo_with_desc(conn, description_en="old desc", description_zh="旧译")
-    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc")})
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc", language="Python", topics=("ai",))}
+    )
     logger, _records = make_logger()
     _run(client, conn, logger)
 
@@ -391,7 +403,7 @@ def test_snapshot_description_change_updates_en_and_clears_zh(tmp_path):
     ).fetchone()
     assert row["description_en"] == "new desc"  # 原文更新为 nodes 现值
     assert row["description_zh"] is None  # 清旧译文：当日 ensure 重译
-    assert row["language"] == "Python" and row["topics"] == '["ai"]'  # language/topics 漂移不处理（§7.4 边界留痕）
+    assert row["language"] == "Python" and row["topics"] == '["ai"]'  # language/topics 无漂移：不动（§7.4 T-025）
     assert row["dead"] == 0
     # 快照照常写入（变更检测是附带更新，不改变快照行为）
     repo_id = conn.execute("SELECT id FROM repos WHERE full_name = 'a/live'").fetchone()["id"]
@@ -403,7 +415,9 @@ def test_snapshot_description_unchanged_keeps_translation(tmp_path):
     """原文无变更 → 不动原文不动译文（§7.3 自动分支口径）。"""
     conn = _open_db(tmp_path)
     _seed_repo_with_desc(conn, description_en="same desc", description_zh="已译")
-    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc")})
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc", language="Python", topics=("ai",))}
+    )
     logger, _records = make_logger()
     _run(client, conn, logger)
 
@@ -416,7 +430,9 @@ def test_snapshot_description_removed_clears_en_and_zh(tmp_path):
     """简介被删除（nodes 返回 None）→ 原文清 NULL＋清译文；快照照写（简介删除也是变更）。"""
     conn = _open_db(tmp_path)
     _seed_repo_with_desc(conn, description_en="was here", description_zh="已译")
-    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description=None)})
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description=None, language="Python", topics=("ai",))}
+    )
     logger, _records = make_logger()
     _run(client, conn, logger)
 
@@ -440,7 +456,9 @@ def test_snapshot_description_change_clears_all_recommendations(tmp_path):
         (repo_id, repo_id),
     )
     conn.commit()
-    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc")})
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc", language="Python", topics=("ai",))}
+    )
     logger, _records = make_logger()
     _run(client, conn, logger)
 
@@ -461,11 +479,173 @@ def test_snapshot_description_unchanged_keeps_recommendations(tmp_path):
         (repo_id,),
     )
     conn.commit()
-    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc")})
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc", language="Python", topics=("ai",))}
+    )
     logger, _records = make_logger()
     _run(client, conn, logger)
 
     row = conn.execute("SELECT description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
     assert row["description_zh"] == "已译"
     assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 1
+    conn.close()
+
+
+# ---------- T-025：language/topics 漂移检测（§7.4 口径：只 UPDATE 归类字段，不清译文不删推荐语） ----------
+
+
+def _seed_repo_with_meta(conn, *, language=None, topics='["ai"]', description_en=None, description_zh=None):
+    """插一个归类字段/简介/译文全可定制的仓库（T-025 漂移测试用），返回 repo_id。"""
+    cur = conn.execute(
+        "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 0, 'initial', ?)",
+        ("a/live", "nid-live", description_en, description_zh, language, topics, "2026-08-08T00:00:00Z"),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_snapshot_language_drift_updates_language_only(tmp_path):
+    """language 漂移 → 只 UPDATE 归类字段：译文保留、推荐语不删（§7.4 T-025 口径）；drift_updated=1。"""
+    conn = _open_db(tmp_path)
+    repo_id = _seed_repo_with_desc(conn, description_en="same desc", description_zh="已译")  # language='Python', topics='["ai"]'
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '总星文本', 'sha-1', '2026-W32')",
+        (repo_id,),
+    )
+    conn.commit()
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc", language="Rust", topics=("ai",))}
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute("SELECT language, topics, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["language"] == "Rust"  # 归类字段更新
+    assert row["topics"] == '["ai"]'  # 未漂移字段写回 nodes 侧新值（同值，字符串不变）
+    assert row["description_zh"] == "已译"  # 不清译文
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 1  # 不删推荐语
+    assert stats.drift_updated == 1
+    conn.close()
+
+
+def test_snapshot_topics_drift_updates_topics_json(tmp_path):
+    """topics 增/减 → repos.topics 更新为 nodes 原序 JSON；推荐语不删、译文不动；drift_updated=1。"""
+    conn = _open_db(tmp_path)
+    repo_id = _seed_repo_with_desc(conn, description_en="same desc", description_zh="已译")
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '总星文本', 'sha-1', '2026-W32')",
+        (repo_id,),
+    )
+    conn.commit()
+    client = FakeClient(
+        nodes_by_id={
+            "nid-live": make_node("a/live", stars=2000, description="same desc", language="Python", topics=("ai", "ml"))
+        }
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute("SELECT topics, language, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["topics"] == '["ai", "ml"]'  # 按 GitHub 返回原序 JSON 写回
+    assert row["language"] == "Python"
+    assert row["description_zh"] == "已译"
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 1
+    assert stats.drift_updated == 1
+    conn.close()
+
+
+def test_snapshot_topics_order_shuffle_is_not_drift(tmp_path):
+    """topics 仅顺序不同（GitHub 返回顺序抖动）→ 按集合比较视为无漂移：不 UPDATE、drift_updated=0。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_meta(conn, language="Python", topics='["ai", "ml"]')  # 库内 [ai, ml]
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, language="Python", topics=("ml", "ai"))}  # node 反序
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute("SELECT topics FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["topics"] == '["ai", "ml"]'  # 库内字符串原样，不被顺序扰动刷行
+    assert stats.drift_updated == 0
+    conn.close()
+
+
+def test_snapshot_no_drift_touches_nothing(tmp_path):
+    """language/topics/description 均无变更 → 归类字段/译文/推荐语都不动；drift_updated=0。"""
+    conn = _open_db(tmp_path)
+    repo_id = _seed_repo_with_desc(conn, description_en="same desc", description_zh="已译")
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '总星文本', 'sha-1', '2026-W32')",
+        (repo_id,),
+    )
+    conn.commit()
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="same desc", language="Python", topics=("ai",))}
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute("SELECT language, topics, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert (row["language"], row["topics"], row["description_zh"]) == ("Python", '["ai"]', "已译")
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 1
+    assert stats.drift_updated == 0
+    conn.close()
+
+
+def test_snapshot_language_appears_from_none(tmp_path):
+    """language None → 有值（GitHub 补标语言）：库内 NULL 更新为新语言；drift_updated=1。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_meta(conn, language=None, topics='["ai"]')  # 库内 NULL
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, language="Go", topics=("ai",))})
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute("SELECT language FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["language"] == "Go"
+    assert stats.drift_updated == 1
+    conn.close()
+
+
+def test_snapshot_language_removed_to_none(tmp_path):
+    """language 有值 → None（GitHub 官方允许清空语言）：库内更新为 NULL；drift_updated=1。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_meta(conn, language="Go", topics='["ai"]')
+    client = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2000, language=None, topics=("ai",))})
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute("SELECT language FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["language"] is None
+    assert stats.drift_updated == 1
+    conn.close()
+
+
+def test_snapshot_description_and_drift_both_apply(tmp_path):
+    """description 与 language/topics 同仓叠加变更 → 两者都生效：译文清、推荐语删、归类字段更新；drift_updated=1。"""
+    conn = _open_db(tmp_path)
+    repo_id = _seed_repo_with_desc(conn, description_en="old desc", description_zh="旧译")  # language='Python', topics='["ai"]'
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '总星文本', 'sha-1', '2026-W32')",
+        (repo_id,),
+    )
+    conn.commit()
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, description="new desc", language="Rust", topics=("ml",))}
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    row = conn.execute(
+        "SELECT description_en, description_zh, language, topics FROM repos WHERE full_name = 'a/live'"
+    ).fetchone()
+    assert row["description_en"] == "new desc"
+    assert row["description_zh"] is None  # description 变更 → 清译文
+    assert row["language"] == "Rust" and row["topics"] == '["ml"]'  # 漂移 → 归类字段更新
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 0  # 删推荐语
+    assert stats.drift_updated == 1
     conn.close()

@@ -7,7 +7,8 @@
   只停采不删历史快照（schema 注释口径）。
 - T-016/T-017 变更检测（决策 5 v2）：nodes 本已拉 description 字段，与库内 description_en 比对，
   有变更 → 更新原文＋清 description_zh=NULL＋DELETE 该仓全部维度推荐语（当日 ensure 对范围内仓自然重译/重生）；
-  无变更不动。language/topics 漂移本次不处理（流程说明 §7.4 钉死边界，只覆盖 description_en）。
+  无变更不动。T-025 追加 language/topics 漂移检测（流程说明 §7.4）：只 UPDATE repos 归类字段，
+  不清译文不删推荐语——归类读时实时算，UPDATE 后次日榜单自然生效（漂移率低、重生成本高）。
 - 整轮共享一个 captured_at（任务启动时刻 utc_now_iso()）：与 T-005 同批一致口径，
   "当日快照"后续按 <= 截止日取最近一行的榜单 SQL 不受影响。
 - 发现池每日只捞 stars:>=1000 按 updated 降序前 5 页（500 条）：星数榜头部常年固化，
@@ -16,7 +17,7 @@
 - 静默容错（共识 §8：连续 3 天失败允许数据空洞，次日调度自然重试）：
   单批/单页失败记日志后继续跑完本批之外的量；整任务异常吞掉只记日志，不报警、不抛出。
 - 任务日志双写 data/jobs.log（RotatingFileHandler，data/ 已 gitignore）与控制台，
-  每轮结束记一行汇总（快照/新发现/dead/耗时），出问题有据可查。
+  每轮结束记一行汇总（快照/新发现/dead/漂移/耗时），出问题有据可查。
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ class DailyStats:
     snapshots_written: int = 0  # 本轮写入的当日快照行数
     discovered: int = 0  # 本轮新入池仓库数（source='discover'）
     dead_marked: int = 0  # 本轮新标记死库数
+    drift_updated: int = 0  # 本轮 language/topics 漂移更新归类字段的仓库数（T-025；同仓双漂移也只 +1）
 
 
 def get_job_logger(log_path: str | Path = DEFAULT_LOG_PATH) -> logging.Logger:
@@ -78,8 +80,13 @@ def _apply_snapshot_batch(
 
     T-016/T-017 变更检测：nodes 返回的 description 与库内 description_en 比对，有变更 → 更新原文并清旧译文
     （description_zh=NULL）＋DELETE 该仓全部维度推荐语（recommendations，可再生数据；当日 ensure 对范围内仓
-    重生自愈，与译文清除同一检测点）；无变更不动。language/topics 漂移不处理（流程说明 §7.4 钉死边界：
-    只覆盖 description_en）。
+    重生自愈，与译文清除同一检测点）；无变更不动。
+    T-025 追加 language/topics 漂移检测（与 description 检测并列独立）：任一漂移 → 只 UPDATE repos 归类字段
+    （language/topics 一并写 nodes 侧新值，保持简单），不清 description_zh、不 DELETE recommendations——
+    推荐语/译文输入是简介与 README，归类是读时实时算的，UPDATE 后次日榜单自然生效；漂移率低、重生成本高。
+    topics 按集合比较（防 GitHub 返回顺序抖动造成伪漂移），集合相等不写库（避免顺序扰动刷行）、有差异才
+    按 GitHub 返回原序 json.dumps(ensure_ascii=False) 写回；row['topics'] 脏数据 json.loads 抛错属 fail-loud
+    不捕获（与 report.py 惯例一致）；node 结构缺键按 KeyError/TypeError 上抛（协议字段，缺了就是真异常）。
     """
     with conn:  # 一批一个事务：半批失败整体回滚，重跑整批幂等
         for row, node in zip(chunk, nodes):
@@ -95,6 +102,17 @@ def _apply_snapshot_batch(
                     )
                     # T-017：简介变更 → 当日清该仓全部维度推荐语（可再生数据；当日 ensure 范围内重生自愈）
                     conn.execute("DELETE FROM recommendations WHERE repo_id = ?", (row["id"],))
+                # T-025：language/topics 漂移检测——任一漂移只更新归类字段（不清译文不删推荐语，见 docstring）；
+                # topics 按集合比较防顺序抖动伪漂移，写入按 GitHub 返回原序
+                lang_node = node.get("primaryLanguage")  # GitHub 官方允许为空：None 与库内 None 相等视为无变更
+                language = lang_node["name"] if lang_node is not None else None
+                topics = [t["topic"]["name"] for t in node["repositoryTopics"]["nodes"]]
+                if language != row["language"] or set(topics) != set(json.loads(row["topics"])):
+                    conn.execute(
+                        "UPDATE repos SET language = ?, topics = ? WHERE id = ?",
+                        (language, json.dumps(topics, ensure_ascii=False), row["id"]),
+                    )
+                    stats.drift_updated += 1
                 conn.execute(
                     "INSERT OR REPLACE INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
                     (row["id"], captured_at, node["stargazerCount"]),
@@ -107,9 +125,9 @@ async def _snapshot_all(
 ) -> None:
     """每日快照：全部 dead=0 仓库按 node_id 分批走 nodes(ids:)；单批失败记日志跳过，不拖垮整轮。
 
-    SELECT 带 description_en 供 T-016 变更检测（_apply_snapshot_batch 内比对更新）。
+    SELECT 带 description_en/language/topics 供 T-016/T-025 变更检测（_apply_snapshot_batch 内比对更新）。
     """
-    rows = conn.execute("SELECT id, node_id, description_en FROM repos WHERE dead = 0").fetchall()
+    rows = conn.execute("SELECT id, node_id, description_en, language, topics FROM repos WHERE dead = 0").fetchall()
     for offset in range(0, len(rows), MAX_NODES_PER_QUERY):
         chunk = rows[offset : offset + MAX_NODES_PER_QUERY]
         try:
@@ -215,10 +233,11 @@ async def run_daily(
         log.exception("每日任务整轮异常：吞掉不报警（共识 §8 允许数据空洞），次日调度自然重试")
     elapsed = time.monotonic() - started
     log.info(
-        "每日任务汇总：快照 %d 行、新发现 %d 个、dead 标记 %d 个、耗时 %.1f 秒（captured_at=%s）",
+        "每日任务汇总：快照 %d 行、新发现 %d 个、dead 标记 %d 个、漂移更新 %d 个、耗时 %.1f 秒（captured_at=%s）",
         stats.snapshots_written,
         stats.discovered,
         stats.dead_marked,
+        stats.drift_updated,
         elapsed,
         captured_at,
     )
