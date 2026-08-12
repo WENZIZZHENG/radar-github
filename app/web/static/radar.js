@@ -22,12 +22,27 @@ function toggleRow(row) {
   panel.classList.toggle("open", open);
 }
 
-function toast(msg, isErr) {
+function toast(msg, isErr, opts) {
   const t = document.createElement("div");
   t.className = isErr ? "toast err" : "toast";
   t.textContent = msg;
+  // T-023 可选动作按钮（如删除标签的"撤销"）：小按钮，点击立即禁用防连点（防重入）；
+  // 既有全部调用点签名兼容（不带 opts 即纯文本 toast，行为不变）
+  if (opts && opts.action) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-action";
+    btn.textContent = opts.action.label;
+    btn.addEventListener("click", () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      opts.action.onClick();
+    });
+    t.appendChild(btn);
+  }
   document.getElementById("toasts").appendChild(t);
-  setTimeout(() => t.remove(), 4000);
+  setTimeout(() => t.remove(), (opts && opts.duration) || 4000); // 普通 4s；撤销类 6s 由调用方传
+  return t; // T-023 调用方（deleteTag 撤销成功）需移除原 toast
 }
 
 function setStar(star, on) {
@@ -146,7 +161,9 @@ function tagHref(tag) {
   return "/tags/" + encodeURIComponent(tag);
 }
 
-// 删除标签：乐观移除 chip（<100ms 反馈）→ DELETE → 成功 toast；失败插回原位＋报错 toast
+// 删除标签：乐观移除 chip（<100ms 反馈）→ DELETE → 成功 toast 带"撤销"（T-023：该 toast 存续 6s，普通 4s 不动）；
+// 点撤销 → POST /api/tags 重新添加（幂等，同打标调用）→ 成功 chip 插回原位（删除前 nextSibling 锚点）＋toast("已恢复标签")；
+// 失败 → chip 不回插＋报错 toast（与删除失败插回路径不共享状态、互不干扰）；超时未点 → toast 消失不动作。
 async function deleteTag(x) {
   const chip = x.closest(".tag");
   const repo = x.dataset.repo;
@@ -162,7 +179,29 @@ async function deleteTag(x) {
     );
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
-    toast("已删除标签");
+    const undoToast = toast("已删除标签", false, {
+      duration: 6000, // T-023：撤销 toast 存续 6 秒（普通 toast 4s 不动）
+      action: {
+        label: "撤销", // 文案钉死
+        onClick: async () => {
+          try {
+            const addResp = await fetch("/api/tags", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ full_name: repo, tag }),
+            });
+            const addData = await addResp.json().catch(() => ({}));
+            if (!addResp.ok) throw new Error(addData.detail || "HTTP " + addResp.status);
+            undoToast.remove(); // 撤销成功：撤掉"已删除标签"toast，避免与"已恢复标签"并排矛盾（已移除节点 remove 是 no-op）
+            if (anchor && anchor.parentElement) host.insertBefore(chip, anchor);
+            else host.appendChild(chip);
+            toast("已恢复标签");
+          } catch (err) {
+            toast("恢复标签失败：" + err.message, true); // 失败不回插（与删除失败插回路径互不干扰）
+          }
+        },
+      },
+    });
   } catch (err) {
     if (anchor && anchor.parentElement) host.insertBefore(chip, anchor);
     else host.appendChild(chip);
@@ -179,6 +218,9 @@ function startTagInput(btn) {
   input.maxLength = 20;
   input.placeholder = "1~20 字符，回车确认";
   input.setAttribute("aria-label", "新标签名称");
+  // T-022 打标输入建议（datalist）：list 指向页内唯一 datalist（既有标签全量注入，base.html 渲染）；
+  // 空库页无 datalist → 安静跳过（浏览器对缺失 datalist 的 list 属性本就忽略，显式守卫语义清楚）
+  if (document.getElementById("all-tags")) input.setAttribute("list", "all-tags");
   const hint = document.createElement("span");
   hint.className = "tag-hint";
   hint.hidden = true;

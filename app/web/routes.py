@@ -385,6 +385,16 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict, summa
     return groups
 
 
+def _all_tags(conn: sqlite3.Connection) -> list[str]:
+    """T-022 打标输入建议（datalist）：全部既有标签一次注入（SELECT DISTINCT 去重排序，几十个量级）。
+
+    供渲染行页面的模板上下文（_boards_context / follows_page / tag_page）——每页渲染一个
+    `<datalist id="all-tags">`（base.html 统一落点，空库不渲染），行内输入框 list 属性指向它。
+    标签云页（无行列表）不注入。
+    """
+    return [r["tag"] for r in conn.execute("SELECT DISTINCT tag FROM tags ORDER BY tag")]
+
+
 def _display_maps(
     conn: sqlite3.Connection, *, dimension: str, period_label: str
 ) -> tuple[dict, dict, dict, dict]:
@@ -609,6 +619,7 @@ def _boards_context(
             "meta": _meta(conn, period, as_of_date),  # 窗口/口径按请求期次展示，不因降级改写成总星榜口径
             "notice": notice,
             "follow_count": len(follow_rows),
+            "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
             "lang_boards": lang_boards,
             "topic_boards": topic_boards,
         }
@@ -687,6 +698,7 @@ def follows_page(request: Request) -> HTMLResponse:
                 "title": "我的关注",
                 "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
                 "follow_count": len(follow_rows),
+                "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
                 "groups": _follow_groups(cards, reasons, zh, tags, summaries),
             },
         )
@@ -990,6 +1002,7 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
                 "rows": view_rows,
                 "total": len(view_rows),
                 "follow_count": len(follow_rows),
+                "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
             },
         )
     finally:

@@ -591,3 +591,35 @@ def test_row_endpoint_note_on_tag_page(client):
     resp = client.get("/tags/选型观察")
     assert resp.status_code == 200
     assert "端点快照 2026-08-09" in resp.text
+
+
+# ---------- T-022：打标输入 datalist 建议（既有标签全量注入，每页一个） ----------
+
+
+def test_datalist_present_with_existing_tags(client):
+    """渲染行页面（周/季/总星/关注/标签结果页）各注入一个 datalist，含既有标签 option（每页一个防每行一个）。"""
+    for path in ("/", f"/?week={WEEK_LABEL}", "/quarter", "/total", "/follows", "/tags/选型观察"):
+        resp = client.get(path)
+        assert resp.status_code == 200, path
+        assert resp.text.count('<datalist id="all-tags">') == 1, path  # 每页恰好一个
+        assert '<option value="选型观察">' in resp.text, path  # 既有标签全量注入
+    # 标签云总页无行列表（无打标输入框）：不注入 datalist（设计钉死，防多余渲染）
+    assert '<datalist id="all-tags">' not in client.get("/tags").text
+
+
+def test_datalist_updated_after_adding_tag(client):
+    """新增标签后重载页面，datalist 含新标签（服务端全量注入，非页面缓存）。"""
+    resp = client.post("/api/tags", json={"full_name": "a/py", "tag": "新标签建议"})
+    assert resp.status_code == 200 and resp.json()["added"] is True
+    text = client.get("/total").text
+    assert text.count('<datalist id="all-tags">') == 1
+    assert '<option value="新标签建议">' in text
+    assert '<option value="选型观察">' in text  # 既有标签仍在
+
+
+def test_no_datalist_on_empty_tag_db(fresh_client):
+    """空库（无任何标签）不渲染 datalist（钉死形态：无 datalist；JS 对缺失 datalist 的 list 属性静默忽略）。"""
+    for path in ("/", "/total", "/follows", "/tags"):
+        resp = fresh_client.get(path)
+        assert resp.status_code == 200, path
+        assert '<datalist id="all-tags">' not in resp.text, path
