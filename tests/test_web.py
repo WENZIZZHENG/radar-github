@@ -58,6 +58,15 @@ def _seed_full(conn):
         description_en="Go lib",
         snapshots=[("2026-05-11T00:00:00Z", 50), ("2026-08-02T00:00:00Z", 150), (f"{SNAP_DAY}T00:00:00Z", 200)],
     )
+    # T-018 新区种子：两端快照跨度 3 天（<5 缺席）→ 历史周/季页新区行（入池 +300、3 天，时间稳健）
+    _add_repo(
+        conn,
+        "a/rise",
+        language="Rust",
+        topics=["cli"],
+        description_en="rising star",
+        snapshots=[("2026-08-06T00:00:00Z", 100), (f"{SNAP_DAY}T00:00:00Z", 400)],
+    )
     conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_go, "2026-08-02T00:00:00Z"))
     # T-017 推荐语按 (dimension, period_label) 展示：总星行文本供 /total（时间稳健）断言；
     # 周/季行按固定期次标签插入（2026-W32/2026-Q3），供历史周/季页时间稳健断言
@@ -122,16 +131,18 @@ def test_index_has_17_boards_and_chips(client):
     assert text.count('<a class="chip" href="#b-') == 17
 
 
-def test_empty_state_falls_back_to_total(fresh_client):
-    """首期空态（验收标准）：周榜全缺席 → 显示总星榜内容 + 明确提示；17 板块仍在。"""
+def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
+    """首期降级判定变更（T-018）：主榜全空但新区有行 → 不降级（无 notice 无总星榜降级）；
+    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；17 板块仍在、chips 仍 17。"""
     resp = fresh_client.get("/")
     assert resp.status_code == 200
-    # 时间稳健口径（评审中-1 修复）：首期库上周榜永远全缺席 → 必显示降级提示条；
-    # 具体文案随"今天"与 ready 日的关系变化（倒计时/通用缺席），裸 / 请求不锁字面
-    assert 'class="notice"' in resp.text
-    assert "a/new" in resp.text  # 总星榜行确实渲染
+    assert 'class="notice"' not in resp.text  # 新区有行 → 不降级
+    assert "初始总星榜" not in resp.text  # 不降级到总星榜
+    assert "a/new" in resp.text  # 新区行确实渲染
+    assert "新崛起 · 入池未满一个统计窗口" in resp.text
+    assert resp.text.count("本期暂无数据") == 17  # 主榜全空：每榜空态照常
     assert resp.text.count('class="board"') == 17
-    assert "本期暂无数据" in resp.text  # 空榜板块照列
+    assert resp.text.count('<a class="chip" href="#b-') == 17
     assert "follows-sec" not in resp.text  # v1.3：P1 顶部关注区已移出为独立页 P6
     # 默认全部展开（D1/D3 v1.1）：行即展开态、面板 open、aria 同步
     assert 'class="row expanded"' in resp.text
@@ -140,16 +151,19 @@ def test_empty_state_falls_back_to_total(fresh_client):
 
 
 def test_history_week_param(fresh_client):
-    """历史周次参数：合法周 200 且页内显示该周次；跟踪池建立前的周次显示无数据提示。"""
+    """历史周次参数：合法周 200 且页内显示该周次；快照首日所在周主榜空但新区有行 → 不降级；
+    跟踪池建立前的周次主榜新区全空 → 降级无数据提示。"""
     resp = fresh_client.get(f"/?week={WEEK_LABEL}")
     assert resp.status_code == 200
     assert WEEK_LABEL in resp.text  # 期次控件当前期标签
-    assert "初始总星榜" in resp.text  # 该周（=快照首日所在周）仍是首期空态
-    # 倒计时字面锁在固定历史周断言（as_of 恒 2026-08-09 < ready 2026-08-16），时间稳健
-    assert "首份周报预计将于" in resp.text
+    # T-018：a/new 单张快照 → 新区有行 → 不再降级（as_of 恒 2026-08-09 期末，时间稳健）
+    assert "新崛起 · 入池未满一个统计窗口" in resp.text
+    assert "a/new" in resp.text
+    assert "初始总星榜" not in resp.text
+    assert "首份周报预计将于" not in resp.text
     resp = fresh_client.get(f"/?week={PREV_WEEK_LABEL}")
     assert resp.status_code == 200
-    assert "暂无可展示数据" in resp.text  # 2026-08-02 之前无任何快照，连总星榜也为空
+    assert "暂无可展示数据" in resp.text  # 2026-08-02 之前无任何快照：主榜新区全空 → 降级
 
 
 def test_week_param_invalid_and_future(client):
@@ -387,3 +401,84 @@ def test_follows_page_has_recommend_button(follows_client):
     """关注页 P6 行内推荐按钮就位（§8.2：total 维度操作）；无推荐语时按钮按态"生成推荐语"。"""
     text = follows_client.get("/follows").text
     assert 'class="recommend-btn" data-repo="f/ts-hot" data-dim="total" data-period-label="all" data-has-reason="0">生成推荐语</button>' in text
+
+
+# ---------- T-018：新崛起区（决策 4 v2；内容断言走历史期次页/total，遵守本文件时间稳健约定） ----------
+
+
+def test_week_history_page_rising_section(client):
+    """新区小节渲染（历史周页 as_of 固定，时间稳健）：区头/小字说明/计数徽标/入池标注 +X（入池 N 天）。"""
+    text = client.get(f"/?week={WEEK_LABEL}").text
+    assert "新崛起 · 入池未满一个统计窗口" in text
+    assert "以下项目入池不足 7 天，按入池以来增星排序" in text
+    assert "a/rise" in text
+    assert "+300（入池 3 天）" in text  # 在池增量 + 在池天数整数化标注（3.0 天 → 3）
+    assert "新崛起 · 入池未满一个统计窗口<span class=\"n\">Top 1</span>" in text  # 计数徽标 = 新区实际行数
+    assert 'class="window-note"' not in text  # 新区行不显示 window_note
+
+
+def test_quarter_history_page_rising_section(client):
+    """季页新区同款（历史季页 as_of 固定）：小字说明 90 天版＋入池标注。"""
+    text = client.get("/quarter?quarter=2026-Q3").text
+    assert "新崛起 · 入池未满一个统计窗口" in text
+    assert "以下项目入池不足 90 天，按入池以来增星排序" in text
+    assert "+300（入池 3 天）" in text
+
+
+def test_rising_section_absent_on_total_and_empty_boards(client):
+    """空区不渲染：total 页无新区小节（区头/说明全不出现）；无缺席仓的榜块不渲染区头。"""
+    text = client.get("/total").text
+    assert "新崛起" not in text
+    assert "入池未满" not in text
+    text = client.get(f"/?week={WEEK_LABEL}").text
+    # _seed_full 中仅 a/rise（Rust＋cli）缺席：语言 rust 榜与主题 other 榜各一个新区小节，其余榜无区头
+    assert text.count("新崛起 · 入池未满一个统计窗口") == 2
+
+
+def test_chips_exclude_rising_rows(client):
+    """锚点 chips 徽标只计主榜行数不计新区（历史周页 as_of 固定）：rust 榜主榜 0 行但新区 1 行，chip 仍 0。"""
+    text = client.get(f"/?week={WEEK_LABEL}").text
+    assert 'href="#b-language-rust">Rust<i>0</i></a>' in text
+    assert 'href="#b-language-python">Python<i>1</i></a>' in text
+
+
+def test_fallback_when_main_and_rising_both_empty(tmp_path, monkeypatch):
+    """降级判定变更（T-018）：主榜＋新区全空才降级——无任何快照的库周页照旧降级 total＋notice。
+
+    F2-1 收窄适配：straddle 缺席老仓（在池 30 天 > win_max 9）不算新区——主榜＋新区仍全空，降级 notice
+    照旧；notice 文案按是否有总星数据分流（"暂无可展示数据"vs"增量榜全部缺席"），两分支都锁。
+    """
+
+    def _get_page(db_name, seed):
+        db = tmp_path / db_name
+        init_db(db)
+        conn = get_conn(db)
+        seed(conn)
+        conn.commit()
+        conn.close()
+        monkeypatch.setenv("RADAR_DB_PATH", str(db))
+        monkeypatch.setenv("RADAR_JOBS_ENABLED", "0")
+        with TestClient(app) as c:
+            return c.get("/")
+
+    # 无任何快照：总星榜也无数据 → "暂无可展示数据"分支（原断言不动）
+    resp = _get_page("web-empty.db", lambda conn: _add_repo(conn, "a/no-snap", language="Python", snapshots=[]))
+    assert resp.status_code == 200
+    assert 'class="notice"' in resp.text
+    assert "暂无可展示数据" in resp.text
+    assert "新崛起" not in resp.text
+
+    # F2-1 收窄适配：仅 straddle 缺席老仓——主榜缺席且不算新区，降级照旧（有总星数据 → "增量榜全部缺席"分支）
+    resp = _get_page(
+        "web-straddle.db",
+        lambda conn: _add_repo(
+            conn,
+            "a/straddle",
+            language="Go",
+            snapshots=[("2026-07-10T00:00:00Z", 50), (f"{SNAP_DAY}T00:00:00Z", 500)],
+        ),
+    )
+    assert resp.status_code == 200
+    assert 'class="notice"' in resp.text
+    assert "增量榜全部缺席" in resp.text
+    assert "新崛起" not in resp.text  # straddle 老仓不算新区（F2-1 收窄）：主榜＋新区全空才降级

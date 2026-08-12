@@ -13,7 +13,14 @@ import pytest
 from app.classify import LANGUAGES, load_topics
 from app.config import BASE_DIR
 from app.db import get_conn, init_db
-from app.report import _ENDPOINT_SQL, _START_AFTER_SQL, ABSENT_FIRST_WEEK, compute_boards, compute_repo_deltas
+from app.report import (
+    _BASELINE_SQL,
+    _ENDPOINT_SQL,
+    _START_AFTER_SQL,
+    ABSENT_FIRST_WEEK,
+    compute_boards,
+    compute_repo_deltas,
+)
 
 TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"
 AS_OF = "2026-08-09T00:00:00Z"  # 固定基准时刻：窗口语义不依赖"今天"，测试可复现
@@ -265,6 +272,14 @@ def test_endpoint_sql_uses_index_seek(conn):
         assert not any("SCAN" in detail for detail in plan), plan
 
 
+def test_baseline_sql_uses_index_seek(conn):
+    """T-018 新区基线快照 SQL 红线回归锁：主键 ASC LIMIT 1 必须 SEARCH 索引 seek，出现 SCAN 全表扫即变红。"""
+    _add_repo(conn, "a/x", snapshots=[(_iso(1), 100)])
+    plan = [row["detail"] for row in conn.execute(f"EXPLAIN QUERY PLAN {_BASELINE_SQL}", (1,))]
+    assert any("SEARCH" in detail for detail in plan), plan
+    assert not any("SCAN" in detail for detail in plan), plan
+
+
 def test_repo_ids_filter_limits_computation(conn):
     """repo_ids 过滤参数（T-008 评审中-2 转办，T-009 落地）：只算指定集合；dead 剔除口径不变。
 
@@ -289,3 +304,133 @@ def test_repo_ids_filter_limits_computation(conn):
     # total 口径同样接受过滤
     total_deltas = compute_repo_deltas(conn, period="total", as_of=AS_OF, repo_ids=[r3])
     assert set(total_deltas) == {r3} and total_deltas[r3].stars == 400
+
+
+# ---------- T-018 新崛起区（决策 4 v2）：主榜缺席仓按在池增量 Top 10 分区展示 ----------
+
+
+def test_rising_admission_and_graduation(conn, topic_table):
+    """准入：主榜出席校验失败（跨度不足最小窗口）但有端点快照的仓进新区；
+    毕业：跨度满最小窗口当期起出席主榜、自动离开新区（计算口径自然结果，无特判）。"""
+    rid = _add_repo(conn, "a/rising", language="Python", snapshots=[(_iso(4), 100), (_iso(0), 130)])
+    _add_repo(conn, "a/main", language="Python", snapshots=[(_iso(7), 100), (_iso(0), 300)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    py = _board(boards, "language", "python")
+    assert [r.full_name for r in py.rows] == ["a/main"]
+    assert [r.full_name for r in py.rising_rows] == ["a/rising"]
+
+    # 毕业：一周后各补一张端点快照 → 两端跨度满最小窗口，出席主榜，新区不再含它们
+    next_week = (_AS_OF_DT + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute("INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)", (rid, next_week, 200))
+    conn.execute(
+        "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES ((SELECT id FROM repos WHERE full_name = ?), ?, ?)",
+        ("a/main", next_week, 350),
+    )
+    conn.commit()
+    boards2 = compute_boards(conn, topic_table, period="week", as_of=next_week)
+    py2 = _board(boards2, "language", "python")
+    assert {r.full_name for r in py2.rows} == {"a/rising", "a/main"}
+    assert py2.rising_rows == []
+
+
+def test_rising_pool_delta_and_days(conn, topic_table):
+    """新区口径：在池增量 = 端点星数 − 入池基线（最旧一张快照）星数；在池天数 = 两端间隔（1 位小数）。
+
+    基线取最旧一张——远超窗口的旧快照不参与主榜候选（S1 跨度 30 天滑出窗口），仍作入池基线参与在池增量；
+    F2-1 收窄适配：跨窗空洞（在池天数 > win_max）的缺席老仓不进新区，只有真·新入池（pool_days < win_min）在新区。
+    """
+    _add_repo(conn, "a/pooled", language="Go", snapshots=[(_iso(30), 50), (_iso(4), 100), (_iso(0), 500)])
+    _add_repo(conn, "a/true-new", language="Go", snapshots=[(_iso(4), 100), (_iso(0), 500)])
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    go = _board(boards, "language", "go")
+    assert go.rows == []  # 缺席不进主榜
+    (r,) = go.rising_rows
+    assert r.full_name == "a/true-new"
+    assert r.stars == 500 and r.pool_delta == 400 and r.pool_days == 4.0
+    # F2-1 收窄适配：a/pooled 在池 30 天 > win_max（9），跨窗空洞不进新区（两不见）
+    assert all(r.full_name != "a/pooled" for b in boards for r in b.rising_rows)
+
+    # 非整日间隔保留 1 位小数（同 window_days 精度）
+    _add_repo(conn, "a/pooled-frac", language="Rust", snapshots=[(_iso(2.5), 100), (_iso(0), 300)])
+    boards2 = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    (r2,) = _board(boards2, "language", "rust").rising_rows
+    assert r2.pool_days == 2.5 and r2.pool_delta == 200
+
+
+def test_rising_straddle_gap_absent_not_admitted(conn, topic_table):
+    """F2-1 收窄：采集停机致跨窗空洞的缺席老仓（在池天数 > win_max）不进新区也不出席主榜（两不见回 v1）。"""
+    _add_repo(conn, "a/straddle", language="Go", snapshots=[(_iso(30), 50), (_iso(0), 500)])
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    go = _board(boards, "language", "go")
+    assert go.rows == []  # 跨窗缺席不进主榜（v1 行为）
+    assert go.rising_rows == []  # 也不进新区：区头"入池不足 7 天"对在池 30 天仓事实不成立
+
+
+def test_rising_sort_and_tiebreak(conn, topic_table):
+    """新区排序：在池增量降序、负增量沉底；次序键（星数/全名）可复现（与主榜同构）。"""
+    _add_repo(conn, "a/r-up", language="Rust", snapshots=[(_iso(3), 100), (_iso(0), 400)])  # +300
+    _add_repo(conn, "a/r-more", language="Rust", snapshots=[(_iso(3), 900), (_iso(0), 1100)])  # +200 星数 1100
+    _add_repo(conn, "a/r-tie-a", language="Rust", snapshots=[(_iso(3), 100), (_iso(0), 300)])  # +200 星数 300
+    _add_repo(conn, "a/r-tie-b", language="Rust", snapshots=[(_iso(3), 100), (_iso(0), 300)])  # +200 星数 300
+    _add_repo(conn, "a/r-mid", language="Rust", snapshots=[(_iso(3), 100), (_iso(0), 200)])  # +100
+    _add_repo(conn, "a/r-down", language="Rust", snapshots=[(_iso(3), 500), (_iso(0), 450)])  # -50
+
+    rows1 = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "rust").rising_rows
+    rows2 = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "rust").rising_rows
+    assert [r.full_name for r in rows1] == ["a/r-up", "a/r-more", "a/r-tie-a", "a/r-tie-b", "a/r-mid", "a/r-down"]
+    assert [r.full_name for r in rows2] == [r.full_name for r in rows1]
+
+
+def test_rising_dead_excluded(conn, topic_table):
+    """新区 dead 剔除同主榜：dead=1 仓库即使有快照也不进新区。"""
+    _add_repo(conn, "a/ghost", language="Java", dead=1, snapshots=[(_iso(3), 100), (_iso(0), 900)])
+    _add_repo(conn, "a/alive", language="Java", snapshots=[(_iso(3), 100), (_iso(0), 200)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    java = _board(boards, "language", "java")
+    assert [r.full_name for r in java.rising_rows] == ["a/alive"]
+    assert all(r.full_name != "a/ghost" for b in boards for r in b.rising_rows)
+
+
+def test_rising_top_n_capped(conn, topic_table):
+    """新区每分类榜 Top 10：11 个缺席仓截掉在池增量最小者；不足按实际。"""
+    for i in range(1, 12):
+        _add_repo(conn, f"a/ris-{i:02d}", language="Python", snapshots=[(_iso(3), 1000), (_iso(0), 1000 + i)])
+    py = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "python")
+    assert len(py.rising_rows) == 10
+    assert py.rising_rows[0].pool_delta == 11
+    assert {r.pool_delta for r in py.rising_rows} == set(range(2, 12))
+
+
+def test_rising_empty_without_absent(conn, topic_table):
+    """无缺席仓 → 所有榜新区恒空（页面"空区不渲染"的数据基础）。"""
+    _add_repo(conn, "a/attending", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 300)])
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    assert all(b.rising_rows == [] for b in boards)
+
+
+def test_total_period_never_has_rising(conn, topic_table):
+    """total 口径无新区（无缺席概念）：单快照新项目照上主榜，rising 恒空。"""
+    _add_repo(conn, "a/newbie", language="Python", snapshots=[(_iso(1), 600)])
+    boards = compute_boards(conn, topic_table, period="total", as_of=AS_OF)
+    assert all(b.rising_rows == [] for b in boards)
+    assert [r.full_name for r in _board(boards, "language", "python").rows] == ["a/newbie"]
+
+
+def test_rising_quarter_period(conn, topic_table):
+    """季榜新区同口径：缺席（跨度 <86 天）进新区，在池天数按实际两端间隔。"""
+    _add_repo(conn, "a/q-new", language="Python", snapshots=[(_iso(50), 100), (_iso(0), 300)])
+    boards = compute_boards(conn, topic_table, period="quarter", as_of=AS_OF)
+    py = _board(boards, "language", "python")
+    assert py.rows == []
+    (r,) = py.rising_rows
+    assert r.pool_delta == 200 and r.pool_days == 50.0
+
+
+def test_rising_repeats_across_boards(conn, topic_table):
+    """新区行跨榜重复与主榜同口径：命中多主题的缺席仓在每个命中主题榜新区各出现一次。"""
+    _add_repo(conn, "a/ai-rise", topics=["ai", "react"], snapshots=[(_iso(3), 100), (_iso(0), 300)])
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    assert [r.full_name for r in _board(boards, "topic", "ai").rising_rows] == ["a/ai-rise"]
+    assert [r.full_name for r in _board(boards, "topic", "frontend").rising_rows] == ["a/ai-rise"]

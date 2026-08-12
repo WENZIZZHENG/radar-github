@@ -58,7 +58,7 @@ class FakeAiClient:
         self.fail_for = set(fail_for)
         self.calls: list[dict] = []
 
-    async def recommend(self, *, full_name, description, language, categories, dimension, delta=None, stars=None, readme=None):
+    async def recommend(self, *, full_name, description, language, categories, dimension, delta=None, stars=None, readme=None, pool_days=None):
         self.calls.append(
             {
                 "full_name": full_name,
@@ -66,6 +66,7 @@ class FakeAiClient:
                 "delta": delta,
                 "stars": stars,
                 "readme": readme,
+                "pool_days": pool_days,  # T-018：新区仓入池语境（主榜仓 None）
             }
         )
         if full_name in self.fail_for:
@@ -155,7 +156,7 @@ def _wait_rec_batch_finished(client, *, timeout=5.0):
 
 
 def _seed_listed(conn):
-    """一个上榜仓（周榜＋总星榜都出席）：批量补缺 total 应为 2（week 当周 ＋ total/all 两维度缺失）。"""
+    """一个上榜仓（周榜出席、季榜新区）：批量补缺 total 应为 3（week 当周 ＋ quarter 新区 ＋ total/all）。"""
     _add_repo(conn, "a/one", description_en="english text")
 
 
@@ -347,7 +348,7 @@ def test_api_recommend_readme_failure_keeps_sha(tmp_path, monkeypatch):
 
 def test_api_recommend_missing_only_fills_missing(tmp_path, monkeypatch):
     """批量只补缺失（后台任务形态）：202 立即返回＋/status 轮询到 finished；已存在的维度行不覆盖；
-    缺 week＋total 两维度 → total=2；不触碰 repos 翻译字段。"""
+    缺 quarter（T-018 新区）＋total 两维度 → total=2；不触碰 repos 翻译字段。"""
     week_label = _current_week_label()
 
     def seed(conn):
@@ -366,11 +367,11 @@ def test_api_recommend_missing_only_fills_missing(tmp_path, monkeypatch):
         monkeypatch.setattr(routes, "_make_github_client", lambda: fake_gh)
         resp = client.post("/api/recommend-missing")
         assert resp.status_code == 202
-        assert resp.json() == {"started": True, "total": 1}  # 周行已存在：只缺 total/all
+        assert resp.json() == {"started": True, "total": 2}  # 周行已存在：缺 quarter（新区）＋ total/all
         state = _wait_rec_batch_finished(client)
         assert state["running"] is False and state["finished"] is True and state["error"] is None
-        assert state["recommended"] == 1 and state["failed"] == 0
-    assert [c["dimension"] for c in fake.calls] == ["total"]  # 只补缺失维度
+        assert state["recommended"] == 2 and state["failed"] == 0
+    assert [c["dimension"] for c in fake.calls] == ["quarter", "total"]  # 只补缺失维度
     rec = _rec_map(tmp_path / "rec.db")
     assert rec[("week", week_label)] == "已有周文本"  # 已存在的行不覆盖
     assert rec[("total", "all")] == "推荐语-a/one-total"
@@ -389,10 +390,10 @@ def test_api_recommend_missing_partial_failure_degrades(tmp_path, monkeypatch):
         monkeypatch.setattr(routes, "_make_github_client", lambda: FakeGitHubClient())
         resp = client.post("/api/recommend-missing")
         assert resp.status_code == 202
-        assert resp.json() == {"started": True, "total": 4}  # 2 仓 ×（week＋total）
+        assert resp.json() == {"started": True, "total": 6}  # T-018：2 仓 ×（week＋quarter 新区＋total）
         state = _wait_rec_batch_finished(client)
         assert state["finished"] is True and state["error"] is None
-        assert state["recommended"] == 2 and state["failed"] == 2  # a/bad 两维度失败
+        assert state["recommended"] == 3 and state["failed"] == 3  # a/bad 三维度失败，a/good 三维度成功
     conn = get_conn(tmp_path / "rec.db")
     try:
         bad_rows = conn.execute(
@@ -423,7 +424,7 @@ def test_api_recommend_missing_inflight_409(tmp_path, monkeypatch):
         assert resp2.status_code == 409
         state = _wait_rec_batch_finished(client)
         assert state["finished"] is True and state["error"] is None
-        assert state["recommended"] == 2 and state["failed"] == 0
+        assert state["recommended"] == 3 and state["failed"] == 0  # T-018：week＋quarter 新区＋total
 
 
 def test_api_recommend_missing_no_key_auth_error(tmp_path, monkeypatch):
@@ -474,9 +475,9 @@ def test_api_recommend_missing_second_post_resets_counters(tmp_path, monkeypatch
         monkeypatch.setattr(routes, "_make_github_client", lambda: FakeGitHubClient())
         resp1 = client.post("/api/recommend-missing")
         assert resp1.status_code == 202
-        assert resp1.json() == {"started": True, "total": 2}
+        assert resp1.json() == {"started": True, "total": 3}  # T-018：week＋quarter 新区＋total
         state1 = _wait_rec_batch_finished(client)
-        assert state1["recommended"] == 2 and state1["failed"] == 0
+        assert state1["recommended"] == 3 and state1["failed"] == 0
         # 第二轮：全部已生成 → 新一轮 total=0（若未重置会残留上一轮数字）
         resp2 = client.post("/api/recommend-missing")
         assert resp2.status_code == 202
@@ -484,7 +485,7 @@ def test_api_recommend_missing_second_post_resets_counters(tmp_path, monkeypatch
         state2 = _wait_rec_batch_finished(client)
         assert state2["total"] == 0 and state2["recommended"] == 0 and state2["failed"] == 0
         assert state2["error"] is None and state2["finished"] is True and state2["running"] is False
-    assert len(fake.calls) == 2  # 第二轮无缺失，不再调用
+    assert len(fake.calls) == 3  # 第二轮无缺失，不再调用
 
 
 def test_recommend_missing_status_default(tmp_path, monkeypatch):

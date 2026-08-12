@@ -51,7 +51,7 @@ from app.collector.github import (
 from app.config import BASE_DIR, get_settings
 from app.db import get_conn
 from app.follows import follow_repo, unfollow_repo
-from app.report import Board, ReportRow, compute_boards, compute_repo_deltas
+from app.report import Board, ReportRow, RisingRow, compute_boards, compute_repo_deltas, pool_days_label
 
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"  # 供 app.main 挂载 StaticFiles（/static）
@@ -468,12 +468,44 @@ def _row_view(
     }
 
 
+def _rising_row_view(rank: int, row: RisingRow, **row_ctx) -> dict:
+    """新崛起区行视图（T-018 决策 4 v2）：复用 _row.html 行形态，增量列显示在池增量＋在池天数。
+
+    与主榜行差异：delta_text = "+X（入池 N 天）"（N 为在池天数整数化，report.pool_days_label 统一取值）；
+    不渲染 window_note（新区无主榜滑动窗口概念，区头小字说明已讲清口径）。
+    """
+    return {
+        "rank": rank,
+        "full_name": row.full_name,
+        "language": row.language,
+        "lang_color": LANG_COLORS.get(row.language or "", _DEFAULT_LANG_COLOR),
+        "dead": False,
+        "up_na_text": None,
+        "delta_text": f"{_fmt_delta(row.pool_delta)}（入池 {pool_days_label(row.pool_days)} 天）",
+        "delta_neg": row.pool_delta < 0,
+        "stars_text": _fmt_stars(row.stars),
+        "followed": row.full_name in row_ctx["followed"],
+        "description_en": row.description_en,
+        "description_zh": row_ctx["zh"].get(row.full_name),
+        "reason": row_ctx["reasons"].get(row.full_name),  # None → 无推荐语块（AI 降级形态，不留空框）
+        "tags": row_ctx["tags"].get(row.full_name, []),
+        "window_note": None,
+        "reason_dim": row_ctx["reason_dim"],
+        "reason_period_label": row_ctx["reason_period_label"],
+        "reason_label": row_ctx["reason_label"],
+        "show_recommend": row_ctx["show_recommend"],
+    }
+
+
 def _board_view(board: Board, **row_ctx) -> dict:
     return {
         # kind 必须入锚点：language 榜的 other 与 topic 榜的 other 撞 key
         "anchor": f"b-{board.kind}-{board.key}",
         "label": board.label,
         "rows": [_row_view(i + 1, r, **row_ctx) for i, r in enumerate(board.rows)],
+        # T-018 新区：小字说明按页面期次取名义窗口天数（周 7/季 90）；total 口径新区恒空不渲染
+        "rising_days": _NOMINAL_DAYS.get(row_ctx["period"]),
+        "rising_rows": [_rising_row_view(i + 1, r, **row_ctx) for i, r in enumerate(board.rising_rows)],
     }
 
 
@@ -495,8 +527,8 @@ def _boards_context(
         boards = compute_boards(conn, _topic_table(), period=period, as_of=as_of, top_n=30)
         notice = None
         effective_period = period
-        if period in _NOMINAL_DAYS and all(not b.rows for b in boards):
-            # 首期空态降级（流程说明 §4）：增量榜全缺席 → 显示总星榜 + 顶部提示条
+        if period in _NOMINAL_DAYS and all(not b.rows and not b.rising_rows for b in boards):
+            # 首期空态降级（流程说明 §4，T-018 起主榜＋新区全空才降级）：增量榜全缺席 → 显示总星榜 + 顶部提示条
             boards = compute_boards(conn, _topic_table(), period="total", as_of=as_of, top_n=30)
             effective_period = "total"
             notice = _fallback_notice(conn, period, label, as_of_date, any(b.rows for b in boards))

@@ -4,13 +4,17 @@
 - 周/季增量 = 两端快照差（端点星数 − 名义窗口天数前端点星数）；
 - 端点缺失时滑动取实际可得两端：周接受 5~9 天、季接受 86~94 天跨度，结果标注实际窗口天数；
 - 新入池首周缺席增量榜：不满最小窗口跨度（含只有一个快照）一律缺席，绝不拿单日增量混排；
+- 新崛起区（决策 4 v2）：在池跨度不足最小窗口的缺席仓（真·新入池）进新区——在池增量 = 端点星数 −
+  最旧基线快照星数，在池天数 = 两端间隔，按在池增量降序 Top 10 分区展示（与主榜不混排）；
+  采集停机致跨窗空洞（在池天数 > 窗口上限）的缺席老仓不进新区，回 v1 两不见（F2-1 收窄）；
 - 负增量正常参与排序（降序下自然沉底）；dead=1 仓库全部剔除；
 - 总星榜 = as_of 之前最新快照星数降序，无增量、无窗口概念。
 
 SQL 红线（schema.sql 硬约定，T-002 评审 EXPLAIN 实测整表扫为 2300 万行级）：
 端点快照查询必须从 repos 驱动、per-repo `WHERE repo_id=? AND captured_at<=? ORDER BY captured_at DESC LIMIT 1`
 走主键 (repo_id, captured_at) 索引 seek；禁止对 star_snapshots 整表 GROUP BY 或相关子查询全扫。
-本模块逐 alive 仓库做 ≤3 次 LIMIT 1 索引 seek（end、名义起点前最近、名义起点后最早），
+本模块逐 alive 仓库做 ≤3 次 LIMIT 1 索引 seek（end、名义起点前最近、名义起点后最早）；
+新崛起区每缺席仓另做 1 次最旧基线快照 seek（_BASELINE_SQL，同红线风格）。
 6.4 万 repo × 每口径 ≤3 次 seek 可接受，换取执行计划恒定无全表扫。
 """
 
@@ -19,7 +23,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from app.classify import LANGUAGES, OTHER_LANGUAGE_KEY, TopicSpec, classify_language, classify_topics
@@ -29,8 +33,7 @@ from app.collector.github import utc_now_iso
 OTHER_TOPIC_KEY = "other"
 
 # 增量口径参数：(名义窗口天数, 滑动窗口下限, 滑动窗口上限)。
-# 周 5~9 天为决策 4 钉死；季 86~94 天＝90±4 是实施自定参数（冻结物只钉"季榜 90 天同口径"），
-# 容差随窗口量级同比放宽（季窗口约为周的 13 倍）——已在 T-007 详情卡留痕，后续页面标注以此为准
+# 周 5~9 天、季 86~94 天均为决策 4 钉死（v2 起含新崛起区口径）
 _INCREMENT_WINDOWS: dict[str, tuple[int, int, int]] = {
     "week": (7, 5, 9),
     "quarter": (90, 86, 94),
@@ -38,6 +41,8 @@ _INCREMENT_WINDOWS: dict[str, tuple[int, int, int]] = {
 PERIODS: tuple[str, ...] = ("week", "quarter", "total")
 
 ABSENT_FIRST_WEEK = "first_week"  # 缺席原因：不满最小窗口跨度（含只有一个快照），口径上统称"首周缺席"
+
+_RISING_TOP_N = 10  # 新崛起区每分类榜行数上限（决策 4 v2 钉死：Top 10，不足按实际）
 
 _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长，字典序即时间序
 
@@ -56,6 +61,13 @@ _START_AFTER_SQL = (
     "ORDER BY captured_at ASC LIMIT 1"
 )
 
+# 新崛起区基线快照 SQL（决策 4 v2）：入池基线 = 该仓最旧一张快照，主键 (repo_id, captured_at) 索引 seek，
+# 每缺席仓一次 LIMIT 1；tests 以 EXPLAIN QUERY PLAN 锁定其索引 seek 性质（与 _ENDPOINT_SQL 同款红线）
+_BASELINE_SQL = (
+    "SELECT captured_at, stars FROM star_snapshots "
+    "WHERE repo_id = ? ORDER BY captured_at ASC LIMIT 1"
+)
+
 
 @dataclass(frozen=True)
 class RepoDelta:
@@ -69,6 +81,7 @@ class RepoDelta:
     delta: int | None  # 两端星数差，允许为负；None = 缺席；总星榜口径恒 None
     window_days: float | None  # 实际两端跨度（天，保留 1 位小数）；决策 4 要求报告标注；None = 缺席/总星榜
     absent_reason: str | None  # ABSENT_FIRST_WEEK 或 None（出席）；总星榜无缺席概念恒 None
+    captured_at: str | None = None  # 端点（最近）快照时间（UTC 定长 ISO）；T-018 新区在池天数口径用
 
 
 @dataclass(frozen=True)
@@ -84,13 +97,30 @@ class ReportRow:
 
 
 @dataclass(frozen=True)
+class RisingRow:
+    """新崛起区行（决策 4 v2）：主榜出席校验失败且在池天数 < 最小窗口（真·新入池）的缺席仓，按在池增量排序分区展示。"""
+
+    full_name: str
+    description_en: str | None
+    language: str | None  # GitHub 原始语言名（可能 None），页面展示用；归组 key 在 Board 上
+    stars: int  # 端点星数（同主榜行"总星数"展示）
+    pool_delta: int  # 在池增量 = 端点星数 − 入池基线（最旧一张快照）星数；允许为负
+    pool_days: float  # 在池天数 = 端点与基线两端间隔（天，保留 1 位小数同 window_days 精度）
+
+
+@dataclass(frozen=True)
 class Board:
-    """一张榜：kind+key 是机器标识（页面锚点/路由用），label 是展示名，rows 已按口径排序并截 Top N。"""
+    """一张榜：kind+key 是机器标识（页面锚点/路由用），label 是展示名，rows 已按口径排序并截 Top N。
+
+    rising_rows（T-018 决策 4 v2）：新崛起区行——在池跨度不足最小窗口的缺席仓按在池增量降序 Top 10，
+    分区展示不与主榜混排；跨窗空洞缺席老仓不收（准入判定见 compute_boards）；total 口径恒空（无缺席概念）。
+    """
 
     kind: str  # "language" | "topic"
     key: str  # 语言 key（LANGUAGES 值/other）或主题 key（词表 key/other）
     label: str  # 展示名：语言用 GitHub 精确名（"Java"…），主题用词表 label，两个兜底榜为"其它语言"/"其他"
     rows: list[ReportRow]
+    rising_rows: list[RisingRow] = field(default_factory=list)
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -144,9 +174,13 @@ def compute_repo_deltas(
         if end is None:
             continue
         if period == "total":
-            result[repo_id] = RepoDelta(stars=end["stars"], delta=None, window_days=None, absent_reason=None)
+            result[repo_id] = RepoDelta(
+                stars=end["stars"], delta=None, window_days=None, absent_reason=None, captured_at=end["captured_at"]
+            )
         else:
-            result[repo_id] = _increment_delta(conn, repo_id, end, as_of_dt, period)
+            info = _increment_delta(conn, repo_id, end, as_of_dt, period)
+            # T-018：新区在池天数口径需要端点快照时间（缺席仓取最旧基线时求两端间隔）；出席仓同样携带，语义统一
+            result[repo_id] = replace(info, captured_at=end["captured_at"])
     return result
 
 
@@ -201,6 +235,17 @@ def _top(rows: list[ReportRow], period: str, top_n: int) -> list[ReportRow]:
     return ordered[:top_n]
 
 
+def pool_days_label(pool_days: float) -> int:
+    """在池天数整数化（T-018 授权实施：round 取整）：页面"入池 N 天"标注与 AI 推荐语 prompt 共用同一取值，防两处口径漂移。"""
+    return round(pool_days)
+
+
+def _rising_top(rows: list[RisingRow], top_n: int) -> list[RisingRow]:
+    """新区排序：在池增量降序为第一键，负增量自然沉底；星数、全名作次序键保证结果可复现（与 _top 同构）。"""
+    ordered = sorted(rows, key=lambda r: (-r.pool_delta, -r.stars, r.full_name))
+    return ordered[:top_n]
+
+
 def compute_boards(
     conn: sqlite3.Connection,
     topic_table: dict[str, TopicSpec],
@@ -217,7 +262,10 @@ def compute_boards(
       页面按列表顺序直出即可，无需自行排序；
     - 分类实时算不物化：语言按 classify_language 归组，主题按 classify_topics 归组——
       命中多主题的仓库在每命中主题榜各出现一次（允许跨榜重复），零命中进"其他"榜；
-    - 首周缺席/无快照的仓库不进任何增量榜行；不足 top_n 的榜有多少列多少（不补位）。
+    - 首周缺席/无快照的仓库不进任何增量榜行；不足 top_n 的榜有多少列多少（不补位）；
+    - 新崛起区（决策 4 v2）：准入＝在池跨度不足最小窗口的缺席仓（ABSENT_FIRST_WEEK 且 pool_days < win_min），
+      按语言/主题同主榜归组、在池增量降序 Top 10（_RISING_TOP_N）；跨窗空洞缺席老仓（pool_days > win_max）
+      不进新区（回 v1 两不见）；total 口径无缺席概念恒空。
     """
     as_of = as_of or utc_now_iso()
     deltas = compute_repo_deltas(conn, period=period, as_of=as_of)
@@ -247,14 +295,67 @@ def compute_boards(
         for key in hit_keys or [OTHER_TOPIC_KEY]:
             topic_buckets[key].append(row)
 
+    # T-018 新崛起区（决策 4 v2）：在池跨度不足最小窗口的缺席仓 → 按语言/主题归桶、在池增量 Top 10。
+    # total 口径无缺席概念（deltas 无 absent_reason），新区恒空——不计算即不渲染。
+    rising_lang: dict[str, list[RisingRow]] = {key: [] for key in lang_buckets}
+    rising_topic: dict[str, list[RisingRow]] = {key: [] for key in topic_buckets}
+    if period != "total":
+        win_min = _INCREMENT_WINDOWS[period][1]
+        for repo in repos:
+            info = deltas.get(repo["id"])
+            if info is None or info.absent_reason is None or info.captured_at is None:
+                continue  # 无端点安放不了；出席仓不进新区（毕业自然离开主榜缺席集，无需特判）
+            base = conn.execute(_BASELINE_SQL, (repo["id"],)).fetchone()  # 每缺席仓 ≤1 次额外 seek
+            end_dt = _parse_iso(info.captured_at)
+            base_dt = _parse_iso(base["captured_at"])
+            pool_days = round((end_dt - base_dt).total_seconds() / 86400, 1)
+            # 缺席分两向（k3 评审 F2-1 处置，对齐决策 4 v2 字面）：在池天数 < win_min（真·新入池）进新区；
+            # > win_max（采集停机致跨窗空洞）不进新区——回 v1 不可见，全空时走首期降级，区头"入池不足 N 天"文案永真。
+            # 另有第三类边缘缺席（评审新 F3-a）：pool_days 落 [win_min, win_max] 但基线非最近起点候选
+            # （复合空洞），同按字面不进新区——gate 只看 pool_days < win_min，三种缺席行为一致可对。
+            if pool_days >= win_min:
+                continue
+            row = RisingRow(
+                full_name=repo["full_name"],
+                description_en=repo["description_en"],
+                language=repo["language"],
+                stars=info.stars,
+                pool_delta=info.stars - base["stars"],
+                pool_days=pool_days,
+            )
+            rising_lang[classify_language(repo["language"])].append(row)
+            hit_keys = classify_topics(json.loads(repo["topics"]), topic_table)
+            for key in hit_keys or [OTHER_TOPIC_KEY]:
+                rising_topic[key].append(row)
+
+    rising_lang_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_lang.items()}
+    rising_topic_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_topic.items()}
     boards: list[Board] = [
-        Board("language", key, name, _top(lang_buckets[key], period, top_n)) for name, key in LANGUAGES.items()
+        Board("language", key, name, _top(lang_buckets[key], period, top_n), rising_lang_top[key])
+        for name, key in LANGUAGES.items()
     ]
-    boards.append(Board("language", OTHER_LANGUAGE_KEY, "其它语言", _top(lang_buckets[OTHER_LANGUAGE_KEY], period, top_n)))
-    boards.extend(
-        Board("topic", key, spec["label"], _top(topic_buckets[key], period, top_n)) for key, spec in topic_table.items()
+    boards.append(
+        Board(
+            "language",
+            OTHER_LANGUAGE_KEY,
+            "其它语言",
+            _top(lang_buckets[OTHER_LANGUAGE_KEY], period, top_n),
+            rising_lang_top[OTHER_LANGUAGE_KEY],
+        )
     )
-    boards.append(Board("topic", OTHER_TOPIC_KEY, "其他", _top(topic_buckets[OTHER_TOPIC_KEY], period, top_n)))
+    boards.extend(
+        Board("topic", key, spec["label"], _top(topic_buckets[key], period, top_n), rising_topic_top[key])
+        for key, spec in topic_table.items()
+    )
+    boards.append(
+        Board(
+            "topic",
+            OTHER_TOPIC_KEY,
+            "其他",
+            _top(topic_buckets[OTHER_TOPIC_KEY], period, top_n),
+            rising_topic_top[OTHER_TOPIC_KEY],
+        )
+    )
     return boards
 
 
@@ -278,6 +379,8 @@ if __name__ == "__main__":
             print(f"  {plan_row['detail']}")
         for plan_row in conn.execute(f"EXPLAIN QUERY PLAN {_START_AFTER_SQL}", (1, as_of, as_of)):
             print(f"  {plan_row['detail']}")
+        for plan_row in conn.execute(f"EXPLAIN QUERY PLAN {_BASELINE_SQL}", (1,)):
+            print(f"  {plan_row['detail']}")
         deltas_summary = {
             period: compute_repo_deltas(conn, period=period, as_of=as_of) for period in PERIODS
         }
@@ -286,10 +389,12 @@ if __name__ == "__main__":
             absent = sum(1 for d in deltas.values() if d.absent_reason is not None)
             print(f"\n=== {period}：有快照仓库 {len(deltas)}，缺席 {absent}，出席 {len(deltas) - absent} ===")
             for board in compute_boards(conn, table, period=period, as_of=as_of):
-                print(f"[{board.kind}:{board.key}] {board.label} Top{len(board.rows)}")
+                print(f"[{board.kind}:{board.key}] {board.label} Top{len(board.rows)} 新区{len(board.rising_rows)}")
                 for r in board.rows[:3]:
                     delta_text = "——" if r.delta is None else f"{r.delta:+d}"
                     window_text = "" if r.window_days is None else f" 窗口{r.window_days}天"
                     print(f"    {r.full_name} 星{r.stars} 增量{delta_text}{window_text}")
+                for r in board.rising_rows[:3]:
+                    print(f"    新区 {r.full_name} 星{r.stars} 在池{r.pool_delta:+d}（{r.pool_days:g}天）")
     finally:
         conn.close()

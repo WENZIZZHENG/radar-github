@@ -1,7 +1,8 @@
-"""AI 服务（T-011→T-017）：范围内翻译＋三口径分维度推荐语生成＋全程降级（共识 §7 v4 / 决策 5 v2 / 决策 6 v2）。
+"""AI 服务（T-011→T-018）：范围内翻译＋三口径分维度推荐语生成＋全程降级（共识 §7 v4 / 决策 5 v2 / 决策 6 v2）。
 
 口径（任务书钉死，勿自由发挥）：
-- 范围集 S（T-017 收窄，v3 全池口径作废）：三口径榜（周/季/总星 Top30）去重 ∪ 关注集——
+- 范围集 S（T-017 收窄，v3 全池口径作废；T-018 起周/季榜集 = 主榜 Top30 ∪ 新区 Top10）：
+  三口径榜去重 ∪ 关注集——
   S 之外的仓库永远不译不生成（已译译文保留不清除；新上榜/新关注仓由每日 job 自动补译，自愈）；
 - 翻译段：只译 S 内 description_zh IS NULL 的仓（英文非空、不含 CJK 逐条翻译回填 repos.description_zh）；
   原文变更时采集层已清 description_zh（discover.py 变更检测连带清推荐语），当日本轮自然重译；
@@ -37,7 +38,7 @@ import httpx
 from app.classify import load_topics
 from app.collector.github import GitHubAuthError, GitHubClient
 from app.config import BASE_DIR, get_settings
-from app.report import ReportRow, compute_boards
+from app.report import ReportRow, RisingRow, compute_boards, pool_days_label
 
 CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
 CHAT_MODEL = "deepseek-chat"
@@ -154,6 +155,7 @@ class DeepSeekClient:
         delta: int | None = None,
         stars: int | None = None,
         readme: str | None = None,
+        pool_days: float | None = None,
     ) -> str:
         """维度感知推荐语（T-017）：周/季增量语境（输入含当期增量）；总星存量语境"是什么＋领域地位"。
 
@@ -161,6 +163,8 @@ class DeepSeekClient:
         total 维度不引用任何具体星数/排名数字（数字由页面行内数据展示，防 evergreen 陈旧）。
         分化钉死（2026-08-12 本人复验反馈）：周/季有增量时必须明确写出当期增星数字——与 total
         "不引用数字"形成肉眼可见的稳定差异（两套文本不再"看起来一样"）。
+        T-018 分化：pool_days 非 None（新崛起区仓）时增量语境为"入池 N 天新增"（输入行与钉死句
+        同构分化），主榜仓措辞一字不动。
         README 正文截断入输入（无则省略该行）；只输出 2~3 句中文推荐语本体。
         """
         if dimension not in ("week", "quarter", "total"):
@@ -178,9 +182,12 @@ class DeepSeekClient:
                 "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
             )
         else:
+            rising_days = pool_days_label(pool_days) if pool_days is not None else None
             delta_word = "本周" if dimension == "week" else "本季"
             if delta is not None:
-                lines.append(f"{delta_word}新增星数：{delta}")
+                lines.append(
+                    f"入池 {rising_days} 天新增星数：{delta}" if rising_days is not None else f"{delta_word}新增星数：{delta}"
+                )
             if stars is not None:
                 lines.append(f"总星数：{stars}")
             lines.append(f"上榜分类：{'、'.join(categories)}")
@@ -188,12 +195,21 @@ class DeepSeekClient:
             board_word = "周榜" if dimension == "week" else "季榜"
             # 分化钉死（2026-08-12 本人复验反馈）：增星语境必须写出具体数字——与 total 维度
             # "不引用任何数字"形成肉眼可见的稳定差异；delta 缺席（历史期次无增量行）时退回软要求
-            why = (
-                f"其余说明为什么{delta_word}值得关注：必须明确写出{delta_word}新增星数（{delta} 星）"
-                "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
-                if delta is not None
-                else f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类）；"
-            )
+            if rising_days is not None:
+                # T-018 分化：新区仓增量语境是"入池 N 天新增"（与主榜"本周/本季新增"同构分化，主榜措辞一字不动）
+                why = (
+                    f"其余说明为什么入池 {rising_days} 天值得关注：必须明确写入池 {rising_days} 天新增星数（{delta} 星）"
+                    "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
+                    if delta is not None
+                    else f"其余说明为什么入池 {rising_days} 天值得关注（结合入池 {rising_days} 天增星、总星数与上榜分类）；"
+                )
+            else:
+                why = (
+                    f"其余说明为什么{delta_word}值得关注：必须明确写出{delta_word}新增星数（{delta} 星）"
+                    "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
+                    if delta is not None
+                    else f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类）；"
+                )
             system = (
                 f"你是技术雷达的编辑，为一位资深开发者读者写 GitHub {board_word}上榜项目的推荐理由。"
                 f"根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
@@ -256,10 +272,15 @@ class DeepSeekClient:
 
 @dataclass(frozen=True)
 class _ListedItem:
-    """上榜集元素：榜单行 + 所属分类榜名列表（语言榜 label 与命中主题榜 label，可多榜重复）。"""
+    """上榜集元素：主榜行或新区行 + 所属分类榜名列表（语言榜 label 与命中主题榜 label，可多榜重复）。
 
-    row: ReportRow
+    T-018：新区仓（周/季榜集内的 rising 行）row=None 而 rising 携带 RisingRow，主榜仓反之；
+    推荐语生成按 rising 是否为空选择增量语境（主榜窗口增量 vs 在池增量）。
+    """
+
+    row: ReportRow | None
     categories: list[str]
+    rising: RisingRow | None = None
 
 
 def _load_repo_info(conn: sqlite3.Connection, full_names: list[str]) -> dict[str, sqlite3.Row]:
@@ -282,10 +303,11 @@ def _load_repo_info(conn: sqlite3.Connection, full_names: list[str]) -> dict[str
 def _scope_sets(
     conn: sqlite3.Connection, *, now: datetime
 ) -> tuple[dict[str, dict[str, _ListedItem]], list[str]]:
-    """T-017 覆盖口径 S：三口径榜（week/quarter/total 各 Top30）去重 ∪ 关注集。
+    """T-017/T-018 覆盖口径 S：三口径榜去重 ∪ 关注集（周/季 = 主榜 Top30 ∪ 新区 Top10；total = Top30）。
 
     返回 (listed_by_period, follow_names)：listed_by_period[period] = full_name → _ListedItem（榜单序保序）；
     follow_names 按 follows.created_at 序（页面关注序）。S 之外的仓库永远不译不生成（共识 §7 v4）。
+    新区行属上榜口径（决策 4 v2）：缺席仓进周/季榜集，总星榜集与关注集不受影响。
     """
     topic_table = load_topics(TOPICS_PATH)
     as_of_iso = now.strftime(_ISO_FMT)
@@ -300,6 +322,13 @@ def _scope_sets(
                     listed[row.full_name] = _ListedItem(row=row, categories=[board.label])
                 else:
                     item.categories.append(board.label)  # 同一项目多榜出现：分类榜名累加（跨榜复用一条推荐语）
+            # T-018：新区行同属上榜口径（total 榜新区恒空自然不触发）
+            for rising in board.rising_rows:
+                item = listed.get(rising.full_name)
+                if item is None:
+                    listed[rising.full_name] = _ListedItem(row=None, categories=[board.label], rising=rising)
+                else:
+                    item.categories.append(board.label)
         listed_by_period[period] = listed
     follow_names = [
         r["full_name"]
@@ -358,7 +387,7 @@ async def recommend_missing(
     scope: tuple[dict[str, dict[str, _ListedItem]], list[str]] | None = None,
     on_progress: Callable[[dict[str, int]], None] | None = None,
 ) -> dict[str, int]:
-    """三维度推荐语补缺（T-017）：S = 三口径榜（week/quarter/total Top30）去重 ∪ 关注集。
+    """三维度推荐语补缺（T-017，T-018 扩 S）：S = 三口径榜去重 ∪ 关注集（周/季含新区 Top10）。
 
     - week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
     - quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
@@ -411,15 +440,22 @@ async def recommend_missing(
         if key in existing:
             continue
         readme_text, _ = await readme_state.get(full_name, stats)
+        # T-018：新区行带入池语境（在池增量/在池天数），主榜行保持既有增量参数
+        if item.rising is not None:
+            delta, stars, pool_days = item.rising.pool_delta, item.rising.stars, item.rising.pool_days
+        else:
+            assert item.row is not None  # _ListedItem 不变量：主榜仓 row 恒非 None（rising/row 互斥，评审 F3-5 加固）
+            delta, stars, pool_days = (item.row.delta if item.row.delta is not None else 0), item.row.stars, None
         try:
             text = await client.recommend(
                 full_name=full_name,
                 description=info["description_zh"] or info["description_en"] or "（无简介）",
                 language=info["language"] or "未知",
-                delta=item.row.delta if item.row.delta is not None else 0,  # 周榜出席行 delta 恒非 None；防御兜底
-                stars=item.row.stars,
+                delta=delta,
+                stars=stars,
                 categories=item.categories,
                 dimension="week",
+                pool_days=pool_days,
                 readme=readme_text,
             )
         except DeepSeekAuthError:
@@ -450,15 +486,22 @@ async def recommend_missing(
         if cur is not None and (not refresh or cur["generated_week"] == week_label):
             continue
         readme_text, _ = await readme_state.get(full_name, stats)
+        # T-018：新区行带入池语境（在池增量/在池天数），主榜行保持既有增量参数
+        if item.rising is not None:
+            delta, stars, pool_days = item.rising.pool_delta, item.rising.stars, item.rising.pool_days
+        else:
+            assert item.row is not None  # _ListedItem 不变量：主榜仓 row 恒非 None（rising/row 互斥，评审 F3-5 加固）
+            delta, stars, pool_days = (item.row.delta if item.row.delta is not None else 0), item.row.stars, None
         try:
             text = await client.recommend(
                 full_name=full_name,
                 description=info["description_zh"] or info["description_en"] or "（无简介）",
                 language=info["language"] or "未知",
-                delta=item.row.delta if item.row.delta is not None else 0,
-                stars=item.row.stars,
+                delta=delta,
+                stars=stars,
                 categories=item.categories,
                 dimension="quarter",
+                pool_days=pool_days,
                 readme=readme_text,
             )
         except DeepSeekAuthError:
@@ -539,7 +582,7 @@ async def ensure_daily_ai(
 ) -> dict[str, int]:
     """每日 AI 生成（T-017 重写，原名 ensure_weekly_ai）：范围集翻译收窄＋三维度推荐语补缺/刷新。
 
-    步骤：a) 计算范围集 S = 三口径榜（week/quarter/total Top30）去重 ∪ 关注集；
+    步骤：a) 计算范围集 S = 三口径榜去重 ∪ 关注集（周/季 = 主榜 Top30 ∪ 新区 Top10，T-018）；
     b) 翻译段收窄：只译 S 内 description_zh IS NULL 且英文非空无 CJK 的仓（原文变更采集层已清译文，
     当日本轮自然重译；译过的不重译；S 之外永不翻译——v3 全池口径作废）；
     c) 推荐语三维度（口径详见 recommend_missing docstring）；

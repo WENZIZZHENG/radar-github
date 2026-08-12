@@ -96,7 +96,7 @@ class FakeDeepSeekClient:
         return f"译文-{text}"
 
     async def recommend(
-        self, *, full_name, description, language, categories, dimension, delta=None, stars=None, readme=None
+        self, *, full_name, description, language, categories, dimension, delta=None, stars=None, readme=None, pool_days=None
     ) -> str:
         self.recommend_calls.append(
             {
@@ -108,6 +108,7 @@ class FakeDeepSeekClient:
                 "categories": list(categories),
                 "dimension": dimension,
                 "readme": readme,
+                "pool_days": pool_days,  # T-018：新区仓入池语境（主榜仓 None）
             }
         )
         if full_name in self.fail_recommend_for:
@@ -340,9 +341,9 @@ def test_translate_skips_cjk_null_and_already_translated(conn):
     assert zh["a/cjk"] is None and zh["a/mixed"] is None and zh["a/no-desc"] is None
     assert zh["a/done"] == "已译"  # 已译不被覆盖
     assert stats["translated"] == 1 and stats["translate_failed"] == 0
-    # 推荐语对上榜集全部生成（含无简介/中文原文的，不受翻译跳过影响）；每仓 2 维度（周＋总星）
+    # 推荐语对上榜集全部生成（含无简介/中文原文的，不受翻译跳过影响）；每仓 3 维度（周＋季新区＋总星）
     assert {c["full_name"] for c in fake.recommend_calls} == {"a/cjk", "a/mixed", "a/no-desc", "a/done", "a/todo"}
-    assert {c["dimension"] for c in fake.recommend_calls} == {"week", "total"}  # 无季度快照 → 季维度自然为空
+    assert {c["dimension"] for c in fake.recommend_calls} == {"week", "quarter", "total"}  # T-018：无 90 天快照 → 季维度走新区
     no_desc_week = next(c for c in _calls_by_dim(fake, "week") if c["full_name"] == "a/no-desc")
     assert no_desc_week["description"] == "（无简介）"
 
@@ -355,7 +356,7 @@ def test_translate_backfills_listed_repos(conn):
     stats = _run_ensure(conn, fake)
     assert stats["listed"] == 2
     assert stats["translated"] == 2 and stats["translate_failed"] == 0
-    assert stats["recommended"] == 4  # 2 仓 ×（周＋总星）2 维度
+    assert stats["recommended"] == 6  # T-018：2 仓 ×（周＋季新区＋总星）3 维度
     assert _zh_map(conn) == {"a/one": "译文-first project", "a/two": "译文-second project"}
 
 
@@ -364,9 +365,10 @@ def test_recommend_inserted_with_repo_id_week_and_text(conn):
     _add_repo(conn, "a/py-ai", description_en="ai toolkit", topics=["ai"])  # Python 语言榜＋AI与智能 主题榜
     fake = FakeDeepSeekClient()
     stats = _run_ensure(conn, fake)
-    assert stats["listed"] == 1 and stats["recommended"] == 2 and stats["recommend_failed"] == 0
+    assert stats["listed"] == 1 and stats["recommended"] == 3 and stats["recommend_failed"] == 0
     rows = _recommend_rows(conn)
     assert rows == [
+        ("a/py-ai", "quarter", QUARTER1, "推荐语-a/py-ai-quarter"),  # T-018：无 90 天快照 → 季维度新区
         ("a/py-ai", "total", "all", "推荐语-a/py-ai-total"),
         ("a/py-ai", "week", WEEK1, "推荐语-a/py-ai-week"),
     ]
@@ -375,6 +377,9 @@ def test_recommend_inserted_with_repo_id_week_and_text(conn):
     assert week_call["description"] == "译文-ai toolkit"  # 优先用本轮刚译好的中文
     assert week_call["categories"] == ["Python", "AI与智能"]  # 语言榜 label＋主题榜 label 跨榜累加
     assert week_call["language"] == "Python" and week_call["delta"] == 100 and week_call["stars"] == 1100
+    assert week_call["pool_days"] is None  # 主榜仓不带入池语境
+    q_call = _calls_by_dim(fake, "quarter")[0]
+    assert q_call["pool_days"] == 7.0 and q_call["delta"] == 100  # 季新区：在池天数/在池增量（基线 = 7 天前快照）
     total_call = _calls_by_dim(fake, "total")[0]
     assert total_call["delta"] is None and total_call["stars"] is None  # 总星维度无增量/不引用数字
 
@@ -384,13 +389,13 @@ def test_same_week_rerun_idempotent(conn):
     _add_repo(conn, "a/one", description_en="first project")
     fake = FakeDeepSeekClient()
     stats1 = _run_ensure(conn, fake)
-    assert stats1["translated"] == 1 and stats1["recommended"] == 2
+    assert stats1["translated"] == 1 and stats1["recommended"] == 3  # T-018：周＋季新区＋总星
     calls_after_first = (len(fake.translate_calls), len(fake.recommend_calls))
     stats2 = _run_ensure(conn, fake)
     assert stats2["listed"] == 1  # 覆盖集照算
     assert stats2["translated"] == 0 and stats2["recommended"] == 0
     assert (len(fake.translate_calls), len(fake.recommend_calls)) == calls_after_first
-    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 3
 
 
 def test_new_week_regenerates_recommendation(conn):
@@ -405,7 +410,7 @@ def test_new_week_regenerates_recommendation(conn):
     )
     conn.commit()
     stats2 = _run_ensure(conn, fake, now=AS_OF_DT + timedelta(days=7))
-    assert stats2["listed"] == 1 and stats2["recommended"] == 1
+    assert stats2["listed"] == 1 and stats2["recommended"] == 2  # T-018：新周行 1 ＋ 季新区行 REPLACE 1
     assert stats2["translated"] == 0
     weeks = {
         r["period_label"]
@@ -445,8 +450,9 @@ def test_translate_scope_excludes_unlisted_and_dead(conn):
     assert "a/listed" in _recommend_names(conn)
 
 
-def test_followed_unlisted_repo_gets_total_recommendation(conn):
-    """关注仓不在周/季增量榜（单张快照无窗口）→ 只生成总星维度文本（关注页长期盯梢语境，§8.1）。"""
+def test_followed_unlisted_repo_gets_recommendations(conn):
+    """关注仓不在主榜（单张快照无窗口）→ 周/季走新区（T-018：缺席仓属上榜口径，入池语境）＋总星维度
+    （关注页长期盯梢语境，§8.1）。"""
     _add_repo(conn, "a/listed", description_en="on board")
     _add_repo(conn, "f/watched", description_en="watched but quiet", listed=False)
     conn.execute(
@@ -459,7 +465,10 @@ def test_followed_unlisted_repo_gets_total_recommendation(conn):
     assert stats["listed"] == 2  # S = 上榜 ∪ 关注
     assert stats["translated"] == 2  # 关注仓也翻译（范围内）
     dims_for_watched = {c["dimension"] for c in fake.recommend_calls if c["full_name"] == "f/watched"}
-    assert dims_for_watched == {"total"}  # 只生成总星维度（无周/季增量语境）
+    assert dims_for_watched == {"week", "quarter", "total"}  # T-018：单张快照 → 周/季新区（入池语境）＋总星
+    for dim in ("week", "quarter"):
+        call = next(c for c in fake.recommend_calls if c["full_name"] == "f/watched" and c["dimension"] == dim)
+        assert call["pool_days"] == 0.0 and call["delta"] == 0  # 单张快照：在池 0 天、在池增量 0
     rows = _recommend_rows(conn)
     assert ("f/watched", "total", "all", "推荐语-f/watched-total") in rows
     assert ("a/listed", "week", WEEK1, "推荐语-a/listed-week") in rows
@@ -474,7 +483,7 @@ def test_single_item_failure_degrades(conn, caplog):
     with caplog.at_level(logging.WARNING, logger="app.ai"):
         stats = _run_ensure(conn, fake)  # 不抛出即通过
     assert stats["translate_failed"] == 1 and stats["translated"] == 2
-    assert stats["recommend_failed"] == 2 and stats["recommended"] == 4  # a/bad-recommend 周＋总星各失败 1 条
+    assert stats["recommend_failed"] == 3 and stats["recommended"] == 6  # T-018：a/bad-recommend 周＋季新区＋总星各失败 1 条
     zh = _zh_map(conn)
     assert zh["a/bad-translate"] is None  # 翻译失败不留半成品
     assert zh["a/bad-recommend"] == "译文-fine desc" and zh["a/good"] == "译文-good desc"
@@ -522,12 +531,12 @@ def test_partial_failure_converges_next_run_recommend(conn):
     """断点续跑收敛（评审低-2）：第一轮推荐失败翻译成功 → 第二轮零翻译调用（已译跳过）、推荐补齐。"""
     _add_repo(conn, "a/one", description_en="first project")
     stats1 = _run_ensure(conn, FakeDeepSeekClient(fail_recommend_for={"a/one"}))
-    assert stats1["translated"] == 1 and stats1["recommend_failed"] == 2  # 周＋总星各失败 1 条
+    assert stats1["translated"] == 1 and stats1["recommend_failed"] == 3  # T-018：周＋季新区＋总星各失败 1 条
     assert _recommend_names(conn) == set()
     fake2 = FakeDeepSeekClient()
     stats2 = _run_ensure(conn, fake2)
     assert fake2.translate_calls == []  # 已译跳过：零翻译调用
-    assert stats2["recommended"] == 2
+    assert stats2["recommended"] == 3
     assert _recommend_names(conn) == {"a/one"}
 
 
@@ -535,7 +544,7 @@ def test_partial_failure_converges_next_run_translate(conn):
     """断点续跑收敛（评审低-2）：第一轮翻译失败推荐成功 → 第二轮只重译该条、同维度同期已存在推荐不重生成。"""
     _add_repo(conn, "a/one", description_en="first project")
     stats1 = _run_ensure(conn, FakeDeepSeekClient(fail_translate_for={"first project"}))
-    assert stats1["translate_failed"] == 1 and stats1["recommended"] == 2  # 翻译失败不连坐推荐
+    assert stats1["translate_failed"] == 1 and stats1["recommended"] == 3  # T-018：周＋季新区＋总星；翻译失败不连坐推荐
     fake2 = FakeDeepSeekClient()
     stats2 = _run_ensure(conn, fake2)
     assert fake2.translate_calls == ["first project"]  # 只重译该条
@@ -700,7 +709,7 @@ def test_readme_fetch_failure_degrades_without_blocking(conn, caplog):
     fake = FakeDeepSeekClient()
     with caplog.at_level(logging.WARNING, logger="app.ai"):
         stats = _run_ensure(conn, fake, github_client=github)  # 不抛出即通过
-    assert stats["recommended"] == 2
+    assert stats["recommended"] == 3  # T-018：周＋季新区＋总星
     assert all(c["readme"] is None for c in fake.recommend_calls)
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'total'"
@@ -717,7 +726,7 @@ def test_readme_auth_error_stops_fetching_but_recommend_continues(conn, caplog):
     github = FakeGitHubClient(auth_for={"a/one"})  # 第一个仓即 auth 错误 → 停拉
     with caplog.at_level(logging.WARNING, logger="app.ai"):
         stats = _run_ensure(conn, FakeDeepSeekClient(), github_client=github)  # 不抛出即通过
-    assert stats["recommended"] == 4  # 2 仓 × 2 维度照常生成
+    assert stats["recommended"] == 6  # T-018：2 仓 × 3 维度照常生成
     assert github.readme_calls == ["a/one"]  # 第二个仓不再尝试（auth 停拉）
     assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE readme_sha IS NOT NULL").fetchone()[0] == 0
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -729,12 +738,80 @@ def test_no_github_client_degrades_readme_silently(conn):
     _add_repo(conn, "a/one", description_en="first project")
     fake = FakeDeepSeekClient()
     stats = _run_ensure(conn, fake)  # github_client 缺省 None
-    assert stats["recommended"] == 2
+    assert stats["recommended"] == 3  # T-018：周＋季新区＋总星
     assert all(c["readme"] is None for c in fake.recommend_calls)
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'total'"
     ).fetchone()
     assert row["readme_sha"] is None
+
+
+# ---------- T-018：新区仓进覆盖集（入池语境 prompt 分化；全部 fake client，离线） ----------
+
+
+def test_rising_repo_in_scope_with_pool_context(conn):
+    """T-018 覆盖集：缺席仓（跨度不足）进周/季榜集——推荐语调用携带入池语境（pool_days＋在池增量）；
+    主榜仓不携带（pool_days=None）。"""
+    _add_repo(conn, "a/attending", description_en="attending repo")
+    rid = _add_repo(conn, "a/rising", description_en="rising repo", listed=False)
+    conn.execute(
+        "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
+        (rid, _iso(AS_OF_DT - timedelta(days=3)), 500),
+    )
+    conn.commit()
+    fake = FakeDeepSeekClient()
+    stats = _run_ensure(conn, fake)
+    assert stats["listed"] == 2
+    week_call = next(c for c in _calls_by_dim(fake, "week") if c["full_name"] == "a/rising")
+    assert week_call["pool_days"] == 3.0 and week_call["delta"] == 600  # 在池增量 = 端点 − 最旧基线
+    assert week_call["stars"] == 1100
+    q_call = next(c for c in _calls_by_dim(fake, "quarter") if c["full_name"] == "a/rising")
+    assert q_call["pool_days"] == 3.0 and q_call["delta"] == 600
+    main_call = next(c for c in _calls_by_dim(fake, "week") if c["full_name"] == "a/attending")
+    assert main_call["pool_days"] is None  # 主榜仓不带入池语境（prompt 措辞一字不动）
+
+
+def test_scope_sets_include_rising_rows(conn):
+    """T-018 _scope_sets 扩展：周/季榜集 = 主榜 Top30 ∪ 新区 Top10——缺席仓带 rising 语境入集；
+    总星榜集不动（无新区概念，缺席仓以主榜行形态入集）。"""
+    from app.ai import _scope_sets
+
+    _add_repo(conn, "a/attending", description_en="attending repo")
+    _add_repo(conn, "a/rising", description_en="rising repo", listed=False)
+    listed_by_period, follow_names = _scope_sets(conn, now=AS_OF_DT)
+    assert follow_names == []
+    week_item = listed_by_period["week"]["a/rising"]
+    assert week_item.row is None and week_item.rising is not None
+    assert week_item.rising.pool_delta == 0 and week_item.rising.pool_days == 0.0  # 单张快照：在池 0 天
+    main_item = listed_by_period["week"]["a/attending"]
+    assert main_item.row is not None and main_item.rising is None
+    assert "a/rising" in listed_by_period["quarter"]
+    total_item = listed_by_period["total"]["a/rising"]
+    assert total_item.row is not None and total_item.rising is None  # 总星榜集不动：新区概念不存在
+
+
+def test_client_recommend_rising_pool_context():
+    """新区仓 prompt 分化（T-018）：输入行"入池 N 天新增星数：X"＋钉死句"必须明确写入池 N 天新增星数（X 星）"；
+    主榜仓措辞一字不动（"本周新增星数"/"必须明确写出本周新增星数"照旧）。"""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "推荐语本体"}}]})
+
+    client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
+    base = {"full_name": "a/one", "description": "desc", "language": "Python", "categories": ["Python"]}
+    asyncio.run(client.recommend(**base, dimension="week", delta=600, stars=1100, pool_days=3.0))
+    asyncio.run(client.recommend(**base, dimension="week", delta=150, stars=1100))
+    asyncio.run(client.aclose())
+
+    rising_user, rising_sys = bodies[0]["messages"][1]["content"], bodies[0]["messages"][0]["content"]
+    assert "入池 3 天新增星数：600" in rising_user
+    assert "必须明确写入池 3 天新增星数（600 星）" in rising_sys
+    assert "本周新增星数" not in rising_user and "写出本周" not in rising_sys
+    main_user, main_sys = bodies[1]["messages"][1]["content"], bodies[1]["messages"][0]["content"]
+    assert "本周新增星数：150" in main_user
+    assert "必须明确写出本周新增星数（150 星）" in main_sys
 
 
 # ---------- daily_job 接线：AI 失败永不阻断快照主流程 ----------

@@ -144,6 +144,16 @@ h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 }
 .board > h3 .top:hover { color: var(--blue); background: rgba(88,166,255,.08); }
 
+/* ===== T-018 新崛起区（决策 4 v2）：主榜行后分区展示 ===== */
+.rising { border-top: 1px dashed var(--line); }
+.rising-h {
+  display: flex; align-items: center; gap: var(--s2);
+  font-size: 12.5px; font-weight: 600; color: var(--accent);
+  padding: 8px var(--s4) 0;
+}
+.rising-h .n { font-family: var(--font-mono); color: var(--text-3); font-weight: 400; font-size: 11.5px; }
+.rising-note { padding: 3px var(--s4) 0; font-size: 12px; color: var(--text-3); }
+
 /* ===== 第 5 层：紧凑项目行（右列定宽对齐，增星数视觉权重最高） ===== */
 .row {
   display: flex; align-items: center; gap: 10px;
