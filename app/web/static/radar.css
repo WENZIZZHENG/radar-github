@@ -24,8 +24,8 @@
   --reason-bg:rgba(227,179,65,.08);
   --reason-line:rgba(227,179,65,.32);
   /* 字体：Sans 管界面与中文，Code 管数据 / 标识符（天然等宽 = tabular figures） */
-  --font-sans:"Fira Sans","Noto Sans SC",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-  --font-mono:"Fira Code",ui-monospace,"SF Mono",Consolas,monospace;
+  --font-sans:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  --font-mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,monospace;
   /* 间距（density 8/10，密集榜单工具）：4 的倍数 */
   --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px;
   /* 圆角 */
