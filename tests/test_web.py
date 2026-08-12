@@ -3,7 +3,8 @@
 断言分两类：
 - 结构断言（时间稳健）：三页面 200、17 榜区块、17 chips、默认展开态、空态降级提示、期次参数 200/400；
   周/季出席数据随"今天"推移会滑出窗口，故不做数据内容断言（口径语义归 tests/test_report.py）。
-- 内容断言全走 /total（最新快照降序，无窗口概念，时间稳健）与首期空态（快照仅同一天）。
+- 内容断言全走 /total（最新快照降序，无窗口概念，时间稳健）与首期空态（快照仅同一天）；
+  例外：历史期次页（/?week=2026-W32、/quarter?quarter=2026-Q3）as_of 固定、种子快照恒出席，允许内容断言（T-017 复验打回修复起）。
 """
 
 import json
@@ -59,17 +60,13 @@ def _seed_full(conn):
     )
     conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_go, "2026-08-02T00:00:00Z"))
     # T-017 推荐语按 (dimension, period_label) 展示：总星行文本供 /total（时间稳健）断言；
-    # 周/季行按"今天"所处期次标签插入（_display_maps 维度映射单测另行覆盖）
-    now = datetime.now(timezone.utc)
-    iso = now.date().isocalendar()
-    week_label = f"{iso.year}-W{iso.week:02d}"
-    quarter_label = f"{now.year}-Q{(now.month - 1) // 3 + 1}"
+    # 周/季行按固定期次标签插入（2026-W32/2026-Q3），供历史周/季页时间稳健断言
     conn.execute(
         "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
-        " VALUES (?, 'total', 'all', '本周亮点：测试推荐语', NULL, ?),"
-        " (?, 'week', ?, '周报亮点：周推荐语', NULL, ?),"
-        " (?, 'quarter', ?, '季报亮点：季推荐语', NULL, ?)",
-        (repo_py, week_label, repo_py, week_label, week_label, repo_py, quarter_label, week_label),
+        " VALUES (?, 'total', 'all', '本周亮点：测试推荐语', NULL, '2026-W32'),"
+        " (?, 'week', '2026-W32', '周报亮点：周推荐语', NULL, '2026-W32'),"
+        " (?, 'quarter', '2026-Q3', '季报亮点：季推荐语', NULL, '2026-W32')",
+        (repo_py, repo_py, repo_py),
     )
     conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, ?)", (repo_py, "选型观察"))
 
@@ -359,8 +356,31 @@ def test_total_page_shows_total_dimension_reason(client):
     """总星榜页展示 ('total','all') 维度文本（§8.1）；行内推荐按钮按 total 维度渲染。"""
     text = client.get("/total").text
     assert "本周亮点：测试推荐语" in text  # total 行文本（_seed_full 插入）
+    assert "<b>总星榜推荐语</b>" in text  # 块标题维度标识（2026-08-12 复验反馈钉死）
     assert 'class="recommend-btn" data-repo="a/py" data-dim="total" data-period-label="all" data-has-reason="1">重新生成</button>' in text
     assert 'data-has-reason="0">生成推荐语</button>' in text  # a/go 无推荐语 → "生成推荐语"
+
+
+def test_week_page_shows_week_dimension_reason_with_label(client):
+    """历史周页展示 ('week', 2026-W32) 维度文本＋维度标题"周榜推荐语 · 期次"（§8.1＋2026-08-12 复验反馈）。
+
+    历史周页 as_of 固定（2026-08-09 期末，起点 08-02 span=7 恒出席），时间稳健——当期 / 断言会随
+    "今天"滑窗转红，故不走默认周页。
+    """
+    text = client.get("/?week=2026-W32").text
+    assert "周报亮点：周推荐语" in text  # week 行文本（_seed_full 按固定期次标签插入）
+    assert "<b>周榜推荐语 · 2026-W32</b>" in text  # 维度标题带期次：与总星榜文本一眼可辨
+
+
+def test_quarter_page_shows_quarter_dimension_reason_with_label(client):
+    """季页展示 ('quarter', 2026-Q3) 维度文本＋维度标题"季榜推荐语 · 期次"（§8.1＋评审 F3-2 补锁）。
+
+    种子 05-11→08-09 跨度 90 天落在 86~94 季窗口内：历史季页 as_of 恒 2026-09-30（期末端点 08-09、
+    起点候选 05-11 恒出席）；当前季取 now 时 08-09 仍为期末端点，两种取值下均出席，时间稳健。
+    """
+    text = client.get("/quarter?quarter=2026-Q3").text
+    assert "季报亮点：季推荐语" in text  # quarter 行文本（_seed_full 按固定期次标签插入）
+    assert "<b>季榜推荐语 · 2026-Q3</b>" in text  # 维度标题带期次：与总星榜文本一眼可辨
 
 
 def test_follows_page_has_recommend_button(follows_client):

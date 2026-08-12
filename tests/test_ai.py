@@ -201,6 +201,35 @@ def test_client_posts_chat_completions_payload():
     asyncio.run(client.aclose())
 
 
+def test_client_recommend_prompt_dimension_divergence():
+    """分维度 prompt 分化钉死（2026-08-12 本人复验反馈）：周/季 system 必须要求明确写出当期增星数字，
+    total system 禁止引用任何数字——两套文本肉眼可辨；delta 缺席时周/季退回软要求（不写死数字）。"""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "推荐语本体"}}]})
+
+    client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
+    base = {"full_name": "a/one", "description": "desc", "language": "Python", "categories": ["Python"]}
+    asyncio.run(client.recommend(**base, dimension="week", delta=150, stars=1100))
+    asyncio.run(client.recommend(**base, dimension="quarter", delta=200, stars=1100))
+    asyncio.run(client.recommend(**base, dimension="total"))
+    asyncio.run(client.recommend(**base, dimension="week", stars=1100))  # delta 缺席（历史期次无增量行）
+    asyncio.run(client.aclose())
+
+    week_sys, week_user = bodies[0]["messages"][0]["content"], bodies[0]["messages"][1]["content"]
+    assert "必须明确写出本周新增星数（150 星）" in week_sys
+    assert "本周新增星数：150" in week_user
+    quarter_sys = bodies[1]["messages"][0]["content"]
+    assert "必须明确写出本季新增星数（200 星）" in quarter_sys
+    total_sys, total_user = bodies[2]["messages"][0]["content"], bodies[2]["messages"][1]["content"]
+    assert "不要引用任何具体数字" in total_sys
+    assert "新增星数" not in total_user and "总星数" not in total_user  # total 输入不带数字
+    soft_sys = bodies[3]["messages"][0]["content"]
+    assert "必须明确写出" not in soft_sys and "结合本周增星" in soft_sys  # delta 缺席退回软要求
+
+
 def test_client_retries_5xx_once_then_succeeds():
     """5xx 重试一次后成功：共 2 次请求，返回第二次的 content。"""
     calls = []

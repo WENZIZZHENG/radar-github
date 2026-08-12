@@ -349,6 +349,7 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
                     # T-017（§8.1/§8.2）：关注页长期盯梢语境 → 总星维度文本；行内按钮按 total 操作
                     "reason_dim": "total",
                     "reason_period_label": "all",
+                    "reason_label": _reason_label("total", "all"),
                     "show_recommend": True,
                 }
             )
@@ -387,17 +388,31 @@ def _display_maps(
     return reasons, zh, tags
 
 
+def _reason_label(dimension: str, period_label: str) -> str:
+    """推荐语块维度标题（2026-08-12 本人复验反馈钉死）：一眼可辨该文本属三维度中的哪套
+    （周/季/总星各行一条）；首期空态降级页面上同时解释"当前展示的是总星榜文本"。"""
+    if dimension == "week":
+        return f"周榜推荐语 · {period_label}"
+    if dimension == "quarter":
+        return f"季榜推荐语 · {period_label}"
+    return "总星榜推荐语"
+
+
 def _page_recommend_ctx(period: str, as_of_date: date) -> dict:
     """页面展示维度 → 推荐语 (dimension, period_label)（§8.1 展示映射）＋行内按钮参数。
 
     period 用实际展示期次（周/季页首期空态降级为 total 时按 total 取——页面行即总星榜行，
     按钮维度与展示一致）。周/季按页面语境日期推导标签：历史周页取该周标签，手动重生写回同一期。
+    返回 dict 含 reason_dim/reason_period_label/reason_label/show_recommend：reason_label 为
+    _reason_label 生成的块标题（周/季带期次、总星固定文案），页面渲染与测试断言均按此取。
     """
     if period == "week":
-        return {"reason_dim": "week", "reason_period_label": _week_label(as_of_date), "show_recommend": True}
+        label = _week_label(as_of_date)
+        return {"reason_dim": "week", "reason_period_label": label, "reason_label": _reason_label("week", label), "show_recommend": True}
     if period == "quarter":
-        return {"reason_dim": "quarter", "reason_period_label": _quarter_label(as_of_date), "show_recommend": True}
-    return {"reason_dim": "total", "reason_period_label": "all", "show_recommend": True}
+        label = _quarter_label(as_of_date)
+        return {"reason_dim": "quarter", "reason_period_label": label, "reason_label": _reason_label("quarter", label), "show_recommend": True}
+    return {"reason_dim": "total", "reason_period_label": "all", "reason_label": _reason_label("total", "all"), "show_recommend": True}
 
 
 def _row_view(
@@ -411,12 +426,14 @@ def _row_view(
     tags: dict,
     reason_dim: str = "total",
     reason_period_label: str = "all",
+    reason_label: str = "总星榜推荐语",
     show_recommend: bool = False,
 ) -> dict:
     """榜单行 + 详情面板的模板视图：模板只负责渲染，一切格式化在本层完成。
 
-    reason_dim/reason_period_label/show_recommend 为 T-017 行内推荐语按钮参数（§8.2：只在有推荐语
-    展示位的页面出现，按当前页维度操作）；标签结果页行（_tag_row_view）传 show_recommend=False 不渲染按钮。
+    reason_dim/reason_period_label/reason_label/show_recommend 为 T-017 行内推荐语按钮参数与
+    推荐语块维度标题（§8.2：只在有推荐语展示位的页面出现，按当前页维度操作）；标签结果页行
+    （_tag_row_view）传 show_recommend=False 不渲染按钮。
     """
     delta_text = None
     delta_neg = False
@@ -446,6 +463,7 @@ def _row_view(
         "window_note": window_note,
         "reason_dim": reason_dim,
         "reason_period_label": reason_period_label,
+        "reason_label": reason_label,
         "show_recommend": show_recommend,
     }
 
@@ -501,6 +519,7 @@ def _boards_context(
             "tags": tags,
             "reason_dim": rec_ctx["reason_dim"],
             "reason_period_label": rec_ctx["reason_period_label"],
+            "reason_label": rec_ctx["reason_label"],
             "show_recommend": rec_ctx["show_recommend"],
         }
         lang_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "language"]
@@ -822,6 +841,7 @@ def _tag_row_view(
         "window_note": None,
         "reason_dim": "total",
         "reason_period_label": "all",
+        "reason_label": _reason_label("total", "all"),
         "show_recommend": False,
     }
 
@@ -1249,6 +1269,7 @@ async def api_recommend(
             "text": text,
             "dimension": dimension,
             "period_label": period_label,
+            "reason_label": _reason_label(dimension, period_label),  # 前端局部替换块标题同构（免 JS 重复映射）
         }
     finally:
         conn.close()

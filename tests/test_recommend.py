@@ -183,7 +183,14 @@ def test_api_recommend_force_regenerate_overwrites(tmp_path, monkeypatch):
         )
     assert resp.status_code == 200
     data = resp.json()
-    assert data == {"full_name": "a/one", "recommended": True, "text": "推荐语-a/one-total", "dimension": "total", "period_label": "all"}
+    assert data == {
+        "full_name": "a/one",
+        "recommended": True,
+        "text": "推荐语-a/one-total",
+        "dimension": "total",
+        "period_label": "all",
+        "reason_label": "总星榜推荐语",  # 块标题维度标识（2026-08-12 复验反馈），前端局部替换同构
+    }
     assert fake.calls[0]["readme"] == "# One"  # README 输入透传
     assert _rec_map(tmp_path / "rec.db") == {("total", "all"): "推荐语-a/one-total"}  # 覆盖写库
     conn = get_conn(tmp_path / "rec.db")

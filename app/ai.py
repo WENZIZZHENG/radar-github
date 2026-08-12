@@ -159,6 +159,8 @@ class DeepSeekClient:
 
         prompt 两条钉死口径（本人拍板）：周/季输入必须带当期增量（"本周/本季新增 X 星，为什么火"）；
         total 维度不引用任何具体星数/排名数字（数字由页面行内数据展示，防 evergreen 陈旧）。
+        分化钉死（2026-08-12 本人复验反馈）：周/季有增量时必须明确写出当期增星数字——与 total
+        "不引用数字"形成肉眼可见的稳定差异（两套文本不再"看起来一样"）。
         README 正文截断入输入（无则省略该行）；只输出 2~3 句中文推荐语本体。
         """
         if dimension not in ("week", "quarter", "total"):
@@ -184,11 +186,18 @@ class DeepSeekClient:
             lines.append(f"上榜分类：{'、'.join(categories)}")
             user = "\n".join(lines)
             board_word = "周榜" if dimension == "week" else "季榜"
+            # 分化钉死（2026-08-12 本人复验反馈）：增星语境必须写出具体数字——与 total 维度
+            # "不引用任何数字"形成肉眼可见的稳定差异；delta 缺席（历史期次无增量行）时退回软要求
+            why = (
+                f"其余说明为什么{delta_word}值得关注：必须明确写出{delta_word}新增星数（{delta} 星）"
+                "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
+                if delta is not None
+                else f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类）；"
+            )
             system = (
                 f"你是技术雷达的编辑，为一位资深开发者读者写 GitHub {board_word}上榜项目的推荐理由。"
                 f"根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
-                f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类），"
-                "有选型参考价值时点明。"
+                f"{why}有选型参考价值时点明。"
                 "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
             )
         return await self._chat(
