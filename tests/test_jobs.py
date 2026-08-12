@@ -58,6 +58,8 @@ def make_search_item(full_name: str, node_id: str, *, stars: int = 1500, descrip
 class FakeClient:
     """假 GitHub client：nodes 按 node_id→节点脚本返回（缺省 None＝死库信号）；search 按页脚本返回。
 
+    search_pages 按页号返回（每日发现查询用）；search_pages_by_query 按 query 精确区分返回
+    （T-019 补捞查询与每日查询需返回不同内容时用，缺省回落 search_pages，不影响既有用例）。
     fail_batches / fail_pages 模拟单批/单页失败；raise_always 模拟整轮异常。记录所有调用供断言。
     """
 
@@ -66,14 +68,18 @@ class FakeClient:
         *,
         nodes_by_id: dict | None = None,
         search_pages: dict | None = None,
+        search_pages_by_query: dict | None = None,
         fail_batches: set = (),
         fail_pages: set = (),
+        fail_queries: set = (),
         raise_always: bool = False,
     ) -> None:
         self.nodes_by_id = nodes_by_id or {}
         self.search_pages = search_pages or {}
+        self.search_pages_by_query = search_pages_by_query or {}
         self.fail_batches = set(fail_batches)
         self.fail_pages = set(fail_pages)
+        self.fail_queries = set(fail_queries)
         self.raise_always = raise_always
         self.fetch_calls: list[list[str]] = []
         self.search_calls: list[tuple[str, str, int]] = []
@@ -87,9 +93,11 @@ class FakeClient:
 
     async def search_repositories(self, query: str, *, sort: str = "stars", per_page: int = 100, page: int = 1) -> dict:
         self.search_calls.append((query, sort, page))
-        if self.raise_always or page in self.fail_pages:
+        # fail_queries 非空时失败限定到指定 query（每日/补捞查询各自翻页互不影响），空则按页号全局
+        if self.raise_always or (page in self.fail_pages and (not self.fail_queries or query in self.fail_queries)):
             raise RuntimeError("模拟翻页失败")
-        return {"total_count": 0, "items": self.search_pages.get(page, [])}
+        pages = self.search_pages_by_query.get(query, self.search_pages)
+        return {"total_count": 0, "items": pages.get(page, [])}
 
 
 def _open_db(tmp_path):
@@ -123,8 +131,8 @@ def make_logger():
     return logger, records
 
 
-def _run(client, conn, logger):
-    return asyncio.run(run_daily(client, conn, now_iso=lambda: NOW, log=logger))
+def _run(client, conn, logger, *, now=NOW):
+    return asyncio.run(run_daily(client, conn, now_iso=lambda: now, log=logger))
 
 
 # ---------- 每日快照：nodes → snapshots 行，死信号 → dead=1 ----------
@@ -648,4 +656,133 @@ def test_snapshot_description_and_drift_both_apply(tmp_path):
     assert row["language"] == "Rust" and row["topics"] == '["ml"]'  # 漂移 → 归类字段更新
     assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE repo_id = ?", (repo_id,)).fetchone()[0] == 0  # 删推荐语
     assert stats.drift_updated == 1
+    conn.close()
+
+
+# ---------- T-019：每周补捞（仅 UTC 周一触发，星数区间按 ISO 周序号轮换） ----------
+
+MONDAY_W32 = "2026-08-03T00:00:00Z"  # 周一：ISO W32 → 32%7=4 → bands[4] = 16000..32000（区间语法）
+MONDAY_W34 = "2026-08-17T00:00:00Z"  # 周一：ISO W34 → 34%7=6 → bands[6] = 64000..None（开放段语法）
+
+
+def test_weekly_refill_not_triggered_on_non_monday(tmp_path):
+    """非周一（NOW=2026-08-09 周日）：不触发补捞，搜索调用只有每日 updated 查询。"""
+    conn = _open_db(tmp_path)
+    client = FakeClient()
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    assert len(client.search_calls) == 5  # 每日 5 页
+    assert all(query == "stars:>=1000" and sort == "updated" for query, sort, _page in client.search_calls)
+    conn.close()
+
+
+def test_weekly_refill_triggered_once_with_band_query(tmp_path):
+    """周一（W32）：触发且只触发一次补捞，查询为当周波段 stars:16000..32000；新面孔入池＋基线快照。"""
+    conn = _open_db(tmp_path)
+    band = {"stars:16000..32000": {1: [make_search_item("band/new-a", "nid-band-a", stars=20000)]}}
+    client = FakeClient(search_pages_by_query=band)
+    logger, records = make_logger()
+    stats = _run(client, conn, logger, now=MONDAY_W32)
+
+    # 每日查询 5 次 updated；补捞恰一次（5 页，与每日同配额档）、sort=stars
+    daily = [c for c in client.search_calls if c[0] == "stars:>=1000"]
+    refills = [c for c in client.search_calls if c[0] != "stars:>=1000"]
+    assert len(daily) == 5 and all(c[1] == "updated" for c in daily)
+    assert refills == [("stars:16000..32000", "stars", p) for p in range(1, 6)]
+    # 新面孔入池＋当行基线快照（captured_at 与整轮共享）
+    assert stats.discovered == 1
+    rows = conn.execute("SELECT full_name, node_id FROM repos WHERE source = 'discover'").fetchall()
+    assert [(r["full_name"], r["node_id"]) for r in rows] == [("band/new-a", "nid-band-a")]
+    snaps = conn.execute("SELECT s.captured_at, s.stars FROM star_snapshots s").fetchall()
+    assert [(s["captured_at"], s["stars"]) for s in snaps] == [(MONDAY_W32, 20000)]
+    # 补捞 INFO 日志：波段、实捞条数、新入池数
+    assert any("每周补捞执行" in r.getMessage() and "stars:16000..32000" in r.getMessage() for r in records)
+    conn.close()
+
+
+def test_weekly_refill_band_rotation_open_end(tmp_path):
+    """周一（W34）：轮换取模 → 开放段 bands[6]=(64000,None) → stars:>=64000。"""
+    conn = _open_db(tmp_path)
+    band = {"stars:>=64000": {1: [make_search_item("band/huge", "nid-huge", stars=100000)]}}
+    client = FakeClient(search_pages_by_query=band)
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger, now=MONDAY_W34)
+
+    refills = [c for c in client.search_calls if c[0] != "stars:>=1000"]
+    assert refills == [("stars:>=64000", "stars", p) for p in range(1, 6)]
+    assert stats.discovered == 1
+    assert conn.execute("SELECT full_name FROM repos WHERE source = 'discover'").fetchone()["full_name"] == "band/huge"
+    conn.close()
+
+
+def test_weekly_refill_skips_existing_and_daily_ingested(tmp_path):
+    """已在库仓与每日刚入池的仓不重复入池：补捞判重从库重读 seen（同轮每日发现自然覆盖）。"""
+    conn = _open_db(tmp_path)
+    seed_repo(conn, "old/live", "nid-live")  # 快照阶段会请求 nodes
+    daily_pages = {1: [make_search_item("daily/fresh", "nid-daily", stars=1300)]}
+    band = {
+        "stars:16000..32000": {
+            1: [
+                make_search_item("old/live", "nid-live", stars=25000),  # 早已在库
+                make_search_item("daily/fresh", "nid-daily", stars=25000),  # 每日刚入池
+                make_search_item("band/fresh", "nid-band", stars=25000),  # 真新面孔
+            ]
+        }
+    }
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("old/live", stars=2000)},
+        search_pages=daily_pages,
+        search_pages_by_query=band,
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger, now=MONDAY_W32)
+
+    assert stats.discovered == 2  # daily/fresh（每日发现）＋ band/fresh（补捞）各计一次
+    names = {r["full_name"] for r in conn.execute("SELECT full_name FROM repos WHERE source = 'discover'")}
+    assert names == {"daily/fresh", "band/fresh"}
+    # 基线快照不重复：每仓恰一行
+    snaps = conn.execute(
+        "SELECT r.full_name, COUNT(*) FROM star_snapshots s JOIN repos r ON r.id = s.repo_id GROUP BY r.full_name"
+    ).fetchall()
+    assert {r["full_name"]: r[1] for r in snaps} == {"old/live": 1, "daily/fresh": 1, "band/fresh": 1}
+    conn.close()
+
+
+def test_weekly_refill_page_failure_logged_and_continues(tmp_path):
+    """补捞第 2 页失败：记日志继续第 3 页（fail_queries 限定只让补捞查询的页失败，每日查询不受影响）。"""
+    conn = _open_db(tmp_path)
+    band = {
+        "stars:16000..32000": {
+            1: [make_search_item("band/p1", "nid-bp1", stars=20000)],
+            3: [make_search_item("band/p3", "nid-bp3", stars=20000)],
+        }
+    }
+    client = FakeClient(search_pages_by_query=band, fail_queries={"stars:16000..32000"}, fail_pages={2})
+    logger, records = make_logger()
+    stats = _run(client, conn, logger, now=MONDAY_W32)
+
+    assert len(client.search_calls) == 10  # 每日 5 页 + 补捞 5 页
+    assert stats.discovered == 2
+    names = {r["full_name"] for r in conn.execute("SELECT full_name FROM repos WHERE source = 'discover'")}
+    assert names == {"band/p1", "band/p3"}
+    assert any("每周补捞第 2 页拉取失败" in r.getMessage() for r in records)
+    conn.close()
+
+
+def test_weekly_refill_renamed_repo_not_duplicated(tmp_path):
+    """改名仓（node_id 撞已有行）出现在补捞波段：双键判重拦截，不重复入池不炸。"""
+    conn = _open_db(tmp_path)
+    seed_repo(conn, "old/name", "nid-same")  # 改名前已在池
+    band = {"stars:16000..32000": {1: [make_search_item("brand/new-name", "nid-same", stars=20000)]}}  # 改名后出现
+    client = FakeClient(
+        nodes_by_id={"nid-same": make_node("old/name", stars=2000)},
+        search_pages_by_query=band,
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger, now=MONDAY_W32)
+
+    assert stats.discovered == 0  # 改名 ≠ 新面孔
+    assert conn.execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 1
+    assert conn.execute("SELECT full_name FROM repos").fetchone()["full_name"] == "old/name"  # 原名不动
     conn.close()

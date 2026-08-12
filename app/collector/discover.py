@@ -14,6 +14,10 @@
 - 发现池每日只捞 stars:>=1000 按 updated 降序前 5 页（500 条）：星数榜头部常年固化，
   按最近活跃排序才能轮到涨星中的新仓库；判重按 full_name＋node_id 双键（改名库不算新面孔，
   含死库——存在即不动），当行写基线快照，使新入池首周缺席口径（决策 4）有据可依。
+- T-019 每周补捞（仅 UTC 周一触发，嵌入 run_daily 每日发现之后）：星数区间 7 段指数划分
+  （1000..2000 … >=64000）按 ISO 周序号轮换、sort=stars 捞前 500 条——补 updated 排序盲区：
+  老仓慢涨过 1000 星但近期无更新永远翻不进每日前 500；7 周扫完全谱，长尾段 7 周轮转、
+  头部优先（每段只捞 Top 500 属既定截断）；判重与入池完全复用发现池路径。
 - 静默容错（共识 §8：连续 3 天失败允许数据空洞，次日调度自然重试）：
   单批/单页失败记日志后继续跑完本批之外的量；整任务异常吞掉只记日志，不报警、不抛出。
 - 任务日志双写 data/jobs.log（RotatingFileHandler，data/ 已 gitignore）与控制台，
@@ -29,6 +33,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -39,6 +44,17 @@ from app.db import get_conn, init_db
 
 DISCOVER_QUERY = "stars:>=1000"  # 发现池查询：与核心池同下界，按 updated 排序捞新面孔
 DISCOVER_PAGES = 5  # 每日只看前 500 条活跃仓库：再深的页新面孔密度极低，不值得配额
+# T-019 每周补捞：星数区间 7 段（指数划分），仅 UTC 周一按 ISO 周序号轮换，7 周扫完全谱
+DISCOVER_BANDS = [
+    (1000, 2000),
+    (2000, 4000),
+    (4000, 8000),
+    (8000, 16000),
+    (16000, 32000),
+    (32000, 64000),
+    (64000, None),  # 开放段：stars:>=64000（GitHub Search 区间语法到上限即用 >=）
+]
+DISCOVER_BAND_PAGES = 5  # 每波段捞前 500 条（stars 降序头部优先），与每日同配额档
 DEFAULT_LOG_PATH = BASE_DIR / "data" / "jobs.log"
 
 logger = logging.getLogger("radar.jobs")
@@ -186,32 +202,72 @@ def _ingest_discovered(conn: sqlite3.Connection, items: list[dict], *, now_iso: 
     return inserted
 
 
-async def _discover(
-    client: GitHubClient, conn: sqlite3.Connection, *, captured_at: str, stats: DailyStats, log: logging.Logger
-) -> None:
-    """发现池：按 updated 降序捞前 500 条活跃仓库，新面孔入池＋基线快照；单页失败记日志继续下一页。"""
-    # 判重按 full_name + node_id 双键：仓库改名后 full_name 变、node_id 不变，
-    # 只按名字判会把改名库当"新面孔"——INSERT 撞 node_id UNIQUE 被 IGNORE，后续反查落空（评审中-1）
+async def _collect_new_faces(
+    client: GitHubClient,
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    sort: str,
+    pages: int,
+    label: str,
+    log: logging.Logger,
+) -> list[dict]:
+    """翻页捞＋双键判重收集新面孔（T-019 起每日发现与每周补捞共用），不落库，判重/入池归调用方。
+
+    判重按 full_name + node_id 双键：仓库改名后 full_name 变、node_id 不变，
+    只按名字判会把改名库当"新面孔"——INSERT 撞 node_id UNIQUE 被 IGNORE，后续反查落空（评审中-1）。
+    seen 每次调用从库重读：补捞嵌在每日发现之后执行，同轮刚入池的仓自然覆盖。
+    单页失败记日志继续下一页（与 _snapshot_all 同容错）；token 失效直通整轮 handler 记一次。
+    """
     seen_names = {row["full_name"] for row in conn.execute("SELECT full_name FROM repos")}
     seen_ids = {row["node_id"] for row in conn.execute("SELECT node_id FROM repos")}
     new_items: list[dict] = []
-    for page in range(1, DISCOVER_PAGES + 1):
+    for page in range(1, pages + 1):
         try:
-            data = await client.search_repositories(DISCOVER_QUERY, sort="updated", per_page=100, page=page)
+            data = await client.search_repositories(query, sort=sort, per_page=100, page=page)
         except GitHubAuthError:
             raise  # token 失效是确定性错误：逐页重试只会刷爆日志，直通整轮 handler 记一次
         except Exception:
-            log.exception("发现池第 %d 页拉取失败：跳过本页继续，缺口由次日调度补", page)
+            log.exception("%s第 %d 页拉取失败：跳过本页继续，缺口由下次调度补", label, page)
             continue
         for item in data.get("items") or []:
             name = item.get("full_name")
             nid = item.get("node_id")
             if not name or name in seen_names or nid in seen_ids:
                 continue
-            seen_names.add(name)  # 页间去重：同一仓库可能因 updated 排序抖动出现在多页
+            seen_names.add(name)  # 页间去重：同一仓库可能因排序抖动出现在多页
             seen_ids.add(nid)
             new_items.append(item)
+    return new_items
+
+
+async def _discover(
+    client: GitHubClient, conn: sqlite3.Connection, *, captured_at: str, stats: DailyStats, log: logging.Logger
+) -> None:
+    """发现池：按 updated 降序捞前 500 条活跃仓库，新面孔入池＋基线快照；单页失败记日志继续下一页。"""
+    new_items = await _collect_new_faces(
+        client, conn, query=DISCOVER_QUERY, sort="updated", pages=DISCOVER_PAGES, label="发现池", log=log
+    )
     stats.discovered += _ingest_discovered(conn, new_items, now_iso=captured_at, captured_at=captured_at)
+
+
+async def _weekly_refill(
+    client: GitHubClient, conn: sqlite3.Connection, *, captured_at: str, stats: DailyStats, log: logging.Logger
+) -> None:
+    """T-019 每周补捞：仅 UTC 周一触发，星数区间按 ISO 周序号轮换（7 周扫完全谱）、
+    sort=stars 捞前 500 条——补 updated 排序盲区（老仓慢涨过 1000 星但近期无更新）；判重/入池复用发现池路径。
+    已知限度（评审 F3-2 留痕）：ISO 跨年周数跳变（W53→W1）处个别波段间隔拉长或短期重复，无状态方案固有限度。"""
+    day = date.fromisoformat(captured_at[:10])
+    if day.weekday() != 0:
+        return
+    low, high = DISCOVER_BANDS[day.isocalendar().week % len(DISCOVER_BANDS)]
+    query = f"stars:>={low}" if high is None else f"stars:{low}..{high}"
+    new_items = await _collect_new_faces(
+        client, conn, query=query, sort="stars", pages=DISCOVER_BAND_PAGES, label="每周补捞", log=log
+    )
+    inserted = _ingest_discovered(conn, new_items, now_iso=captured_at, captured_at=captured_at)
+    stats.discovered += inserted
+    log.info("每周补捞执行：波段 %s、新面孔 %d 个、新入池 %d 个", query, len(new_items), inserted)
 
 
 async def run_daily(
@@ -221,7 +277,7 @@ async def run_daily(
     now_iso: Callable[[], str] = utc_now_iso,
     log: logging.Logger | None = None,
 ) -> DailyStats:
-    """执行一次全日任务（快照→发现池）；任何异常吞掉记日志不抛出（共识 §8），汇总行必定落日志。"""
+    """执行一次全日任务（快照→发现池→每周补捞（T-019 仅周一））；任何异常吞掉记日志不抛出（共识 §8），汇总行必定落日志。"""
     log = log or get_job_logger()
     started = time.monotonic()
     captured_at = now_iso()  # 整轮共享一个时间戳：UTC 定长硬约定 + 同批一致
@@ -229,6 +285,7 @@ async def run_daily(
     try:
         await _snapshot_all(client, conn, captured_at=captured_at, stats=stats, log=log)
         await _discover(client, conn, captured_at=captured_at, stats=stats, log=log)
+        await _weekly_refill(client, conn, captured_at=captured_at, stats=stats, log=log)  # T-019：仅 UTC 周一补捞
     except Exception:
         log.exception("每日任务整轮异常：吞掉不报警（共识 §8 允许数据空洞），次日调度自然重试")
     elapsed = time.monotonic() - started
