@@ -15,6 +15,11 @@
     总星文本懒口径不每周重刷；prompt 不引用具体星数/排名数字，防 evergreen 数字陈旧）；
     README 拉取失败（sha 未取到，含 404/auth 停拉）不触发重生、保留旧行旧指纹——防失败制造每日 churn
     （README 被删除的 404 场景因此不再触发，属探测能力边界）；
+  * 概要（T-024，§11）：与推荐语并存——推荐语＝为什么值得关注（营销视角），概要＝是什么
+    （README 文档视角、段落级 3~5 句中文、无维度概念、全页面同一条）；key=(repo_id, 'summary', 'all')，
+    覆盖 S 全集（上榜∪关注，同 T-017 推荐语 S 集口径）；懒生成（缺时每日 ensure 补）＋README 变更
+    当日重生（同 total 段 F2-1 守卫）；仅每日 ensure（refresh=True）执行，无任何手动入口
+    （手动批量 worker refresh=False 整段跳过——§11 无手动按钮）；prompt 不引用任何星数/增星/排名数字；
   * README sha 比对仅每日 ensure 对 S 内仓进行；sha NULL 仓后续出现 README 视为变更自愈；
     周/季维度不随 README 触发；
 - 降级：DEEPSEEK_API_KEY 未配置 → 记 INFO 返回零统计，服务照常；单条 translate/recommend 失败 →
@@ -222,6 +227,39 @@ class DeepSeekClient:
             temperature=0.3,  # 低温度：推荐语允许一点措辞空间，但不许发散
         )
 
+    async def summarize(
+        self,
+        *,
+        full_name: str,
+        description: str,
+        language: str,
+        readme: str | None = None,
+    ) -> str:
+        """项目 AI 概要（T-024，§11）：README 文档视角"这个项目是什么/由什么组成"。
+
+        与推荐语并存不混淆：推荐语＝为什么值得关注（营销视角，三维度分榜）；概要＝是什么
+        （文档视角，段落级 3~5 句中文，无维度概念，全页面同一条）。
+        prompt 三条钉死口径（本人拍板）：不引用任何星数/增星/排名数字（防 evergreen 陈旧，
+        与 total 推荐语同理）；只输出概要本体（无前缀无列表无标题，与 recommend 同风格约束）；
+        temperature 0.3。README 正文截断入输入的口径与 recommend 一致（调用方 _ReadmeState
+        已按 README_HEAD_CHARS 截断，本方法不重复截断）。
+        """
+        lines = [f"仓库：{full_name}", f"简介：{description}", f"主语言：{language}"]
+        if readme:
+            lines.append(f"README 要点：\n{readme}")
+        system = (
+            "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的 AI 概要。"
+            "根据给出的仓库信息，从 README 文档视角写一段 3~5 句的中文概要：这个项目是什么、"
+            "由什么组成（核心模块/组件）。"
+            "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
+            "只输出概要本体：不要加引号包裹，不要加“AI 概要：”等前缀，不要用列表或标题。"
+        )
+        return await self._chat(
+            system=system,
+            user="\n".join(lines),
+            temperature=0.3,  # 低温度：概要求准不求发散（与推荐语同值）
+        )
+
     async def _chat(self, *, system: str, user: str, temperature: float) -> str:
         """一次 chat/completions 调用：超时/传输错误/5xx/响应畸形重试一次后仍失败 → 抛清晰异常。"""
         # key 在使用点校验（与 GitHubClient 同姿态）：config 层不报错，这里第一刀拦住空 key
@@ -387,25 +425,31 @@ async def recommend_missing(
     scope: tuple[dict[str, dict[str, _ListedItem]], list[str]] | None = None,
     on_progress: Callable[[dict[str, int]], None] | None = None,
 ) -> dict[str, int]:
-    """三维度推荐语补缺（T-017，T-018 扩 S）：S = 三口径榜去重 ∪ 关注集（周/季含新区 Top10）。
+    """三维度推荐语补缺（T-017，T-018 扩 S）＋ AI 概要补缺（T-024）：S = 三口径榜去重 ∪ 关注集（周/季含新区 Top10）。
 
     - week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
     - quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
     - total：(repo_id, 'total', 'all') 缺失则生成（懒口径）；refresh=True（每日 ensure）时 README blob sha
       变化 → REPLACE 重生并更新 sha（README 变更当日重生，自愈）；总星文本不每周重刷、prompt 不引用数字；
+    - summary（T-024，§11）：key=(repo_id, 'summary', 'all')，覆盖 S 全集（all_names 即上榜∪关注去重），
+      仅 refresh=True（每日 ensure 路径）执行——§11 无手动入口，手动批量 worker refresh=False 整段跳过；
+      缺失则生成；refresh 时 README sha 非空且与 cur['readme_sha'] 不同 → REPLACE 重生并更新 sha
+      （与 total 段同一 F2-1 守卫：本次 sha 未取到不触发重生、保留旧行旧指纹）；概要懒口径不每周重刷；
     - 输入含 README 正文（截断；拉取失败/空退化元数据，不持久化）；README 拉取失败绝不抛出阻塞
-      （GitHub token 缺失/无效 → 全量退化、readme_sha 保持 NULL）；
+      （GitHub token 缺失/无效 → 全量退化、readme_sha 保持 NULL）；README 复用同一 _ReadmeState 实例
+      （逐仓缓存，同轮同仓只拉一次，total 段与 summary 段共享）；
     - 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError 直通整轮 handler；
     - 单条写入即 commit（崩溃不丢已花配额，重跑幂等补缺）。
 
     被每日 ensure_daily_ai 与手动批量补缺 worker（refresh=False，只补缺失不重生）共用。
     on_progress 在每条写库后回调 stats 快照（批量 worker 渐进更新进度用）。
 
-    返回 {"listed", "recommended", "recommend_failed", "readme_fetched"}：
-    listed＝S 去重仓库数；recommended＝新写/覆盖条数；其余为各步成功/失败计数。
+    返回 {"listed", "recommended", "recommend_failed", "summarized", "summary_failed", "readme_fetched"}：
+    listed＝S 去重仓库数；recommended/summarized＝推荐语/概要新写或覆盖条数；其余为各步成功/失败计数。
+    手动批量 worker（refresh=False）只读 recommended/recommend_failed，不受概要两键影响。
     """
     log = log or logger
-    stats = {"listed": 0, "recommended": 0, "recommend_failed": 0, "readme_fetched": 0}
+    stats = {"listed": 0, "recommended": 0, "recommend_failed": 0, "summarized": 0, "summary_failed": 0, "readme_fetched": 0}
     if scope is None:
         scope = _scope_sets(conn, now=now)
     listed_by_period, follow_names = scope
@@ -569,6 +613,45 @@ async def recommend_missing(
         if on_progress is not None:
             on_progress(stats)
 
+    # --- 概要维度（T-024，§11）：key=(repo_id, 'summary', 'all')，覆盖 S 全集（all_names = 三榜去重 ∪ 关注）；
+    #     仅 refresh=True（每日 ensure 路径）执行——§11 无手动入口，手动批量 worker refresh=False 整段跳过；
+    #     缺失则生成；refresh 时 README sha 非空且与旧指纹不同 → REPLACE 重生（与 total 段同一 F2-1 守卫：
+    #     本次 sha 未取到不触发重生、保留旧行旧指纹）；概要与推荐语并存（文档视角，无维度概念，全页面同一条） ---
+    if refresh:
+        for full_name in all_names:
+            info = repo_info.get(full_name)
+            if info is None:
+                continue
+            rid = info["id"]
+            key = (rid, "summary", "all")
+            cur = existing.get(key)
+            readme_text, sha = await readme_state.get(full_name, stats)  # 复用同一 _ReadmeState：同轮同仓缓存命中
+            if cur is not None and (sha is None or cur["readme_sha"] == sha):
+                continue  # 已有且未触发重生：概要懒口径不重刷（README 变更当日才重生）
+            try:
+                text = await client.summarize(
+                    full_name=full_name,
+                    description=info["description_zh"] or info["description_en"] or "（无简介）",
+                    language=info["language"] or "未知",
+                    readme=readme_text,
+                )
+            except DeepSeekAuthError:
+                raise  # 账户类确定性错误直通（同推荐语段）
+            except Exception as exc:
+                log.warning("AI 概要生成失败，跳过 %s：%s", full_name, exc)
+                stats["summary_failed"] += 1
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO recommendations (repo_id, dimension, period_label, text, readme_sha,"
+                " generated_week) VALUES (?, 'summary', 'all', ?, ?, ?)",
+                (rid, text, sha, week_label),
+            )
+            conn.commit()
+            stats["summarized"] += 1
+            existing[key] = None  # 防御：同轮不重复判定
+            if on_progress is not None:
+                on_progress(stats)
+
     return stats
 
 
@@ -580,12 +663,12 @@ async def ensure_daily_ai(
     log: logging.Logger | None = None,
     github_client: GitHubClient | None = None,
 ) -> dict[str, int]:
-    """每日 AI 生成（T-017 重写，原名 ensure_weekly_ai）：范围集翻译收窄＋三维度推荐语补缺/刷新。
+    """每日 AI 生成（T-017 重写，原名 ensure_weekly_ai）：范围集翻译收窄＋三维度推荐语补缺/刷新＋AI 概要（T-024）。
 
     步骤：a) 计算范围集 S = 三口径榜去重 ∪ 关注集（周/季 = 主榜 Top30 ∪ 新区 Top10，T-018）；
     b) 翻译段收窄：只译 S 内 description_zh IS NULL 且英文非空无 CJK 的仓（原文变更采集层已清译文，
     当日本轮自然重译；译过的不重译；S 之外永不翻译——v3 全池口径作废）；
-    c) 推荐语三维度（口径详见 recommend_missing docstring）；
+    c) 推荐语三维度＋概要（口径详见 recommend_missing docstring；refresh=True → 概要段随行执行）；
     d) 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效）是确定性配置错误，
     直通抛出由调用方整轮捕获（与采集层 GitHubAuthError 同姿态）；
     e) key 未配置记 INFO 直接返回零统计；GitHub token 缺失/无效 → README 全量退化不报错。
@@ -593,8 +676,8 @@ async def ensure_daily_ai(
     事务选择：单条写入即 commit（不开整体事务）——后台串行、量级小（S ≤ 数百仓），
     崩溃时已完成写入不丢（不浪费已花的 API 配额），重跑靠"已译/同维度同期已存在"幂等跳过自然补缺。
 
-    返回 {"listed", "translated", "translate_failed", "recommended", "recommend_failed", "readme_fetched"}：
-    listed＝S 去重仓库数，其余为各步成功/失败计数。
+    返回 {"listed", "translated", "translate_failed", "recommended", "recommend_failed",
+    "summarized", "summary_failed", "readme_fetched"}：listed＝S 去重仓库数，其余为各步成功/失败计数。
     """
     log = log or logger
     stats = {
@@ -603,6 +686,8 @@ async def ensure_daily_ai(
         "translate_failed": 0,
         "recommended": 0,
         "recommend_failed": 0,
+        "summarized": 0,
+        "summary_failed": 0,
         "readme_fetched": 0,
     }
     if not get_settings().deepseek_api_key:
@@ -649,22 +734,26 @@ async def ensure_daily_ai(
         if cur.rowcount:
             stats["translated"] += 1
 
-    # c) 推荐语三维度（refresh=True：quarter 每周 REPLACE、total README 变更重生）
+    # c) 推荐语三维度＋概要（refresh=True：quarter 每周 REPLACE、total/summary README 变更重生；概要段仅 refresh 路径）
     sub = await recommend_missing(
         conn, client, now=now, log=log, github_client=github_client, refresh=True, scope=scope
     )
     stats["recommended"] += sub["recommended"]
     stats["recommend_failed"] += sub["recommend_failed"]
+    stats["summarized"] += sub["summarized"]
+    stats["summary_failed"] += sub["summary_failed"]
     stats["readme_fetched"] += sub["readme_fetched"]
 
     log.info(
-        "AI 每日生成汇总（%s）：覆盖 %d、新译 %d（失败 %d）、新推荐 %d（失败 %d）、README 拉取 %d",
+        "AI 每日生成汇总（%s）：覆盖 %d、新译 %d（失败 %d）、新推荐 %d（失败 %d）、概要 %d（失败 %d）、README 拉取 %d",
         _week_label(now.date()),
         stats["listed"],
         stats["translated"],
         stats["translate_failed"],
         stats["recommended"],
         stats["recommend_failed"],
+        stats["summarized"],
+        stats["summary_failed"],
         stats["readme_fetched"],
     )
     return stats

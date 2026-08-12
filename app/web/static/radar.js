@@ -432,7 +432,8 @@ async function translateMissing(btn) {
 // ---- T-017 推荐语交互（§8.2 主路径 / §8.3 分支文案钉死，前端不发明文案） ----
 
 // 面板推荐语块即时局部替换（不刷新页面）：有则覆写文本（块标题 <b> 保留——维度标题与页面一致），
-// 无则插到操作区之前（模板顺序 desc→reason→acts），新块标题用 API 返回的 reason_label（服务端单一映射）；
+// 无则插到概要/端点/窗口标注/操作区的首个存在块之前（模板顺序 desc→reason→summary→endpoint-note→window-note→acts，
+// §11.1 钉死推荐语在概要上方），新块标题用 API 返回的 reason_label（服务端单一映射）；
 // 全部走 textContent 防 XSS（同 T-010/T-016 口径）
 function replaceReason(panel, text, label) {
   if (!panel) return;
@@ -450,8 +451,8 @@ function replaceReason(panel, text, label) {
   b.textContent = label || "推荐理由";
   el.appendChild(b);
   el.appendChild(document.createTextNode(text));
-  const acts = panel.querySelector(".acts");
-  if (acts) acts.insertAdjacentElement("beforebegin", el);
+  const anchor = panel.querySelector(".summary, .endpoint-note, .window-note, .acts");
+  if (anchor) anchor.insertAdjacentElement("beforebegin", el);
   else panel.appendChild(el);
 }
 

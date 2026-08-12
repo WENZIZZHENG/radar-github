@@ -14,6 +14,8 @@
   {% if r.description_en %}<div class="desc-en">{{ r.description_en }}</div>{% else %}<div class="desc-en na">（本仓库暂无描述）</div>{% endif %}
   {% if r.description_zh %}<div class="desc-zh">{{ r.description_zh }}</div>{% endif %}
   {% if r.reason %}<div class="reason"><b>{{ r.reason_label }}</b>{{ r.reason }}</div>{% endif %}
+  {# T-024：AI 概要块（§11）——推荐语下方、文档视角"是什么"；缺则整块不渲染（AI 降级形态，不留空框） #}
+  {% if r.summary %}<div class="summary"><b>AI 概要</b>{{ r.summary }}</div>{% endif %}
   {# T-020：端点快照日期标注（恒有；window_note 是异常才出现的标注——两者并存时端点日期在前） #}
   {% if r.endpoint_note %}<div class="endpoint-note">{{ r.endpoint_note }}</div>{% endif %}
   {% if r.window_note %}<div class="window-note">{{ r.window_note }}</div>{% endif %}

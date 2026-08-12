@@ -22,6 +22,7 @@ from app.ai import (
     DeepSeekError,
     ensure_daily_ai,
     has_cjk,
+    recommend_missing,
 )
 from app.collector.github import GitHubAuthError
 from app.db import get_conn, init_db
@@ -78,16 +79,20 @@ def _add_repo(
 
 
 class FakeDeepSeekClient:
-    """假 DeepSeek client：translate 回显"译文-<原文>"，recommend 记录全部入参回显"推荐语-<full_name>-<dimension>"。
+    """假 DeepSeek client：translate 回显"译文-<原文>"，recommend 记录全部入参回显"推荐语-<full_name>-<dimension>"，
+    summarize 记录全部入参回显"概要-<full_name>"（T-024 新增）。
 
-    fail_translate_for（按简介文本）/ fail_recommend_for（按 full_name）注入单条失败（失败不区分维度）。
+    fail_translate_for（按简介文本）/ fail_recommend_for（按 full_name）/ fail_summarize_for（按 full_name）
+    注入单条失败（失败不区分维度）。
     """
 
-    def __init__(self, *, fail_translate_for=(), fail_recommend_for=()):
+    def __init__(self, *, fail_translate_for=(), fail_recommend_for=(), fail_summarize_for=()):
         self.fail_translate_for = set(fail_translate_for)
         self.fail_recommend_for = set(fail_recommend_for)
+        self.fail_summarize_for = set(fail_summarize_for)
         self.translate_calls: list[str] = []
         self.recommend_calls: list[dict] = []
+        self.summarize_calls: list[dict] = []
 
     async def translate(self, text: str) -> str:
         self.translate_calls.append(text)
@@ -114,6 +119,14 @@ class FakeDeepSeekClient:
         if full_name in self.fail_recommend_for:
             raise DeepSeekError("模拟推荐语失败")
         return f"推荐语-{full_name}-{dimension}"
+
+    async def summarize(self, *, full_name, description, language, readme=None) -> str:
+        self.summarize_calls.append(
+            {"full_name": full_name, "description": description, "language": language, "readme": readme}
+        )
+        if full_name in self.fail_summarize_for:
+            raise DeepSeekError("模拟概要生成失败")
+        return f"概要-{full_name}"
 
 
 class FakeGitHubClient:
@@ -342,8 +355,10 @@ def test_translate_skips_cjk_null_and_already_translated(conn):
     assert zh["a/done"] == "已译"  # 已译不被覆盖
     assert stats["translated"] == 1 and stats["translate_failed"] == 0
     # 推荐语对上榜集全部生成（含无简介/中文原文的，不受翻译跳过影响）；每仓 3 维度（周＋季新区＋总星）
+    # ＋ 1 条概要（T-024：summary 段只走 summarize 方法，不产生 recommend_calls）
     assert {c["full_name"] for c in fake.recommend_calls} == {"a/cjk", "a/mixed", "a/no-desc", "a/done", "a/todo"}
     assert {c["dimension"] for c in fake.recommend_calls} == {"week", "quarter", "total"}  # T-018：无 90 天快照 → 季维度走新区
+    assert {c["full_name"] for c in fake.summarize_calls} == {"a/cjk", "a/mixed", "a/no-desc", "a/done", "a/todo"}
     no_desc_week = next(c for c in _calls_by_dim(fake, "week") if c["full_name"] == "a/no-desc")
     assert no_desc_week["description"] == "（无简介）"
 
@@ -357,11 +372,13 @@ def test_translate_backfills_listed_repos(conn):
     assert stats["listed"] == 2
     assert stats["translated"] == 2 and stats["translate_failed"] == 0
     assert stats["recommended"] == 6  # T-018：2 仓 ×（周＋季新区＋总星）3 维度
+    assert stats["summarized"] == 2  # T-024：2 仓各 1 条概要
     assert _zh_map(conn) == {"a/one": "译文-first project", "a/two": "译文-second project"}
 
 
 def test_recommend_inserted_with_repo_id_week_and_text(conn):
-    """推荐语落库三要素（repo_id＋维度＋期次标签＋text）；周维度入参携带跨榜累加的分类榜名与增量。"""
+    """推荐语落库三要素（repo_id＋维度＋期次标签＋text）；周维度入参携带跨榜累加的分类榜名与增量。
+    T-024：概要行同库并存（'summary'/'all'，全页面同一条）。"""
     _add_repo(conn, "a/py-ai", description_en="ai toolkit", topics=["ai"])  # Python 语言榜＋AI与智能 主题榜
     fake = FakeDeepSeekClient()
     stats = _run_ensure(conn, fake)
@@ -369,6 +386,7 @@ def test_recommend_inserted_with_repo_id_week_and_text(conn):
     rows = _recommend_rows(conn)
     assert rows == [
         ("a/py-ai", "quarter", QUARTER1, "推荐语-a/py-ai-quarter"),  # T-018：无 90 天快照 → 季维度新区
+        ("a/py-ai", "summary", "all", "概要-a/py-ai"),  # T-024：概要行，period_label 恒 'all'
         ("a/py-ai", "total", "all", "推荐语-a/py-ai-total"),
         ("a/py-ai", "week", WEEK1, "推荐语-a/py-ai-week"),
     ]
@@ -382,20 +400,26 @@ def test_recommend_inserted_with_repo_id_week_and_text(conn):
     assert q_call["pool_days"] == 7.0 and q_call["delta"] == 100  # 季新区：在池天数/在池增量（基线 = 7 天前快照）
     total_call = _calls_by_dim(fake, "total")[0]
     assert total_call["delta"] is None and total_call["stars"] is None  # 总星维度无增量/不引用数字
+    summary_call = fake.summarize_calls[0]
+    assert summary_call["full_name"] == "a/py-ai"
+    assert summary_call["description"] == "译文-ai toolkit"  # 概要输入优先中文简介
+    assert summary_call["language"] == "Python" and summary_call["readme"] is None  # 无 README 退化输入
 
 
 def test_same_week_rerun_idempotent(conn):
-    """同周跑两次幂等：第二轮翻译/推荐全跳过（已译＋同维度同期已存在），零 API 调用、库内零变化。"""
+    """同周跑两次幂等：第二轮翻译/推荐/概要全跳过（已译＋同维度同期已存在＋概要已生成），
+    零 API 调用、库内零变化。"""
     _add_repo(conn, "a/one", description_en="first project")
     fake = FakeDeepSeekClient()
     stats1 = _run_ensure(conn, fake)
     assert stats1["translated"] == 1 and stats1["recommended"] == 3  # T-018：周＋季新区＋总星
-    calls_after_first = (len(fake.translate_calls), len(fake.recommend_calls))
+    assert stats1["summarized"] == 1  # T-024：概要 1 条
+    calls_after_first = (len(fake.translate_calls), len(fake.recommend_calls), len(fake.summarize_calls))
     stats2 = _run_ensure(conn, fake)
     assert stats2["listed"] == 1  # 覆盖集照算
-    assert stats2["translated"] == 0 and stats2["recommended"] == 0
-    assert (len(fake.translate_calls), len(fake.recommend_calls)) == calls_after_first
-    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 3
+    assert stats2["translated"] == 0 and stats2["recommended"] == 0 and stats2["summarized"] == 0
+    assert (len(fake.translate_calls), len(fake.recommend_calls), len(fake.summarize_calls)) == calls_after_first
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 4  # 3 推荐语＋1 概要
 
 
 def test_new_week_regenerates_recommendation(conn):
@@ -475,7 +499,8 @@ def test_followed_unlisted_repo_gets_recommendations(conn):
 
 
 def test_single_item_failure_degrades(conn, caplog):
-    """单条失败降级：ensure 不抛、记 WARNING、其余项目正常、失败计入统计；翻译失败不连坐推荐。"""
+    """单条失败降级：ensure 不抛、记 WARNING、其余项目正常、失败计入统计；翻译失败不连坐推荐；
+    T-024：推荐语失败不连坐概要（summary 段独立计数）。"""
     _add_repo(conn, "a/bad-translate", description_en="boom translate")
     _add_repo(conn, "a/bad-recommend", description_en="fine desc")
     _add_repo(conn, "a/good", description_en="good desc")
@@ -484,11 +509,21 @@ def test_single_item_failure_degrades(conn, caplog):
         stats = _run_ensure(conn, fake)  # 不抛出即通过
     assert stats["translate_failed"] == 1 and stats["translated"] == 2
     assert stats["recommend_failed"] == 3 and stats["recommended"] == 6  # T-018：a/bad-recommend 周＋季新区＋总星各失败 1 条
+    assert stats["summarized"] == 3 and stats["summary_failed"] == 0  # T-024：概要不受推荐语失败连坐
     zh = _zh_map(conn)
     assert zh["a/bad-translate"] is None  # 翻译失败不留半成品
     assert zh["a/bad-recommend"] == "译文-fine desc" and zh["a/good"] == "译文-good desc"
-    # 两段独立：a/bad-translate 翻译失败仍用英文原文生成推荐语；a/bad-recommend 两维度都无推荐语
-    assert _recommend_names(conn) == {"a/bad-translate", "a/good"}
+    # 两段独立：a/bad-translate 翻译失败仍用英文原文生成推荐语；a/bad-recommend 三维度都无推荐语
+    # 但概要独立生成成功（三仓 summary 行都在）
+    assert _recommend_names(conn) == {"a/bad-translate", "a/bad-recommend", "a/good"}
+    summary_names = {
+        r["full_name"]
+        for r in conn.execute(
+            "SELECT r.full_name FROM recommendations c JOIN repos r ON r.id = c.repo_id"
+            " WHERE c.dimension = 'summary'"
+        )
+    }
+    assert summary_names == {"a/bad-translate", "a/bad-recommend", "a/good"}
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("AI 翻译失败，跳过 a/bad-translate" in m for m in messages)
     assert any("AI 推荐语生成失败，跳过 a/bad-recommend" in m for m in messages)
@@ -506,6 +541,8 @@ def test_empty_key_returns_zero_stats(conn, monkeypatch):
         "translate_failed": 0,
         "recommended": 0,
         "recommend_failed": 0,
+        "summarized": 0,
+        "summary_failed": 0,
         "readme_fetched": 0,
     }
     assert fake.translate_calls == [] and fake.recommend_calls == []
@@ -528,15 +565,18 @@ def test_auth_error_passes_through(conn):
 
 
 def test_partial_failure_converges_next_run_recommend(conn):
-    """断点续跑收敛（评审低-2）：第一轮推荐失败翻译成功 → 第二轮零翻译调用（已译跳过）、推荐补齐。"""
+    """断点续跑收敛（评审低-2）：第一轮推荐失败翻译成功（概要独立生成成功）→ 第二轮零翻译调用
+    （已译跳过）、推荐语补齐、概要不重生成。"""
     _add_repo(conn, "a/one", description_en="first project")
     stats1 = _run_ensure(conn, FakeDeepSeekClient(fail_recommend_for={"a/one"}))
     assert stats1["translated"] == 1 and stats1["recommend_failed"] == 3  # T-018：周＋季新区＋总星各失败 1 条
-    assert _recommend_names(conn) == set()
+    assert stats1["summarized"] == 1  # T-024：概要不随推荐语失败（独立段）
+    assert _recommend_names(conn) == {"a/one"}  # 仅有概要行落库（三维度推荐语全失败）
     fake2 = FakeDeepSeekClient()
     stats2 = _run_ensure(conn, fake2)
     assert fake2.translate_calls == []  # 已译跳过：零翻译调用
     assert stats2["recommended"] == 3
+    assert stats2["summarized"] == 0 and fake2.summarize_calls == []  # 概要已存在：幂等不重生成
     assert _recommend_names(conn) == {"a/one"}
 
 
@@ -744,6 +784,171 @@ def test_no_github_client_degrades_readme_silently(conn):
         "SELECT readme_sha FROM recommendations WHERE dimension = 'total'"
     ).fetchone()
     assert row["readme_sha"] is None
+
+
+# ---------- T-024：AI 概要（§11；全部 fake client，离线） ----------
+
+
+def test_client_summarize_prompt_shape():
+    """summarize prompt 钉死口径：README 文档视角"是什么/由什么组成"（§11.1 冻结文本逐字，评审 F3-1 对齐）、
+    段落级 3~5 句、不引用任何数字、只输出概要本体（无前缀/列表/标题）、低温度 0.3；输入含 README 截断文本。"""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "概要本体"}}]})
+
+    client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
+    asyncio.run(client.summarize(full_name="a/one", description="desc", language="Python", readme="readme body"))
+    asyncio.run(client.aclose())
+
+    system, user = bodies[0]["messages"][0]["content"], bodies[0]["messages"][1]["content"]
+    assert "3~5 句" in system  # 段落级句数要求
+    assert "这个项目是什么" in system and "由什么组成" in system  # README 文档视角（无维度概念，§11.1 冻结文本逐字）
+    assert "怎么用" not in system  # F3-1：冻结文本只钉"是什么/怎么组成"，不扩口径
+    assert "不要引用任何具体数字" in system  # 与 total 推荐语同口径：不引用数字（星数/增星/排名均为禁令列举）
+    assert "周榜" not in system and "季榜" not in system and "总星" not in system  # 无维度概念：与三维度推荐语可辨
+    assert "只输出概要本体" in system and "不要用列表或标题" in system  # 同 recommend 风格约束
+    assert bodies[0]["temperature"] == 0.3
+    assert "仓库：a/one" in user and "简介：desc" in user and "主语言：Python" in user
+    assert "README 要点：\nreadme body" in user
+    assert "categories" not in user and "星数" not in user  # 概要输入不带分类/星数
+
+
+def test_summary_skipped_when_refresh_false(conn):
+    """§11 无手动入口：refresh=False（手动批量 worker 路径）summary 段整段跳过——零 summarize 调用、
+    库内无 summary 行；推荐语补缺照常。"""
+    _add_repo(conn, "a/one", description_en="first project")
+    fake = FakeDeepSeekClient()
+    stats = asyncio.run(recommend_missing(conn, fake, now=AS_OF_DT, refresh=False))
+    assert stats["summarized"] == 0 and stats["summary_failed"] == 0
+    assert fake.summarize_calls == []
+    assert stats["recommended"] == 3  # 三维度推荐语照常补缺
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE dimension = 'summary'").fetchone()[0] == 0
+
+
+def test_summary_generated_for_scope_and_idempotent(conn):
+    """覆盖 S 全集（上榜∪关注）：缺失生成 ('summary','all') 行（period_label 恒 'all'、generated_week 当周）；
+    同轮同仓只生成一条（existing 防御）；次轮幂等零调用。"""
+    _add_repo(conn, "a/one", description_en="first project")
+    _add_repo(conn, "f/watched", description_en="watched but quiet", listed=False)
+    conn.execute(
+        "INSERT INTO follows (repo_id, created_at) VALUES ((SELECT id FROM repos WHERE full_name = 'f/watched'), ?)",
+        ("2026-07-02T00:00:00Z",),
+    )
+    conn.commit()
+    fake = FakeDeepSeekClient()
+    stats = _run_ensure(conn, fake)
+    assert stats["summarized"] == 2 and stats["summary_failed"] == 0
+    assert [c["full_name"] for c in fake.summarize_calls] == ["f/watched", "a/one"]  # all_names 序：关注集在前、三榜去重在后（每仓恰好一条，existing 防御）
+    rows = conn.execute(
+        "SELECT r.full_name, c.period_label, c.generated_week FROM recommendations c"
+        " JOIN repos r ON r.id = c.repo_id WHERE c.dimension = 'summary' ORDER BY r.full_name"
+    ).fetchall()
+    assert [(r["full_name"], r["period_label"], r["generated_week"]) for r in rows] == [
+        ("a/one", "all", WEEK1),
+        ("f/watched", "all", WEEK1),
+    ]
+    fake2 = FakeDeepSeekClient()
+    stats2 = _run_ensure(conn, fake2)
+    assert stats2["summarized"] == 0 and fake2.summarize_calls == []  # 已生成：幂等不重刷
+
+
+def test_summary_sha_change_regenerates(conn):
+    """README blob sha 变化 → summary 行 REPLACE 重生并更新 sha（README 变更当日重生，懒口径不每周重刷）。"""
+    _add_repo(conn, "a/one", description_en="first project")
+    github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
+    fake1 = FakeDeepSeekClient()
+    _run_ensure(conn, fake1, github_client=github)
+    row = conn.execute(
+        "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-v1"
+
+    github.readmes["a/one"] = ("v2 readme", "sha-v2")
+    fake2 = FakeDeepSeekClient()
+    stats2 = _run_ensure(conn, fake2, github_client=github)
+    assert stats2["summarized"] == 1  # 仅概要 REPLACE 重生
+    assert stats2["recommended"] == 1  # total 段同触发（README 变更当日 total 也重生）
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE dimension = 'summary'").fetchone()[0] == 1
+    row = conn.execute(
+        "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-v2"
+
+    stats3 = _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
+    assert stats3["summarized"] == 0  # sha 未再变：懒口径不重刷
+
+
+def test_summary_sha_none_keeps_existing(conn):
+    """F2-1 守卫（与 total 段同款）：已有行＋本次 sha 未取到（拉取失败）→ 不触发重生、旧指纹保留。"""
+    _add_repo(conn, "a/one", description_en="first project")
+    github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
+    _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
+    row = conn.execute(
+        "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-v1"
+
+    github.fail_for = {"a/one"}  # 本次拉取抛普通异常 → sha=None
+    fake2 = FakeDeepSeekClient()
+    stats2 = _run_ensure(conn, fake2, github_client=github)
+    assert stats2["summarized"] == 0 and fake2.summarize_calls == []
+    row = conn.execute(
+        "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-v1"
+
+
+def test_summary_single_failure_counts_and_continues(conn, caplog):
+    """单条概要失败：记 WARNING 跳过计入 summary_failed、其余仓正常；不连坐推荐语段。"""
+    _add_repo(conn, "a/bad", description_en="bad desc")
+    _add_repo(conn, "a/good", description_en="good desc")
+    fake = FakeDeepSeekClient(fail_summarize_for={"a/bad"})
+    with caplog.at_level(logging.WARNING, logger="app.ai"):
+        stats = _run_ensure(conn, fake)  # 不抛出即通过
+    assert stats["summarized"] == 1 and stats["summary_failed"] == 1
+    assert stats["recommended"] == 6  # 推荐语段不受概要失败影响
+    summary_names = {
+        r["full_name"]
+        for r in conn.execute(
+            "SELECT r.full_name FROM recommendations c JOIN repos r ON r.id = c.repo_id"
+            " WHERE c.dimension = 'summary'"
+        )
+    }
+    assert summary_names == {"a/good"}  # a/bad 无概要行（不留半成品）
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("AI 概要生成失败，跳过 a/bad" in m for m in messages)
+
+
+def test_summary_auth_error_passes_through(conn):
+    """DeepSeekAuthError 直通契约（同推荐语段）：概要段不吞账户类错误——整轮抛出、当条不落库。"""
+    _add_repo(conn, "a/one", description_en="first project")
+
+    class AuthSummarizeClient(FakeDeepSeekClient):
+        async def summarize(self, **kwargs):
+            raise DeepSeekAuthError("模拟 key 无效")
+
+    with pytest.raises(DeepSeekAuthError):
+        _run_ensure(conn, AuthSummarizeClient())
+    assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE dimension = 'summary'").fetchone()[0] == 0
+
+
+def test_summary_reuses_readme_state_cache(conn):
+    """README 复用同一 _ReadmeState 实例：total 段与 summary 段同轮同仓只拉一次（逐仓缓存命中）；
+    summary 输入带 README 截断文本（同一 README_HEAD_CHARS 截断约定）；readme_sha 落库。"""
+    _add_repo(conn, "a/one", description_en="first project")
+    readme_text = "# First\n\n" + "x" * 10000  # 超截断上限
+    github = FakeGitHubClient(readmes={"a/one": (readme_text, "sha-abc")})
+    fake = FakeDeepSeekClient()
+    stats = _run_ensure(conn, fake, github_client=github)
+    assert stats["readme_fetched"] == 1
+    assert github.readme_calls == ["a/one"]  # 缓存复用：三维度＋概要同轮只拉一次
+    assert fake.summarize_calls[0]["readme"] == "# First\n\n" + "x" * (8000 - 9)  # 与 recommend 同一截断口径
+    row = conn.execute(
+        "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-abc"
 
 
 # ---------- T-018：新区仓进覆盖集（入池语境 prompt 分化；全部 fake client，离线） ----------

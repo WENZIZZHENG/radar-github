@@ -71,12 +71,16 @@ def _seed_full(conn):
     conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_go, "2026-08-02T00:00:00Z"))
     # T-017 推荐语按 (dimension, period_label) 展示：总星行文本供 /total（时间稳健）断言；
     # 周/季行按固定期次标签插入（2026-W32/2026-Q3），供历史周/季页时间稳健断言
+    # T-024 概要行：dimension='summary' 且 period_label='all'（全页面同一条，文档视角）；
+    # a/py 与 a/go 各一条（关注页走 a/go 的概要断言），a/rise 无概要行（降级断言）
     conn.execute(
         "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
         " VALUES (?, 'total', 'all', '本周亮点：测试推荐语', NULL, '2026-W32'),"
         " (?, 'week', '2026-W32', '周报亮点：周推荐语', NULL, '2026-W32'),"
-        " (?, 'quarter', '2026-Q3', '季报亮点：季推荐语', NULL, '2026-W32')",
-        (repo_py, repo_py, repo_py),
+        " (?, 'quarter', '2026-Q3', '季报亮点：季推荐语', NULL, '2026-W32'),"
+        " (?, 'summary', 'all', '概要文本：Python 库', NULL, '2026-W32'),"
+        " (?, 'summary', 'all', '概要文本：Go 库', NULL, '2026-W32')",
+        (repo_py, repo_py, repo_py, repo_py, repo_go),
     )
     conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, ?)", (repo_py, "选型观察"))
 
@@ -354,15 +358,48 @@ def test_display_maps_dimension_mapping(tmp_path, monkeypatch):
             (repo_id, week_label, week_label, repo_id, quarter_label, week_label, repo_id, week_label),
         )
         conn.commit()
-        reasons_w, _, _ = _display_maps(conn, dimension="week", period_label=week_label)
+        reasons_w, _, _, _ = _display_maps(conn, dimension="week", period_label=week_label)
         assert reasons_w == {"a/one": "周文本"}
-        reasons_q, _, _ = _display_maps(conn, dimension="quarter", period_label=quarter_label)
+        reasons_q, _, _, _ = _display_maps(conn, dimension="quarter", period_label=quarter_label)
         assert reasons_q == {"a/one": "季文本"}
-        reasons_t, _, _ = _display_maps(conn, dimension="total", period_label="all")
+        reasons_t, _, _, _ = _display_maps(conn, dimension="total", period_label="all")
         assert reasons_t == {"a/one": "总星文本"}
         # 缺该维度行 → 无推荐语块（dict 空，降级形态）
-        reasons_empty, _, _ = _display_maps(conn, dimension="week", period_label="2026-W01")
+        reasons_empty, _, _, _ = _display_maps(conn, dimension="week", period_label="2026-W01")
         assert reasons_empty == {}
+    finally:
+        conn.close()
+
+
+def test_display_maps_summary_fixed_mapping(tmp_path, monkeypatch):
+    """T-024：概要展示映射固定取 dimension='summary' 且 period_label='all'（无维度概念，全页面同一条）；
+    缺该维度行 → 无概要（dict 空，降级形态）。"""
+    from app.web.routes import _display_maps
+
+    db = tmp_path / "map.db"
+    init_db(db)
+    conn = get_conn(db)
+    try:
+        repo_id = _add_repo(
+            conn,
+            "a/one",
+            language="Python",
+            description_en="desc",
+            snapshots=[(f"{SNAP_DAY}T00:00:00Z", 100)],
+        )
+        conn.execute(
+            "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+            " VALUES (?, 'summary', 'all', '概要文本', NULL, '2026-W32'),"
+            " (?, 'summary', '2026-W31', '概要文本-旧期', NULL, '2026-W31')",
+            (repo_id, repo_id),
+        )
+        conn.commit()
+        _, _, _, summaries = _display_maps(conn, dimension="total", period_label="all")
+        assert summaries == {"a/one": "概要文本"}  # 只取 ('summary', 'all')，旧期标签行不展示
+        conn.execute("DELETE FROM recommendations WHERE dimension = 'summary' AND period_label = 'all'")
+        conn.commit()
+        _, _, _, summaries_gone = _display_maps(conn, dimension="total", period_label="all")
+        assert summaries_gone == {}  # 缺概要行 → dict 空（降级形态，不留空框）
     finally:
         conn.close()
 
@@ -402,6 +439,41 @@ def test_follows_page_has_recommend_button(follows_client):
     """关注页 P6 行内推荐按钮就位（§8.2：total 维度操作）；无推荐语时按钮按态"生成推荐语"。"""
     text = follows_client.get("/follows").text
     assert 'class="recommend-btn" data-repo="f/ts-hot" data-dim="total" data-period-label="all" data-has-reason="0">生成推荐语</button>' in text
+
+
+# ---------- T-024：AI 概要块展示（§11：推荐语块下方、全页面同一条；缺则无块） ----------
+
+
+def test_row_summary_block_on_history_week_page(client):
+    """历史周页（as_of 固定，时间稳健）：行面板推荐语块下方渲染"AI 概要"块＋概要文本；
+    无概要行的仓（a/rise 新区行）不渲染概要块。"""
+    text = client.get(f"/?week={WEEK_LABEL}").text
+    assert "概要文本：Python 库" in text and "概要文本：Go 库" in text  # 概要文本随行渲染
+    # a/py、a/go 各跨两个榜（语言榜＋主题榜）渲染两行 → 4 块；a/rise 新区行无概要行 → 无块（降级）
+    assert text.count('<div class="summary"><b>AI 概要</b>') == 4
+    assert text.index("周报亮点：周推荐语") < text.index("概要文本：Python 库")  # 概要块位于推荐语块下方（模板顺序 reason → summary）
+
+
+def test_row_summary_block_on_follows_page(follows_client):
+    """关注页 P6：关注的仓渲染概要块（a/go 有 summary 行，seed 自造）；无概要的仓无块。"""
+    text = follows_client.get("/follows").text
+    assert "概要文本：Go 库" not in text  # follows_client 是 _seed_follows（无概要行）→ 全页无概要块（降级）
+    assert '<div class="summary">' not in text
+
+
+def test_row_summary_block_on_follows_page_seeded(client):
+    """关注页 P6（_seed_full 语境走关注页）：a/go 被关注且有 summary 行 → 概要块渲染（全页面同一条）。"""
+    resp = client.get("/follows")
+    assert resp.status_code == 200
+    text = resp.text
+    assert "概要文本：Go 库" in text
+    assert text.count('<div class="summary"><b>AI 概要</b>') == 1  # 仅 a/go（关注集只有它）
+
+
+def test_no_summary_row_renders_no_summary_block(fresh_client):
+    """降级：库内无任何 summary 行 → 页面无 .summary 元素（不留空框，AI 失败永不阻塞出榜）。"""
+    text = fresh_client.get("/total").text
+    assert "AI 概要" not in text and 'class="summary"' not in text
 
 
 # ---------- T-018：新崛起区（决策 4 v2；内容断言走历史期次页/total，遵守本文件时间稳健约定） ----------

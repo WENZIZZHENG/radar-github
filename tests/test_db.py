@@ -163,3 +163,129 @@ def test_recommendations_migration_idempotent(tmp_path):
         assert (row["dimension"], row["period_label"]) == ("week", "2026-W32")  # 无重复行（未二次搬入）
     finally:
         conn.close()
+
+
+# ---------- T-024：recommendations 3 值 CHECK → 4 值 CHECK（'summary'）幂等迁移 ----------
+
+
+def _make_three_value_recommendations(db, *, text="旧总星文本", sha="sha-old"):
+    """把新库的 recommendations 换成 T-017 3 值 CHECK 结构（无 'summary'）并塞旧行。"""
+    conn = get_conn(db)
+    conn.execute("DROP TABLE recommendations")
+    conn.execute(
+        "CREATE TABLE recommendations ("
+        "  repo_id INTEGER NOT NULL REFERENCES repos (id),"
+        "  dimension TEXT NOT NULL CHECK (dimension IN ('week', 'quarter', 'total')),"
+        "  period_label TEXT NOT NULL,"
+        "  text TEXT NOT NULL,"
+        "  readme_sha TEXT,"
+        "  generated_week TEXT NOT NULL,"
+        "  PRIMARY KEY (repo_id, dimension, period_label)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX idx_recommendations_dim_period ON recommendations (dimension, period_label)"
+    )
+    conn.execute(
+        "INSERT INTO repos (full_name, node_id, source, created_at) VALUES (?, ?, ?, ?)",
+        ("octocat/three", "node-three", "initial", "2026-07-01T00:00:00Z"),
+    )
+    rid = conn.execute("SELECT id FROM repos WHERE full_name = 'octocat/three'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', ?, ?, '2026-W31')",
+        (rid, text, sha),
+    )
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def test_summary_migration_from_three_value_check(tmp_path):
+    """3 值 CHECK 旧表 → init_db 后可插 'summary' 行（CHECK 已升级）；旧数据行保留（全列搬移）；索引在。"""
+    db = tmp_path / "three.db"
+    init_db(db)
+    rid = _make_three_value_recommendations(db)
+    init_db(db)  # 触发 summary 迁移
+
+    conn = get_conn(db)
+    try:
+        # 旧行全列保留（readme_sha 指纹一并搬移，不能丢）
+        rows = conn.execute(
+            "SELECT repo_id, dimension, period_label, text, readme_sha, generated_week FROM recommendations"
+        ).fetchall()
+        assert [(r["repo_id"], r["dimension"], r["period_label"], r["text"], r["readme_sha"], r["generated_week"]) for r in rows] == [
+            (rid, "total", "all", "旧总星文本", "sha-old", "2026-W31")
+        ]
+        # 新 CHECK 允许 'summary' 维度（3 值 CHECK 的旧表插这条会 IntegrityError）
+        conn.execute(
+            "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+            " VALUES (?, 'summary', 'all', 'AI 概要文本', NULL, '2026-W32')",
+            (rid,),
+        )
+        conn.commit()
+        indexes = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert "idx_recommendations_dim_period" in indexes
+    finally:
+        conn.close()
+
+
+def test_summary_migration_idempotent(tmp_path):
+    """迁移后再次 init_db：不重复迁移、行数不变、表结构保持 4 值（幂等语义）。"""
+    db = tmp_path / "three.db"
+    init_db(db)
+    _make_three_value_recommendations(db)
+    init_db(db)
+    init_db(db)  # 第三次：已含 'summary' 再跑
+
+    conn = get_conn(db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 1  # 未二次搬入
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'recommendations'"
+        ).fetchone()[0]
+        assert "'summary'" in sql  # 最终结构 = 4 值 CHECK
+    finally:
+        conn.close()
+
+
+def test_summary_allowed_on_fresh_db(tmp_path):
+    """新装库（schema.sql 直接建最终结构）：无需迁移即可插 'summary' 行。"""
+    db = tmp_path / "fresh.db"
+    init_db(db)
+    conn = get_conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, source, created_at) VALUES (?, ?, ?, ?)",
+            ("octocat/fresh", "node-fresh", "initial", "2026-07-01T00:00:00Z"),
+        )
+        rid = conn.execute("SELECT id FROM repos WHERE full_name = 'octocat/fresh'").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+            " VALUES (?, 'summary', 'all', 'AI 概要文本', NULL, '2026-W32')",
+            (rid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_invalid_dimension_rejected_by_check(tmp_path):
+    """CHECK 约束真实生效：'summary' 之外的非法 dimension 插行必须 IntegrityError（防静默放宽）。"""
+    db = tmp_path / "check.db"
+    init_db(db)
+    conn = get_conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, source, created_at) VALUES (?, ?, ?, ?)",
+            ("octocat/check", "node-check", "initial", "2026-07-01T00:00:00Z"),
+        )
+        rid = conn.execute("SELECT id FROM repos WHERE full_name = 'octocat/check'").fetchone()["id"]
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+                " VALUES (?, 'bogus', 'all', 'x', NULL, '2026-W32')",
+                (rid,),
+            )
+    finally:
+        conn.close()

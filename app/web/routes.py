@@ -13,7 +13,9 @@
 - 推荐语写端点（T-017）：单个强制重生 / 批量只补缺失（见 /api/recommend、/api/recommend-missing，
   《交互流程说明》§8.4 钉死口径；不触碰 repos 翻译字段）；
 - 本层对 recommendations 表展示映射按 (dimension, period_label) 取（§8.1：周页→周文本、季页→季文本、
-  总星/关注/标签页→总星文本），缺则该行无推荐语块（AI 降级形态）。
+  总星/关注/标签页→总星文本），缺则该行无推荐语块（AI 降级形态）；
+- AI 概要（T-024，§11）：展示映射固定取 dimension='summary' 且 period_label='all'（文档视角、无维度概念、
+  全页面同一条，S 全集覆盖），缺则该行无概要块（AI 降级形态，不留空框）；无任何手动生成入口。
 """
 
 from __future__ import annotations
@@ -324,7 +326,7 @@ def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_o
     return cards
 
 
-def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> list[dict]:
+def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict, summaries: dict) -> list[dict]:
     """P6 分组区（流程说明 §2A）：按语言分 7 组（classify_language 同口径；空组不进结果即不渲染）。
 
     组内三态排序：正常行按当周增量降序 → 无增量行（"—— 下周起有数据"）→ dead 行（灰显"已失效"）沉尾；
@@ -360,6 +362,7 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
                     "description_en": r["description_en"],
                     "description_zh": zh.get(r["full_name"]),
                     "reason": reasons.get(r["full_name"]),  # None → 无推荐语块（AI 降级形态）
+                    "summary": summaries.get(r["full_name"]),  # None → 无概要块（AI 降级形态，T-024）
                     "tags": tags.get(r["full_name"], []),
                     "endpoint_note": r["endpoint_note"],
                     "window_note": r["window_note"],
@@ -384,10 +387,12 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
 
 def _display_maps(
     conn: sqlite3.Connection, *, dimension: str, period_label: str
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """详情面板展示映射（recommendations / description_zh / tags 三张表全部只读）：
     - 推荐理由 recommendations：按 (维度, 期次标签) 取（§8.1 展示映射）——周页 ('week', 当周标签)、
       季页 ('quarter', 当季标签)、总星榜/关注页/标签结果页 ('total', 'all')；缺则该行无推荐语块（AI 降级）；
+    - AI 概要 recommendations：固定取 dimension='summary' 且 period_label='all'（T-024 §11：文档视角、
+      无维度概念、全页面同一条），缺则该行无概要块（AI 降级形态，不留空框）；
     - 中文描述 description_zh：懒写入，当前全 NULL → 只显示英文（AI 降级口径，流程说明 §4）；
     - 标签 tags：每行 chips 数据源（行内增删走 /api/tags、结果页跳转 /tags/<tag>，T-010 接线）。
     """
@@ -398,11 +403,17 @@ def _display_maps(
             (dimension, period_label),
         ).fetchall()
     )
+    summaries = dict(
+        conn.execute(
+            "SELECT r.full_name, c.text FROM recommendations c JOIN repos r ON r.id = c.repo_id"
+            " WHERE c.dimension = 'summary' AND c.period_label = 'all'"
+        ).fetchall()
+    )
     zh = dict(conn.execute("SELECT full_name, description_zh FROM repos WHERE description_zh IS NOT NULL").fetchall())
     tags: dict[str, list[str]] = {}
     for row in conn.execute("SELECT r.full_name, t.tag FROM tags t JOIN repos r ON r.id = t.repo_id ORDER BY t.tag"):
         tags.setdefault(row["full_name"], []).append(row["tag"])
-    return reasons, zh, tags
+    return reasons, zh, tags, summaries
 
 
 def _reason_label(dimension: str, period_label: str) -> str:
@@ -439,6 +450,7 @@ def _row_view(
     period: str,
     followed: set,
     reasons: dict,
+    summaries: dict,
     zh: dict,
     tags: dict,
     reason_dim: str = "total",
@@ -476,6 +488,7 @@ def _row_view(
         "description_en": row.description_en,
         "description_zh": zh.get(row.full_name),
         "reason": reasons.get(row.full_name),  # None → 无推荐语块（AI 降级形态，不留空框）
+        "summary": summaries.get(row.full_name),  # None → 无概要块（AI 降级形态，不留空框，T-024）
         "tags": tags.get(row.full_name, []),
         "endpoint_note": _endpoint_note(row.captured_at),
         "window_note": window_note,
@@ -506,6 +519,7 @@ def _rising_row_view(rank: int, row: RisingRow, **row_ctx) -> dict:
         "description_en": row.description_en,
         "description_zh": row_ctx["zh"].get(row.full_name),
         "reason": row_ctx["reasons"].get(row.full_name),  # None → 无推荐语块（AI 降级形态，不留空框）
+        "summary": row_ctx["summaries"].get(row.full_name),  # None → 无概要块（AI 降级形态，不留空框，T-024）
         "tags": row_ctx["tags"].get(row.full_name, []),
         "endpoint_note": _endpoint_note(row.captured_at),
         "window_note": None,
@@ -557,15 +571,16 @@ def _boards_context(
         followed = {r["full_name"] for r in follow_rows}
 
         # T-017 展示映射（§8.1）：按实际展示期次取 (dimension, period_label)——首期空态降级为 total
-        # 时按 total 取（页面行即总星榜行，按钮维度与展示一致）
+        # 时按 total 取（页面行即总星榜行，按钮维度与展示一致）；T-024 概要固定取 ('summary', 'all')
         rec_ctx = _page_recommend_ctx(effective_period, as_of_date)
-        reasons, zh, tags = _display_maps(
+        reasons, zh, tags, summaries = _display_maps(
             conn, dimension=rec_ctx["reason_dim"], period_label=rec_ctx["reason_period_label"]
         )
         row_ctx = {
             "period": effective_period,
             "followed": followed,
             "reasons": reasons,
+            "summaries": summaries,
             "zh": zh,
             "tags": tags,
             "reason_dim": rec_ctx["reason_dim"],
@@ -660,8 +675,9 @@ def follows_page(request: Request) -> HTMLResponse:
             " FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
         ).fetchall()
         cards = _follow_cards(conn, follow_rows, now.strftime(_ISO_FMT))
-        # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块
-        reasons, zh, tags = _display_maps(conn, dimension="total", period_label="all")
+        # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块；
+        # T-024：概要固定取 ('summary', 'all')（文档视角，全页面同一条），缺则该行无概要块
+        reasons, zh, tags, summaries = _display_maps(conn, dimension="total", period_label="all")
         return templates.TemplateResponse(
             request=request,
             name="follows.html",
@@ -671,7 +687,7 @@ def follows_page(request: Request) -> HTMLResponse:
                 "title": "我的关注",
                 "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
                 "follow_count": len(follow_rows),
-                "groups": _follow_groups(cards, reasons, zh, tags),
+                "groups": _follow_groups(cards, reasons, zh, tags, summaries),
             },
         )
     finally:
@@ -867,6 +883,7 @@ def _tag_row_view(
     *,
     followed: set,
     reasons: dict,
+    summaries: dict,
     zh: dict,
     tags: dict,
 ) -> dict:
@@ -889,6 +906,7 @@ def _tag_row_view(
         "description_en": row["description_en"],
         "description_zh": zh.get(row["full_name"]),
         "reason": reasons.get(row["full_name"]),  # None → 无推荐语块（AI 降级形态，不留空框）
+        "summary": summaries.get(row["full_name"]),  # None → 无概要块（AI 降级形态，不留空框，T-024）
         "tags": tags.get(row["full_name"], []),
         "endpoint_note": _endpoint_note(captured_at),
         "window_note": None,
@@ -952,12 +970,12 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
         starred.sort(key=lambda t: (-(t[0] or 0), t[2]["full_name"]))  # 无快照行按 0 沉底，同星按名稳定
 
         # T-017（§8.1）：标签结果页同总星榜语境 → 总星维度文本；行内推荐按钮不渲染（_tag_row_view）
-        reasons, zh, tags = _display_maps(conn, dimension="total", period_label="all")
+        reasons, zh, tags, summaries = _display_maps(conn, dimension="total", period_label="all")
         follow_rows = conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id").fetchall()
         followed = {r["full_name"] for r in follow_rows}
         view_rows = [
             _tag_row_view(
-                i + 1, row, stars, captured_at, followed=followed, reasons=reasons, zh=zh, tags=tags
+                i + 1, row, stars, captured_at, followed=followed, reasons=reasons, summaries=summaries, zh=zh, tags=tags
             )
             for i, (stars, captured_at, row) in enumerate(starred)
         ]

@@ -201,13 +201,13 @@ h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 @keyframes pin { from { opacity: 0; transform: translateY(-4px); } }
 .panel .desc-en { color: var(--text-3); font-size: 12.5px; line-height: 1.6; }
 .panel .desc-zh { font-size: 13.5px; color: var(--text-1); line-height: 1.65; margin-top: 3px; }
-/* 推荐理由：琥珀色调信息块，与绿色增量区分开语义 */
-.panel .reason {
+/* 推荐理由（琥珀色调信息块，与绿色增量区分开语义）＋ AI 概要（T-024 §11：同款信息块，概要在推荐语下方） */
+.panel .reason, .panel .summary {
   font-size: 12.5px; line-height: 1.6; color: var(--text-2);
   background: var(--reason-bg); border: 1px solid var(--reason-line); border-radius: var(--r-m);
   padding: 7px 11px; margin-top: 9px;
 }
-.panel .reason b { color: var(--gold); font-weight: 600; font-size: 11px; letter-spacing: .08em; margin-right: 6px; }
+.panel .reason b, .panel .summary b { color: var(--gold); font-weight: 600; font-size: 11px; letter-spacing: .08em; margin-right: 6px; }
 .panel .acts { margin-top: var(--s3); display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
 .panel .gh {
   display: inline-flex; align-items: center; gap: 6px;
