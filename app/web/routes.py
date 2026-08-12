@@ -232,6 +232,15 @@ def _fmt_delta(delta: int) -> str:
     return f"{delta:+,}"
 
 
+def _endpoint_note(captured_at: str | None) -> str | None:
+    """端点快照日期标注（T-020，流程说明 §10）：定长 ISO 前 10 字符直接切片（schema 硬约定，不做日期解析）。
+
+    四个行视图装配点共用的展示字段，None → 模板不渲染（防御行）。"""
+    if captured_at is None:
+        return None
+    return f"端点快照 {captured_at[:10]}"
+
+
 def _meta(conn: sqlite3.Connection, period: str, as_of_date: date) -> dict:
     """元信息行（流程说明 §2 第 1 层）：统计窗口、生成时间（UTC+8）、跟踪池规模、口径说明。"""
     nominal = _NOMINAL_DAYS.get(period)
@@ -265,13 +274,16 @@ def _fallback_notice(conn: sqlite3.Connection, period: str, label: str, as_of_da
     return f"{label} 增量榜全部缺席（统计窗口内快照不足），当前显示总星榜。"
 
 
-def _endpoint_stars(conn: sqlite3.Connection, repo_id: int, before: str) -> int | None:
-    """dead 关注仓库的端点星数：与 app.report._ENDPOINT_SQL 同一主键索引 seek 模式（每仓库一次 LIMIT 1）。"""
-    row = conn.execute(
-        "SELECT stars FROM star_snapshots WHERE repo_id = ? AND captured_at <= ? ORDER BY captured_at DESC LIMIT 1",
+def _endpoint_snapshot(conn: sqlite3.Connection, repo_id: int, before: str) -> sqlite3.Row | None:
+    """dead 关注/标签页仓库的端点快照（stars＋captured_at）：与 app.report._ENDPOINT_SQL 同一主键索引 seek 模式（每仓库一次 LIMIT 1）。
+
+    T-020 起连 captured_at 一并取（行面板端点日期标注的数据源）；None = 该仓 as_of 前无快照。
+    """
+    return conn.execute(
+        "SELECT stars, captured_at FROM star_snapshots WHERE repo_id = ? AND captured_at <= ? "
+        "ORDER BY captured_at DESC LIMIT 1",
         (repo_id, before),
     ).fetchone()
-    return None if row is None else row["stars"]
 
 
 def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_of: str) -> list[dict]:
@@ -286,8 +298,11 @@ def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_o
     cards = []
     for r in follow_rows:
         info = deltas.get(r["id"])
-        stars = info.stars if info is not None else _endpoint_stars(conn, r["id"], as_of)
+        endpoint = None if info is not None else _endpoint_snapshot(conn, r["id"], as_of)  # dead 仓旁路补取
+        stars = info.stars if info is not None else (None if endpoint is None else endpoint["stars"])
         delta = info.delta if info is not None else None
+        # T-020：端点日期标注数据源——出席/缺席仓取 deltas 透传值，dead 仓取旁路快照；两路都可能是 None（防御）
+        captured_at = info.captured_at if info is not None else (None if endpoint is None else endpoint["captured_at"])
         window_note = None
         if info is not None and info.window_days is not None and abs(info.window_days - _NOMINAL_DAYS["week"]) > 0.05:
             # 与榜单行同一标注口径（决策 4：窗口异常必须标注实际天数）
@@ -302,6 +317,7 @@ def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_o
                 "delta_text": _fmt_delta(delta) if delta is not None else None,
                 "delta_neg": delta is not None and delta < 0,
                 "stars_text": None if stars is None else _fmt_stars(stars),
+                "endpoint_note": _endpoint_note(captured_at),
                 "window_note": window_note,
             }
         )
@@ -345,6 +361,7 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict) -> li
                     "description_zh": zh.get(r["full_name"]),
                     "reason": reasons.get(r["full_name"]),  # None → 无推荐语块（AI 降级形态）
                     "tags": tags.get(r["full_name"], []),
+                    "endpoint_note": r["endpoint_note"],
                     "window_note": r["window_note"],
                     # T-017（§8.1/§8.2）：关注页长期盯梢语境 → 总星维度文本；行内按钮按 total 操作
                     "reason_dim": "total",
@@ -460,6 +477,7 @@ def _row_view(
         "description_zh": zh.get(row.full_name),
         "reason": reasons.get(row.full_name),  # None → 无推荐语块（AI 降级形态，不留空框）
         "tags": tags.get(row.full_name, []),
+        "endpoint_note": _endpoint_note(row.captured_at),
         "window_note": window_note,
         "reason_dim": reason_dim,
         "reason_period_label": reason_period_label,
@@ -489,6 +507,7 @@ def _rising_row_view(rank: int, row: RisingRow, **row_ctx) -> dict:
         "description_zh": row_ctx["zh"].get(row.full_name),
         "reason": row_ctx["reasons"].get(row.full_name),  # None → 无推荐语块（AI 降级形态，不留空框）
         "tags": row_ctx["tags"].get(row.full_name, []),
+        "endpoint_note": _endpoint_note(row.captured_at),
         "window_note": None,
         "reason_dim": row_ctx["reason_dim"],
         "reason_period_label": row_ctx["reason_period_label"],
@@ -844,6 +863,7 @@ def _tag_row_view(
     rank: int,
     row: sqlite3.Row,
     stars: int | None,
+    captured_at: str | None,
     *,
     followed: set,
     reasons: dict,
@@ -870,6 +890,7 @@ def _tag_row_view(
         "description_zh": zh.get(row["full_name"]),
         "reason": reasons.get(row["full_name"]),  # None → 无推荐语块（AI 降级形态，不留空框）
         "tags": tags.get(row["full_name"], []),
+        "endpoint_note": _endpoint_note(captured_at),
         "window_note": None,
         "reason_dim": "total",
         "reason_period_label": "all",
@@ -924,16 +945,21 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
         ).fetchall()
         starred = []
         for r in rows:
-            starred.append((_endpoint_stars(conn, r["id"], as_of), r))
-        starred.sort(key=lambda t: (-(t[0] or 0), t[1]["full_name"]))  # 无快照行按 0 沉底，同星按名稳定
+            endpoint = _endpoint_snapshot(conn, r["id"], as_of)
+            stars = None if endpoint is None else endpoint["stars"]
+            captured_at = None if endpoint is None else endpoint["captured_at"]
+            starred.append((stars, captured_at, r))
+        starred.sort(key=lambda t: (-(t[0] or 0), t[2]["full_name"]))  # 无快照行按 0 沉底，同星按名稳定
 
         # T-017（§8.1）：标签结果页同总星榜语境 → 总星维度文本；行内推荐按钮不渲染（_tag_row_view）
         reasons, zh, tags = _display_maps(conn, dimension="total", period_label="all")
         follow_rows = conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id").fetchall()
         followed = {r["full_name"] for r in follow_rows}
         view_rows = [
-            _tag_row_view(i + 1, row, stars, followed=followed, reasons=reasons, zh=zh, tags=tags)
-            for i, (stars, row) in enumerate(starred)
+            _tag_row_view(
+                i + 1, row, stars, captured_at, followed=followed, reasons=reasons, zh=zh, tags=tags
+            )
+            for i, (stars, captured_at, row) in enumerate(starred)
         ]
         return templates.TemplateResponse(
             request=request,

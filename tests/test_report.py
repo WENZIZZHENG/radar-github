@@ -434,3 +434,25 @@ def test_rising_repeats_across_boards(conn, topic_table):
     boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
     assert [r.full_name for r in _board(boards, "topic", "ai").rising_rows] == ["a/ai-rise"]
     assert [r.full_name for r in _board(boards, "topic", "frontend").rising_rows] == ["a/ai-rise"]
+
+
+# ---------- T-020 端点快照日期标注：行结构透传 captured_at（纯展示数据源，一行计算逻辑不动） ----------
+
+
+def test_rows_carry_endpoint_captured_at(conn, topic_table):
+    """主榜行/新区行携带端点快照时间（透传 RepoDelta.captured_at）；total 口径同样有值——页面端点日期标注的数据基础。
+
+    值 = 最新快照的 captured_at 原样（出席/缺席都有值，T-018 起语义统一）；切片形态在视图层（routes._endpoint_note）锁。
+    """
+    _add_repo(conn, "a/main", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 300)])  # 出席主榜
+    _add_repo(conn, "a/rise", language="Go", snapshots=[(_iso(3), 100), (_iso(0), 500)])  # 缺席进新区
+
+    go = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "go")
+    (main,) = go.rows
+    assert main.captured_at == _iso(0)  # 端点 = 最新快照时间
+    (rising,) = go.rising_rows
+    assert rising.captured_at == _iso(0)  # 新区行同样携带
+
+    # total 口径：无缺席概念，主榜行同样携带端点时间
+    tgo = _board(compute_boards(conn, topic_table, period="total", as_of=AS_OF), "language", "go")
+    assert [r.captured_at for r in tgo.rows] == [_iso(0), _iso(0)]

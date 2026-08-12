@@ -14,6 +14,8 @@
   {% if r.description_en %}<div class="desc-en">{{ r.description_en }}</div>{% else %}<div class="desc-en na">（本仓库暂无描述）</div>{% endif %}
   {% if r.description_zh %}<div class="desc-zh">{{ r.description_zh }}</div>{% endif %}
   {% if r.reason %}<div class="reason"><b>{{ r.reason_label }}</b>{{ r.reason }}</div>{% endif %}
+  {# T-020：端点快照日期标注（恒有；window_note 是异常才出现的标注——两者并存时端点日期在前） #}
+  {% if r.endpoint_note %}<div class="endpoint-note">{{ r.endpoint_note }}</div>{% endif %}
   {% if r.window_note %}<div class="window-note">{{ r.window_note }}</div>{% endif %}
   <div class="acts">
     <a class="gh" href="https://github.com/{{ r.full_name }}" target="_blank" rel="noopener noreferrer">在 GitHub 打开 <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5.5"/></svg></a>

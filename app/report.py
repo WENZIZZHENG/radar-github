@@ -94,6 +94,7 @@ class ReportRow:
     stars: int  # 总星数（端点快照星数）
     delta: int | None  # 增量；总星榜恒 None
     window_days: float | None  # 实际窗口跨度天数；总星榜恒 None；首周缺席项目不出现在榜行中
+    captured_at: str | None = None  # 端点（最近）快照时间（UTC 定长 ISO）；T-020 页面端点日期标注用，透传不计算
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class RisingRow:
     stars: int  # 端点星数（同主榜行"总星数"展示）
     pool_delta: int  # 在池增量 = 端点星数 − 入池基线（最旧一张快照）星数；允许为负
     pool_days: float  # 在池天数 = 端点与基线两端间隔（天，保留 1 位小数同 window_days 精度）
+    captured_at: str | None = None  # 端点（最近）快照时间（UTC 定长 ISO）；T-020 页面端点日期标注用，透传不计算
 
 
 @dataclass(frozen=True)
@@ -287,6 +289,7 @@ def compute_boards(
             stars=info.stars,
             delta=info.delta,
             window_days=info.window_days,
+            captured_at=info.captured_at,  # T-020：端点日期标注数据源，透传不计算
         )
         lang_buckets[classify_language(repo["language"])].append(row)
         # topics 由写入方 json.dumps 落库（schema 默认 '[]'）；单行脏数据直接抛错属 fail-loud
@@ -322,6 +325,7 @@ def compute_boards(
                 stars=info.stars,
                 pool_delta=info.stars - base["stars"],
                 pool_days=pool_days,
+                captured_at=info.captured_at,  # T-020：端点日期标注数据源，透传不计算
             )
             rising_lang[classify_language(repo["language"])].append(row)
             hit_keys = classify_topics(json.loads(repo["topics"]), topic_table)

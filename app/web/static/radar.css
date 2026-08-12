@@ -298,8 +298,8 @@ footer.note { margin-top: var(--s6); font-size: 12px; line-height: 1.7; color: v
 /* 负增量：示意图未演示负值样式，用既有 --destructive token 与正增量区分语义（偏差已留痕） */
 .row .up.neg { color: var(--destructive); }
 
-/* 行级实际窗口标注（决策 4：窗口异常必须标注实际天数） */
-.panel .window-note { margin-top: 6px; font-size: 11.5px; color: var(--text-3); }
+/* 行级实际窗口标注（决策 4：窗口异常必须标注实际天数）＋端点快照日期标注（T-020：同款小字，恒有） */
+.panel .window-note, .panel .endpoint-note { margin-top: 6px; font-size: 11.5px; color: var(--text-3); }
 
 /* 导航禁用项（标签页 T-010 未上线）：tooltip 说明原因 */
 nav.tabs .off {

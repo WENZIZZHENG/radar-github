@@ -8,6 +8,7 @@
 """
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -482,3 +483,39 @@ def test_fallback_when_main_and_rising_both_empty(tmp_path, monkeypatch):
     assert 'class="notice"' in resp.text
     assert "增量榜全部缺席" in resp.text
     assert "新崛起" not in resp.text  # straddle 老仓不算新区（F2-1 收窄）：主榜＋新区全空才降级
+
+
+# ---------- T-020 端点快照日期标注（流程说明 §10：行详情面板元信息处，全页面共用行模板同步生效） ----------
+
+
+def test_endpoint_note_slice_shape():
+    """_endpoint_note 切片形态：定长 ISO 前 10 字符直接切片（schema 硬约定，不做日期解析）；None → None（模板不渲染）。"""
+    from app.web.routes import _endpoint_note
+
+    assert _endpoint_note("2026-08-09T00:00:00Z") == "端点快照 2026-08-09"
+    assert _endpoint_note("2026-08-09T05:51:43Z") == "端点快照 2026-08-09"  # 秒级时间戳同日期
+    assert _endpoint_note(None) is None
+
+
+def test_row_endpoint_note_on_history_week_page(client):
+    """历史周页（as_of 固定，时间稳健）：主榜行＋新区行面板都渲染端点快照日期标注（_seed_full 端点恒 2026-08-09）。"""
+    text = client.get(f"/?week={WEEK_LABEL}").text
+    assert text.count("端点快照 2026-08-09") >= 3  # 主榜 a/py、a/go 两行＋新区 a/rise 行
+
+
+def test_row_endpoint_note_on_total_page(client):
+    """total 页端点日期标注（时间稳健：种子端点恒 2026-08-09）。"""
+    assert "端点快照 2026-08-09" in client.get("/total").text
+
+
+def test_row_endpoint_note_on_follows_page(follows_client):
+    """P6 关注页端点日期标注（快照相对 now 造、日期不固定 → 断言 20XX- 形态）；dead 仓旁路补取同样渲染。"""
+    text = follows_client.get("/follows").text
+    assert len(re.findall(r"端点快照 20\d\d-\d\d-\d\d", text)) >= 5  # 4 alive 行（含缺席）＋1 dead 行
+
+
+def test_row_endpoint_note_on_tag_page(client):
+    """P5 标签结果页端点日期标注（_seed_full 打标行端点恒 2026-08-09）。"""
+    resp = client.get("/tags/选型观察")
+    assert resp.status_code == 200
+    assert "端点快照 2026-08-09" in resp.text
