@@ -1,6 +1,7 @@
-{# 单张榜：榜头（分类名 + 实际数量 + 回顶部）+ 项目行（紧凑单行，_row.html 与 P6 共用）+ 详情面板（默认全部展开，D1/D3 v1.1） #}
+{# 单张榜：榜头（分类名 + 实际数量 + 回顶部）+ 项目行（紧凑单行，_row.html 与 P6 共用）+ 详情面板（默认全部展开，D1/D3 v1.1）。
+   回顶部链接 T-021 §12.1 起仅无边栏页面渲染（P4/P5/P6 保留；P1/P2/P3 由左侧边栏替代——show_sidebar 由 boards.html 传入）。 #}
 <div class="board" id="{{ b.anchor }}">
-  <h3>{{ b.label }}<span class="n">Top {{ b.rows | length }}</span><a class="top" href="#top">回顶部 <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg></a></h3>
+  <h3>{{ b.label }}<span class="n">Top {{ b.rows | length }}</span>{% if not show_sidebar %}<a class="top" href="#top">回顶部 <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg></a>{% endif %}</h3>
   {% for r in b.rows %}{% set anchor = b.anchor %}{% set idx = loop.index0 %}{% include "_row.html" %}{% else %}
   {# 空榜也渲染板块（示意图口径：0 也列出板块） #}
   <p class="board-empty">本期暂无数据</p>

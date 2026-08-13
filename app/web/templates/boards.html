@@ -13,13 +13,39 @@
 {% endblock %}
 
 {% block content %}
+{% if show_sidebar %}
+{# T-021 §12.1 左侧边栏（P1/P2/P3，替代原第 2 层顶部 chips）：桌面 sticky 常驻、可收起为 44px 细条；
+   窄屏（≤640px）边栏本体变左侧抽屉，配合悬浮钮 FAB＋半透明遮罩（开合/记忆逻辑在 radar.js，样式在 radar.css）。
+   边栏项顺序 = 榜块顺序（context 顺序），label 与榜内数量 = 榜块同源；无"回顶部"项（§12.1 拍板：sticky 常驻后回顶部冗余）。 #}
+<div class="with-sidebar">
+  <aside class="sidebar" aria-label="榜单导航">
+    <div class="sb-head">
+      <span class="sb-title">榜单直达</span>
+      <button type="button" class="sb-toggle" title="收起边栏" aria-label="收起边栏"><span class="ic-collapse"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></span><span class="ic-expand"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></span></button>
+      {# 窄屏抽屉专用关闭钮（桌面隐藏，CSS 控显隐） #}
+      <button type="button" class="sb-close" title="收起抽屉" data-close-drawer aria-label="收起抽屉"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    </div>
+    <nav class="sb-nav">
+      <div class="sb-grp">语言</div>
+      {%- for b in lang_boards %}<a class="sb-item" href="#{{ b.anchor }}" title="{{ b.label }}"><span class="sb-dot" style="background:{{ b.dot }}"></span><span class="sb-txt">{{ b.label }}</span><i>{{ b.rows | length }}</i></a>{% endfor -%}
+      <div class="sb-grp">主题</div>
+      {%- for b in topic_boards %}<a class="sb-item" href="#{{ b.anchor }}" title="{{ b.label }}"><span class="sb-dot" style="background:{{ b.dot }}"></span><span class="sb-txt">{{ b.label }}</span><i>{{ b.rows | length }}</i></a>{% endfor -%}
+    </nav>
+  </aside>
+  {# 窄屏遮罩与悬浮钮（桌面隐藏，CSS 控显隐） #}
+  <div class="drawer-mask" data-close-drawer></div>
+  <button type="button" class="fab" aria-label="展开榜单导航" title="榜单导航"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <main class="content">
+{% endif %}
+
 {# 第 1 层：元信息行 #}
 <p class="meta">{% if meta.window %}窗口：{{ meta.window }} · {% else %}截至 {{ meta.as_of }} · {% endif %}生成于 {{ meta.generated }}（UTC+8） · 跟踪池 {{ meta.tracked }} 个仓库 · {{ meta.method }}</p>
 
 {# 首期/缺席降级提示条（流程说明 §4）：增量榜全缺席时显示总星榜 + 明确提示 #}
 {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 
-{# 第 2 层：锚点导航 chips（榜内数量徽标）。v1.3：原第 2 层"我的关注"已移出为独立页 P6（/follows，顶栏导航进入） #}
+{# 第 2 层：锚点导航 chips（P4 总星页保留，逐像素不变）；P1/P2/P3 已由上方左侧边栏替代（show_sidebar 分支） #}
+{% if not show_sidebar %}
 <section>
   <h2 class="sec">榜单直达</h2>
   <div class="chips">
@@ -29,6 +55,7 @@
     {%- for b in topic_boards %}<a class="chip" href="#{{ b.anchor }}">{{ b.label }}<i>{{ b.rows | length }}</i></a>{% endfor -%}
   </div>
 </section>
+{% endif %}
 
 {# 第 3/4 层：榜单区（17 榜直出，顺序 = compute_boards 返回顺序；空榜也渲染板块）＋项目行 #}
 <section>
@@ -44,4 +71,9 @@
     {% for b in topic_boards %}{% include "_board.html" %}{% endfor %}
   </div>
 </section>
+
+{% if show_sidebar %}
+  </main>
+</div>
+{% endif %}
 {% endblock %}

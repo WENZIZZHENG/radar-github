@@ -545,6 +545,10 @@ def _board_view(board: Board, **row_ctx) -> dict:
         # kind 必须入锚点：language 榜的 other 与 topic 榜的 other 撞 key
         "anchor": f"b-{board.kind}-{board.key}",
         "label": board.label,
+        # T-021 边栏点位色（§12.1）：语言榜用语言点色（与行 badge 呼应），主题榜统一灰点（原型口径）
+        "dot": LANG_COLORS.get(_LANG_KEY_TO_NAME.get(board.key, ""), _DEFAULT_LANG_COLOR)
+        if board.kind == "language"
+        else _DEFAULT_LANG_COLOR,
         "rows": [_row_view(i + 1, r, **row_ctx) for i, r in enumerate(board.rows)],
         # T-018 新区：小字说明按页面期次取名义窗口天数（周 7/季 90）；total 口径新区恒空不渲染
         "rising_days": _NOMINAL_DAYS.get(row_ctx["period"]),
@@ -560,8 +564,12 @@ def _boards_context(
     as_of: str,
     as_of_date: date,
     now: datetime,
+    show_sidebar: bool,
 ) -> dict:
     """三页面共用的上下文装配：榜单（含首期空态降级）→ 元信息 → 期次控件。
+
+    show_sidebar（T-021 §12.1）：P1/P2/P3 榜单页 True → 模板以左侧边栏替代顶部 chips 区；
+    P4 总星页 False → 布局逐像素保持现状（首期空态降级随 handler 走，不因降级改变边栏与否）。
 
     DB 连接请求级获取/关闭（不持全局长连接）；WAL 下读榜单不阻塞每日采集写入。
     """
@@ -616,6 +624,7 @@ def _boards_context(
             "page": period,  # 顶栏 active 态：历史周次仍归属"本周报告"
             "title": title,
             "switcher": switcher,
+            "show_sidebar": show_sidebar,  # T-021 §12.1：True → 左侧边栏替代顶部 chips（P1/P2/P3）
             "meta": _meta(conn, period, as_of_date),  # 窗口/口径按请求期次展示，不因降级改写成总星榜口径
             "notice": notice,
             "follow_count": len(follow_rows),
@@ -632,31 +641,50 @@ def _boards_context(
 
 @router.get("/", response_class=HTMLResponse)
 def weekly(request: Request, week: str | None = None) -> HTMLResponse:
-    """P1 本周报告（=最新一期）；?week=2026-W32 回看历史周次（P2 与 P1 同页换期次，流程说明 §1）。"""
+    """P1 本周报告（=最新一期）；?week=2026-W32 回看历史周次（P2 与 P1 同页换期次，流程说明 §1）。
+
+    T-021 §12.1：P1/P2 页边栏 = True（首期空态降级为 total 榜单时页面仍是周报语境，边栏保留）。
+    """
     now = datetime.now(timezone.utc)
     label, as_of, as_of_date = _resolve_week(week, now)
     return templates.TemplateResponse(
         request=request,
         name="boards.html",
-        context=_boards_context(request, period="week", label=label, as_of=as_of, as_of_date=as_of_date, now=now),
+        context=_boards_context(
+            request,
+            period="week",
+            label=label,
+            as_of=as_of,
+            as_of_date=as_of_date,
+            now=now,
+            show_sidebar=True,
+        ),
     )
 
 
 @router.get("/quarter", response_class=HTMLResponse)
 def quarterly(request: Request, quarter: str | None = None) -> HTMLResponse:
-    """P3 季度回顾（90 天增量榜）；?quarter=2026-Q3 回看往期。"""
+    """P3 季度回顾（90 天增量榜）；?quarter=2026-Q3 回看往期。T-021：边栏 = True（同周报页）。"""
     now = datetime.now(timezone.utc)
     label, as_of, as_of_date = _resolve_quarter(quarter, now)
     return templates.TemplateResponse(
         request=request,
         name="boards.html",
-        context=_boards_context(request, period="quarter", label=label, as_of=as_of, as_of_date=as_of_date, now=now),
+        context=_boards_context(
+            request,
+            period="quarter",
+            label=label,
+            as_of=as_of,
+            as_of_date=as_of_date,
+            now=now,
+            show_sidebar=True,
+        ),
     )
 
 
 @router.get("/total", response_class=HTMLResponse)
 def total(request: Request) -> HTMLResponse:
-    """P4 总星榜：最新快照总星数降序 Top 30/榜，无期次概念。"""
+    """P4 总星榜：最新快照总星数降序 Top 30/榜，无期次概念。T-021 §12.1：P4 无边栏，布局保持现状。"""
     now = datetime.now(timezone.utc)
     return templates.TemplateResponse(
         request=request,
@@ -668,6 +696,7 @@ def total(request: Request) -> HTMLResponse:
             as_of=now.strftime(_ISO_FMT),
             as_of_date=now.date(),
             now=now,
+            show_sidebar=False,
         ),
     )
 
@@ -677,6 +706,7 @@ def follows_page(request: Request) -> HTMLResponse:
     """P6 我的关注（v1.3 独立页）：关注仓库按语言分组，增量与当期周报同窗口（as_of=now 周口径）。
 
     无期次概念（不跟周次切换走）；空关注时渲染空态引导（流程说明 §4），分组/排序口径在 _follow_groups。
+    T-021 §12.2：filter_tags = 我的全部标签（含 0 计数，字典序），供页内客户端筛选 chips。
     """
     now = datetime.now(timezone.utc)
     conn = get_conn()
@@ -689,6 +719,15 @@ def follows_page(request: Request) -> HTMLResponse:
         # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块；
         # T-024：概要固定取 ('summary', 'all')（文档视角，全页面同一条），缺则该行无概要块
         reasons, zh, tags, summaries = _display_maps(conn, dimension="total", period_label="all")
+        # T-021 §12.2 筛选 chips：我的全部标签各自带"关注仓中打该标签的数量"（LEFT JOIN follows，
+        # 0 计数也要列出供空态演示）；按标签名字典序（与 _all_tags 同口径 ORDER BY tag）
+        filter_tags = [
+            {"tag": r["tag"], "count": r["n"]}
+            for r in conn.execute(
+                "SELECT t.tag AS tag, COUNT(f.repo_id) AS n FROM tags t"
+                " LEFT JOIN follows f ON f.repo_id = t.repo_id GROUP BY t.tag ORDER BY t.tag"
+            )
+        ]
         return templates.TemplateResponse(
             request=request,
             name="follows.html",
@@ -698,6 +737,7 @@ def follows_page(request: Request) -> HTMLResponse:
                 "title": "我的关注",
                 "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
                 "follow_count": len(follow_rows),
+                "filter_tags": filter_tags,  # T-021：标签筛选行数据（含 0 计数）
                 "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
                 "groups": _follow_groups(cards, reasons, zh, tags, summaries),
             },

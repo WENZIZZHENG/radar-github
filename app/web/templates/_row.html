@@ -1,7 +1,10 @@
 {# 单行（紧凑行＋默认展开面板）：P1/P3/P4 榜单行与 P6 关注行共用同一模板——"行形态与榜单行完全一致"（v1.3 §2A）由共享模板保证。
    调用方须在 include 前 {% set anchor = ... %}{% set idx = loop.index0 %}（loop 不进 include 上下文，序号须显式传）。
-   P6 专有分支：r.dead → 行灰显＋"已失效"标；r.up_na_text 非空 → up 列退化灰字说明（榜单行两者恒为假值/None，分支不触发）。 #}
-<div class="row expanded{% if r.dead %} dead{% endif %}" data-b="{{ anchor }}" data-i="{{ idx }}" tabindex="0" role="button" aria-expanded="true">
+   P6 专有分支：r.dead → 行灰显＋"已失效"标；r.up_na_text 非空 → up 列退化灰字说明（榜单行两者恒为假值/None，分支不触发）。
+   data-tags（T-021 §12.2）：r.tags JSON 编码（tojson）——供 P6 客户端标签筛选（JSON 数组精确匹配，
+   标签名可含逗号也不与分隔编码冲突；tojson 返回 Markup 致 autoescape 不生效，须 forceescape 把 JSON
+   引号显式转义为 &#34;，浏览器 dataset 读出即合法 JSON）。 #}
+<div class="row expanded{% if r.dead %} dead{% endif %}" data-b="{{ anchor }}" data-i="{{ idx }}" data-tags="{{ r.tags | tojson | forceescape }}" tabindex="0" role="button" aria-expanded="true">
   <span class="rank">{{ r.rank }}</span>
   <span class="repo-wrap"><span class="repo" title="{{ r.full_name }}">{{ r.full_name }}</span>{% if r.dead %}<span class="dead-tag">已失效</span>{% endif %}<svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></span>
   {% if r.language %}<span class="badge"><span class="dot" style="background:{{ r.lang_color }}"></span>{{ r.language }}</span>{% endif %}

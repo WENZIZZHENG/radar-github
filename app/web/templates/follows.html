@@ -8,6 +8,15 @@
 {% if groups %}
 <section>
   <h2 class="sec">我的关注</h2>
+  {# T-021 §12.2 标签筛选行：元信息行与分组区之间；"全部"带关注总数、各标签 chip 带关注仓计数（0 也列出），
+     客户端筛选不发请求（radar.js）；初始"全部"选中（on） #}
+  <div class="tag-filter" role="group" aria-label="标签筛选">
+    <span class="grp">标签筛选</span>
+    <button type="button" class="fchip on" data-tag="">全部<i>{{ follow_count }}</i></button>
+    {%- for t in filter_tags %}<button type="button" class="fchip" data-tag="{{ t.tag }}">{{ t.tag }}<i>{{ t.count }}</i></button>{% endfor -%}
+  </div>
+  {# 筛选 0 命中空态（§12.2）：JS 控制显隐，初始隐藏 #}
+  <p class="filter-empty" id="filter-empty" hidden>该标签下暂无关注项目</p>
   {# id="follow-boards"：radar.js 据以识别 P6 页面，页内取消关注时即时移除该行（组空连组块移除） #}
   <div class="boards" id="follow-boards">
     {% for g in groups %}

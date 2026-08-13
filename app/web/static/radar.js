@@ -67,7 +67,8 @@ function updateFollowCount(data) {
   if (total) total.textContent = String(data.follow_count);
 }
 
-// P6 页内点 ★ 取消关注（流程说明 §3.2）：该行＋详情面板即时从 DOM 移除；组空连组块移除；全空 reload 出空态
+// P6 页内点 ★ 取消关注（流程说明 §3.2）：该行＋详情面板即时从 DOM 移除；组空连组块移除；全空 reload 出空态。
+// T-021 §12.2：P6 带筛选行时，移除后按当前筛选重算可见性/组头计数/空态与 chips 计数（与筛选逻辑兼容）
 function removeFollowRow(star) {
   const row = star.closest(".row");
   if (!row || !row.closest("#follow-boards")) return; // 非 P6 页面：行保留，星标已切换即可
@@ -78,6 +79,11 @@ function removeFollowRow(star) {
   if (board && !board.querySelector(".row")) {
     board.remove();
     if (!document.querySelector("#follow-boards .board")) location.reload(); // 全空 → 空态（任务书允许 reload 简化）
+  }
+  if (document.querySelector(".tag-filter")) {
+    // 筛选行存在（P6 有关注分组）：行移除后按当前筛选重算；无筛选时顺带把组头计数纠正为剩余数
+    applyFollowTagFilter();
+    refreshFollowChipCounts();
   }
 }
 
@@ -639,3 +645,151 @@ async function recommendMissing(btn) {
     /* 接管查询网络异常：安静忽略，不影响页面 */
   }
 })();
+
+// ---- T-021 §12.1 左侧边栏（仅 P1/P2/P3，页面含 .sidebar 才激活）：收起/展开记忆、移动抽屉、scrollspy ----
+
+const SB_KEY = "t021-sb-collapsed"; // 桌面收起态记忆键（§12.1：localStorage 跨会话保持）
+const SB_MQ = window.matchMedia("(max-width: 640px)"); // 断点与 radar.css 同值
+
+function closeSidebarDrawer() {
+  document.body.classList.remove("drawer-open");
+}
+
+// 边栏形态按视口切换：桌面读 localStorage 收起记忆；窄屏恒收起（FAB+抽屉，不记忆展开态）
+function applySidebarView() {
+  const wrap = document.querySelector(".with-sidebar");
+  if (!wrap) return;
+  const toggle = wrap.querySelector(".sb-toggle");
+  if (SB_MQ.matches) {
+    wrap.classList.remove("collapsed");
+    closeSidebarDrawer();
+  } else {
+    let collapsed = false;
+    try {
+      collapsed = localStorage.getItem(SB_KEY) === "1"; // 读失败（隐私模式/禁用站点数据）按展开默认，不中断 scrollspy
+    } catch (err) {
+      collapsed = false;
+    }
+    wrap.classList.toggle("collapsed", collapsed);
+    if (toggle) toggle.title = collapsed ? "展开边栏" : "收起边栏";
+  }
+}
+
+// scrollspy（§12.1，原型已确认交互）：滚动时高亮当前所在榜对应边栏项（根 = 视口，与页面滚动一体）
+function initScrollSpy() {
+  const sidebar = document.querySelector(".sidebar");
+  if (!sidebar) return;
+  const items = [...sidebar.querySelectorAll(".sb-item")];
+  const boards = items.map((a) => document.getElementById(a.getAttribute("href").slice(1))).filter(Boolean);
+  if (!boards.length) return;
+  const io = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((en) => {
+        if (!en.isIntersecting) return;
+        items.forEach((a) => a.classList.toggle("active", a.getAttribute("href") === "#" + en.target.id));
+      });
+    },
+    { rootMargin: "-70px 0px -62% 0px", threshold: 0 } // 顶栏+榜头区让出 70px，底部 62% 判区（原型同参数）
+  );
+  boards.forEach((b) => io.observe(b));
+}
+
+// 边栏交互（桌面收起/展开、移动抽屉开合、抽屉内点选自动收回）：
+// 边栏项跳榜走原生锚点（href="#anchor"，全页 scroll-behavior: smooth 已就位），JS 不拦
+document.addEventListener("click", (e) => {
+  const toggle = e.target.closest(".sb-toggle");
+  if (toggle) {
+    const wrap = toggle.closest(".with-sidebar");
+    if (!wrap) return;
+    const collapsed = wrap.classList.toggle("collapsed");
+    try {
+      localStorage.setItem(SB_KEY, collapsed ? "1" : "0"); // 写失败仅不记忆，不影响本次交互
+    } catch (err) {
+      /* 隐私模式/禁用站点数据：静默忽略 */
+    }
+    toggle.title = collapsed ? "展开边栏" : "收起边栏";
+    return;
+  }
+  if (e.target.closest(".fab")) {
+    document.body.classList.add("drawer-open");
+    return;
+  }
+  if (e.target.closest(".drawer-mask") || e.target.closest("[data-close-drawer]")) {
+    closeSidebarDrawer();
+    return;
+  }
+  if (e.target.closest(".sb-item") && SB_MQ.matches) closeSidebarDrawer(); // 抽屉内点选后自动收回
+});
+
+if (document.querySelector(".sidebar")) {
+  applySidebarView();
+  SB_MQ.addEventListener("change", applySidebarView);
+  initScrollSpy();
+}
+
+// ---- T-021 §12.2 P6 标签筛选（客户端筛选，不发请求；与取消关注即时移除兼容） ----
+
+let activeFollowTag = ""; // "" = 全部（与"全部" chip 的 data-tag 同值）
+
+// data-tags 是 JSON 数组（服务端 tojson 编码，T-021 F2-1）：标签名可含逗号，须 JSON.parse 精确取数组；
+// parse 异常（旧形态/畸形数据）按空数组处理，不炸页面
+function parseRowTags(rowEl) {
+  try {
+    const raw = rowEl.dataset.tags;
+    return raw ? JSON.parse(raw) : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+// 按当前 activeFollowTag 收窄行集：无该标签的行隐藏、空组整组隐藏、组头计数更新为可见数、0 命中显空态
+function applyFollowTagFilter() {
+  const boards = document.querySelectorAll("#follow-boards .board");
+  const empty = document.getElementById("filter-empty");
+  let anyVisible = false;
+  boards.forEach((g) => {
+    let vis = 0;
+    g.querySelectorAll(".row").forEach((r) => {
+      const hit = activeFollowTag === "" || parseRowTags(r).includes(activeFollowTag);
+      r.hidden = !hit;
+      const panel = document.querySelector(`.panel[data-b="${r.dataset.b}"][data-i="${r.dataset.i}"]`);
+      if (panel) panel.hidden = !hit; // 行隐藏时面板一并隐藏（面板是行后的兄弟 div）
+      if (hit) vis++;
+    });
+    g.hidden = vis === 0;
+    if (!g.hidden) {
+      const n = g.querySelector("h3 .n");
+      if (n) n.textContent = `${vis} 个关注`;
+      anyVisible = true;
+    }
+  });
+  if (empty) empty.hidden = anyVisible;
+}
+
+// 筛选 chips 计数重算（取消关注后按剩余行集重算："全部"=剩余行数，各标签=剩余命中数，0 也列出）
+function refreshFollowChipCounts() {
+  const rows = document.querySelectorAll("#follow-boards .row");
+  const counts = {};
+  rows.forEach((r) =>
+    parseRowTags(r).forEach((t) => {
+      if (t) counts[t] = (counts[t] || 0) + 1;
+    })
+  );
+  document.querySelectorAll(".tag-filter .fchip").forEach((c) => {
+    const i = c.querySelector("i");
+    if (!i) return;
+    i.textContent = String(c.dataset.tag === "" ? rows.length : counts[c.dataset.tag] || 0);
+  });
+}
+
+// 点 chip：再点当前标签或"全部" → 取消筛选恢复（§12.2）
+document.addEventListener("click", (e) => {
+  const chip = e.target.closest(".fchip");
+  if (!chip) return;
+  const tag = chip.dataset.tag || "";
+  activeFollowTag = activeFollowTag === tag ? "" : tag;
+  document
+    .querySelectorAll(".tag-filter .fchip")
+    .forEach((c) => c.classList.toggle("on", (c.dataset.tag || "") === activeFollowTag));
+  applyFollowTagFilter();
+});

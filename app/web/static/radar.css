@@ -31,12 +31,14 @@
   /* 圆角 */
   --r-s:6px; --r-m:8px; --r-l:12px; --r-pill:999px;
   /* 层级 */
-  --z-header:20; --z-toast:60;
+  --z-header:20; --z-toast:60; --z-fab:30; --z-mask:35; --z-drawer:40;  /* T-021：FAB/遮罩/抽屉在顶栏之上、toast 之下 */
   /* 动效时长（微交互 150~200ms） */
   --t-fast:.15s; --t-mid:.2s;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* 显隐统一走 hidden 属性（行/面板/组块有 author display 规则，UA 的 [hidden] 会被覆盖，须 !important 兜底） */
+[hidden] { display: none !important; }
 html { scroll-behavior: smooth; }
 body {
   font-family: var(--font-sans);
@@ -400,3 +402,131 @@ header.top .translate-all ~ .recommend-all { margin-left: 0; }
 }
 .toast-action:hover:not(:disabled) { background: rgba(34,197,94,.12); border-color: var(--accent); }
 .toast-action:disabled { opacity: .55; cursor: default; }
+
+/* ===== T-021 追加（左侧边栏 §12.1 ＋ P6 标签筛选 §12.2；样式自原型-T021.html 迁移，一律复用 :root token） ===== */
+
+/* 布局：边栏左侧 sticky 常驻 + 主内容；gap 用 --s5（24px，原提案 24px 同值） */
+.with-sidebar { display: flex; gap: var(--s5); align-items: flex-start; }
+.with-sidebar .content { flex: 1; min-width: 0; }
+
+/* 边栏本体：220px 固定宽，sticky top 52px（顶栏 51px 之下），滚动时随视口常驻；
+   视口矮于 ~660px 时自身限高滚动（max-height 与 sticky top 同值，底部边栏项不截断） */
+.sidebar {
+  position: sticky; top: 52px;
+  width: 220px; flex: none;
+  max-height: calc(100vh - 52px);
+  overflow-y: auto;
+  background: var(--bg); border-right: 1px solid var(--line);
+  padding: 4px 12px 12px 8px;
+  transition: width var(--t-mid) ease;
+}
+.sb-head { display: flex; align-items: center; min-height: 36px; padding: 0 4px; }
+.sb-title { font-size: 12px; color: var(--text-3); letter-spacing: .08em; white-space: nowrap; }
+.sb-toggle, .sb-close {
+  margin-left: auto; width: 28px; height: 28px; display: grid; place-items: center;
+  background: none; border: none; border-radius: var(--r-s); cursor: pointer; color: var(--text-3);
+  transition: color var(--t-fast) ease, background var(--t-fast) ease;
+}
+.sb-toggle:hover, .sb-close:hover { color: var(--text-1); background: rgba(148,163,184,.09); }
+.sb-toggle .ic-expand { display: none; }
+.sb-close { display: none; }  /* 窄屏抽屉关闭钮（桌面隐藏，媒体查询内显示） */
+
+.sb-nav { margin-top: 2px; }
+.sb-grp { font-size: 11px; color: var(--text-3); letter-spacing: .06em; padding: 10px 6px 4px; white-space: nowrap; }
+.sb-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: var(--r-m);
+  font-size: 12.5px; color: var(--text-2); text-decoration: none;
+  white-space: nowrap;
+  transition: background var(--t-fast) ease, color var(--t-fast) ease;
+}
+.sb-item:hover { background: rgba(148,163,184,.09); color: var(--text-1); }
+.sb-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; }
+/* 当前位置高亮：左侧 2px 品牌绿条（与 .row.expanded 同语义），背景淡绿 */
+.sb-item.active { background: rgba(34,197,94,.10); color: var(--text-1); box-shadow: inset 2px 0 0 var(--accent); }
+.sb-item i {
+  margin-left: auto; font-style: normal; font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--text-3); background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px;
+}
+.sb-item.active i { color: var(--text-2); }
+
+/* 收起态：细条 44px，仅留展开钮＋各项点位色（语言彩点 / 主题灰点），hover title 看全名 */
+.with-sidebar.collapsed .sidebar { width: 44px; }
+.with-sidebar.collapsed .sb-title,
+.with-sidebar.collapsed .sb-grp,
+.with-sidebar.collapsed .sb-item .sb-txt,
+.with-sidebar.collapsed .sb-item i { display: none; }
+.with-sidebar.collapsed .sb-head { justify-content: center; padding: 0; }
+.with-sidebar.collapsed .sb-toggle { margin-left: 0; }
+.with-sidebar.collapsed .sb-toggle .ic-collapse { display: none; }
+.with-sidebar.collapsed .sb-toggle .ic-expand { display: grid; }
+.with-sidebar.collapsed .sb-item { justify-content: center; padding: 6px 0; }
+/* 当前位置点带高亮环（收起态唯一位置标识） */
+.with-sidebar.collapsed .sb-item.active .sb-dot { box-shadow: 0 0 0 2px rgba(34,197,94,.4); }
+
+/* 移动端（≤640px，断点与既有页面同值）：悬浮钮 + 左侧抽屉，边栏本体默认收起为抽屉 */
+.drawer-mask, .fab { display: none; }  /* 桌面隐藏 */
+
+/* P6 标签筛选行（§12.2）：chips 横排；选中态＝品牌绿底＋绿描边＋亮绿文字（区别于导航激活的 muted 底） */
+.tag-filter {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+  padding: 12px 2px 10px; margin-top: var(--s3);
+  border-bottom: 1px solid var(--line);
+}
+.tag-filter .grp { font-size: 12px; color: var(--text-3); letter-spacing: .06em; margin-right: 2px; }
+.fchip {
+  display: inline-flex; align-items: center; gap: 7px; min-height: 32px;
+  font-family: inherit; font-size: 12.5px; background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--r-pill); padding: 4px 12px;
+  color: var(--text-2); cursor: pointer;
+  transition: border-color var(--t-fast) ease, background var(--t-fast) ease, color var(--t-fast) ease;
+}
+.fchip:hover { border-color: var(--blue); color: var(--text-1); background: rgba(88,166,255,.07); }
+.fchip i {
+  font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
+  background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px;
+}
+.fchip.on { background: rgba(34,197,94,.14); border-color: var(--accent); color: var(--accent-hi); font-weight: 600; }
+.fchip.on i { color: var(--text-2); background: rgba(34,197,94,.18); }
+/* 筛选 0 命中空态（§12.2：明确文案，不留空架） */
+.filter-empty {
+  margin-top: var(--s5); padding: 34px var(--s4); text-align: center;
+  font-size: 12.5px; color: var(--text-3);
+  background: var(--card); border: 1px dashed var(--line-strong); border-radius: var(--r-l);
+}
+
+/* 移动端形态（与既有 640px 断点同值；置于文件末，覆盖上方桌面规则） */
+@media (max-width: 640px) {
+  .with-sidebar { display: block; }
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0; z-index: var(--z-drawer);
+    width: 280px; max-width: 82%;
+    max-height: none;  /* 抽屉 fixed inset:0 已定高，覆盖桌面限高规则，不被压矮 */
+    background: var(--bg); border-right: 1px solid var(--line-strong);
+    padding: 4px 12px 12px 8px;
+    overflow-y: auto;
+    transform: translateX(-102%);
+    transition: transform var(--t-mid) ease;
+  }
+  body.drawer-open .sidebar { transform: none; }
+  .sidebar .sb-head { padding: 10px 4px 4px 12px; }
+  .sidebar .sb-nav { padding-bottom: 16px; }
+  .drawer-mask {
+    display: block; position: fixed; inset: 0; z-index: var(--z-mask);
+    background: rgba(2,6,23,.55);
+    opacity: 0; pointer-events: none;
+    transition: opacity var(--t-mid) ease;
+  }
+  body.drawer-open .drawer-mask { opacity: 1; pointer-events: auto; }
+  .fab {
+    display: grid; position: fixed; right: 16px; bottom: 16px; z-index: var(--z-fab);
+    width: 52px; height: 52px; border-radius: 50%; place-items: center;
+    background: var(--surface); border: 1px solid var(--accent); color: var(--accent);
+    box-shadow: 0 8px 24px rgba(2,6,23,.55);
+    cursor: pointer; transition: transform .1s ease, background var(--t-fast) ease;
+  }
+  .fab:hover { background: rgba(34,197,94,.12); }
+  .fab:active { transform: scale(.92); }
+  .sb-toggle { display: none; }  /* 抽屉用关闭钮，收起钮无意义 */
+  .sb-close { display: grid; margin-left: auto; }
+}

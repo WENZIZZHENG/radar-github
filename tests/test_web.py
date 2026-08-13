@@ -1,7 +1,8 @@
 """T-008 榜单页面测试：TestClient 打真实 app（lifespan 会跑 init_db），tmp_path 独立库（RADAR_DB_PATH 覆盖）+ 调度关闭。
 
 断言分两类：
-- 结构断言（时间稳健）：三页面 200、17 榜区块、17 chips、默认展开态、空态降级提示、期次参数 200/400；
+- 结构断言（时间稳健）：三页面 200、17 榜区块、P1/P2/P3 边栏 17 项（T-021 起替代顶部 chips，P4 保留 chips）、
+  默认展开态、空态降级提示、期次参数 200/400；
   周/季出席数据随"今天"推移会滑出窗口，故不做数据内容断言（口径语义归 tests/test_report.py）。
 - 内容断言全走 /total（最新快照降序，无窗口概念，时间稳健）与首期空态（快照仅同一天）；
   例外：历史期次页（/?week=2026-W32、/quarter?quarter=2026-Q3）as_of 固定、种子快照恒出席，允许内容断言（T-017 复验打回修复起）。
@@ -129,16 +130,18 @@ def test_three_pages_ok(client):
         assert "GitHub 雷达" in resp.text
 
 
-def test_index_has_17_boards_and_chips(client):
-    """17 榜齐备（语言 7 + 主题 10），空榜也渲染板块；锚点 chips 一一对应。"""
+def test_index_has_17_boards_and_sidebar(client):
+    """T-021：17 榜齐备（语言 7 + 主题 10），空榜也渲染板块；左侧边栏 17 项一一对应（原顶部 chips 已由边栏替代）。"""
     text = client.get("/").text
     assert text.count('class="board"') == 17  # class="boards" 容器不带右引号，不会被误计
-    assert text.count('<a class="chip" href="#b-') == 17
+    assert '<aside class="sidebar"' in text
+    assert text.count('class="sb-item"') == 17  # 边栏项 = 语言 7 + 主题 10
+    assert text.count('<a class="chip" href="#b-') == 0  # 顶部 chips 区不再渲染（边栏替代）
 
 
 def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
     """首期降级判定变更（T-018）：主榜全空但新区有行 → 不降级（无 notice 无总星榜降级）；
-    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；17 板块仍在、chips 仍 17。"""
+    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；17 板块仍在、边栏仍 17 项。"""
     resp = fresh_client.get("/")
     assert resp.status_code == 200
     assert 'class="notice"' not in resp.text  # 新区有行 → 不降级
@@ -147,7 +150,7 @@ def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
     assert "新崛起 · 入池未满一个统计窗口" in resp.text
     assert resp.text.count("本期暂无数据") == 17  # 主榜全空：每榜空态照常
     assert resp.text.count('class="board"') == 17
-    assert resp.text.count('<a class="chip" href="#b-') == 17
+    assert resp.text.count('class="sb-item"') == 17  # T-021：顶部 chips 已由左侧边栏替代（17 项）
     assert "follows-sec" not in resp.text  # v1.3：P1 顶部关注区已移出为独立页 P6
     # 默认全部展开（D1/D3 v1.1）：行即展开态、面板 open、aria 同步
     assert 'class="row expanded"' in resp.text
@@ -262,6 +265,12 @@ def _seed_follows(conn):
             conn.execute("UPDATE repos SET dead = 1 WHERE id = ?", (repo_id,))
         conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_id, f"2026-08-0{i + 1}T00:00:00Z"))
     conn.execute("INSERT INTO tags (repo_id, tag) VALUES ((SELECT id FROM repos WHERE full_name = 'f/ts-hot'), '选型观察')")
+    # T-021 §12.2：未关注仓上的标签也进筛选 chips（0 计数，供空态演示）——不影响 P6 行集与关注计数
+    repo_nf = _add_repo(
+        conn, "f/nf", language="Rust", description_en="not followed",
+        snapshots=[(_iso_ago(days=7), 10), (_iso_ago(hours=1), 12)],
+    )
+    conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, 'AI')", (repo_nf,))
 
 
 @pytest.fixture()
@@ -508,11 +517,17 @@ def test_rising_section_absent_on_total_and_empty_boards(client):
     assert text.count("新崛起 · 入池未满一个统计窗口") == 2
 
 
-def test_chips_exclude_rising_rows(client):
-    """锚点 chips 徽标只计主榜行数不计新区（历史周页 as_of 固定）：rust 榜主榜 0 行但新区 1 行，chip 仍 0。"""
+def test_sidebar_badges_exclude_rising_rows(client):
+    """T-021：边栏项徽标只计主榜行数不计新区（历史周页 as_of 固定）：rust 榜主榜 0 行但新区 1 行，徽标仍 0。"""
     text = client.get(f"/?week={WEEK_LABEL}").text
-    assert 'href="#b-language-rust">Rust<i>0</i></a>' in text
-    assert 'href="#b-language-python">Python<i>1</i></a>' in text
+    assert (
+        'class="sb-item" href="#b-language-rust" title="Rust"><span class="sb-dot" style="background:#dea584">'
+        '</span><span class="sb-txt">Rust</span><i>0</i></a>' in text
+    )
+    assert (
+        'class="sb-item" href="#b-language-python" title="Python"><span class="sb-dot" style="background:#4b8bbe">'
+        '</span><span class="sb-txt">Python</span><i>1</i></a>' in text
+    )
 
 
 def test_fallback_when_main_and_rising_both_empty(tmp_path, monkeypatch):
@@ -623,3 +638,104 @@ def test_no_datalist_on_empty_tag_db(fresh_client):
         resp = fresh_client.get(path)
         assert resp.status_code == 200, path
         assert '<datalist id="all-tags">' not in resp.text, path
+
+
+# ---------- T-021：左侧边栏（§12.1，仅 P1/P2/P3）＋P6 标签筛选（§12.2） ----------
+
+
+def test_sidebar_on_week_and_quarter_pages(client):
+    """P1/P2/P3 榜单页：左侧边栏就位（标题/收起钮/语言+主题两组 17 项/榜内数量徽标）；
+    顶部 chips 区与榜头"回顶部"移除（§12.1 拍板：边栏 sticky 常驻后回顶部冗余）。"""
+    for path in ("/", f"/?week={WEEK_LABEL}", "/quarter"):
+        resp = client.get(path)
+        assert resp.status_code == 200, path
+        text = resp.text
+        assert '<aside class="sidebar"' in text
+        assert '<span class="sb-title">榜单直达</span>' in text
+        assert 'class="sb-toggle"' in text
+        assert 'class="sb-grp">语言' in text and 'class="sb-grp">主题' in text
+        assert text.count('class="sb-item"') == 17  # 语言 7 + 主题 10，顺序 = 榜块顺序
+        assert '<div class="chips"' not in text  # 顶部 chips 区已由边栏替代
+        assert '<a class="chip" href="#b-' not in text
+        assert '<a class="top" href="#top">' not in text  # 榜头回顶部移除
+        assert "回顶部" not in text
+
+
+def test_total_page_keeps_chips_and_top_links(client):
+    """P4 总星榜（§12.1 范围外，零改动）：无边栏；顶部 chips 区保留（17 chips）；每榜头"回顶部"保留（17 处）。"""
+    text = client.get("/total").text
+    assert '<aside class="sidebar"' not in text
+    assert '<div class="chips"' in text
+    assert text.count('<a class="chip" href="#b-') == 17
+    assert text.count('<a class="top" href="#top">') == 17
+
+
+def test_follows_filter_row_and_data_tags(follows_client):
+    """P6 筛选行（§12.2）：'全部'带关注总数（默认选中）；各标签 chip 带关注仓计数（0 也列出，字典序）；
+    行根带 data-tags 供客户端筛选；空态元素初始隐藏。"""
+    text = follows_client.get("/follows").text
+    assert '<div class="tag-filter"' in text
+    assert '<span class="grp">标签筛选</span>' in text
+    assert '<button type="button" class="fchip on" data-tag="">全部<i>5</i></button>' in text
+    assert '<button type="button" class="fchip" data-tag="AI">AI<i>0</i></button>' in text  # 未关注仓标签：0 也列出
+    assert '<button type="button" class="fchip" data-tag="选型观察">选型观察<i>1</i></button>' in text
+    assert text.index('data-tag="AI"') < text.index('data-tag="选型观察"')  # 字典序
+    # f/ts-hot 行（客户端筛选数据源；tojson|forceescape JSON 数组编码——实测形态：中文 \uXXXX 转义、引号 &#34;）
+    assert f'data-tags="{json.dumps(["选型观察"]).replace(chr(34), "&#34;")}"' in text
+    assert text.count('data-tags="[]"') == 4  # 其余四行无标签
+    assert 'id="filter-empty" hidden' in text
+    assert "该标签下暂无关注项目" in text
+
+
+def test_follows_filter_row_absent_when_empty(fresh_client):
+    """空关注页（§12.2）：不炸（200）；无筛选行与分组区（无行可筛），既有空态引导保留。"""
+    resp = fresh_client.get("/follows")
+    assert resp.status_code == 200
+    text = resp.text
+    assert "还没有关注任何项目：去榜单点行右侧 ☆，该项目每周增量会出现在这里" in text
+    assert 'class="tag-filter"' not in text
+    assert 'id="filter-empty"' not in text
+    assert 'id="follow-boards"' not in text
+
+
+# ---------- T-021 F2-1 回归：data-tags JSON 编码（标签名可含逗号） ----------
+
+
+def _seed_follows_comma_tags(conn):
+    """F2-1 回归种子（独立 fixture，不动 _seed_follows 共享平衡）：两关注仓——f/c-tag 单枚含逗号标签
+    `a,b`；f/i-tags 两枚独立标签 `a`/`b`。验证 JSON 数组编码下"逗号标签永不命中/误命中"双向修复。"""
+    rows = [
+        ("f/c-tag", ["a,b"]),
+        ("f/i-tags", ["a", "b"]),
+    ]
+    for i, (name, tags) in enumerate(rows):
+        repo_id = _add_repo(
+            conn,
+            name,
+            language="Python",
+            description_en=f"{name} desc",
+            snapshots=[(_iso_ago(days=7), 100), (_iso_ago(hours=1), 200)],
+        )
+        conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_id, f"2026-08-0{i + 1}T00:00:00Z"))
+        for t in tags:
+            conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, ?)", (repo_id, t))
+
+
+@pytest.fixture()
+def follows_comma_client(tmp_path, monkeypatch):
+    with _make_client(tmp_path, monkeypatch, _seed_follows_comma_tags) as c:
+        yield c
+
+
+def test_follows_filter_comma_tag_json_encoding(follows_comma_client):
+    """F2-1 回归：data-tags JSON 数组编码——含逗号标签 `a,b` 是单枚（chip 计数 1），独立标签 `a`/`b` 各计数 1，
+    两行 data-tags 分别精确为 JSON ["a,b"] 与 ["a", "b"]（实测转义形态：&#34;），互不误命中；
+    SQL 精确计数与 JSON 编码口径一致即修复成立（客户端命中由浏览器预演覆盖）。"""
+    text = follows_comma_client.get("/follows").text
+    assert '<button type="button" class="fchip on" data-tag="">全部<i>2</i></button>' in text
+    assert '<button type="button" class="fchip" data-tag="a">a<i>1</i></button>' in text
+    assert '<button type="button" class="fchip" data-tag="a,b">a,b<i>1</i></button>' in text  # 含逗号标签是单枚 chip
+    assert '<button type="button" class="fchip" data-tag="b">b<i>1</i></button>' in text
+    assert 'data-tags="[&#34;a,b&#34;]"' in text  # f/c-tag：单枚含逗号标签（JSON ["a,b"]）
+    assert 'data-tags="[&#34;a&#34;, &#34;b&#34;]"' in text  # f/i-tags：两枚独立标签（tojson 分隔符含空格）
+    assert text.count('data-tags="[&#34;') == 2  # 仅两行带标签 JSON，互不混淆
