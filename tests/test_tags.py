@@ -196,9 +196,11 @@ def test_tag_page_empty_state(client):
 
 
 def test_row_tag_controls_on_all_pages(client):
-    """行内增删控件（tag-add 按钮＋chip 链接）在 P1/P3/P4/P6 四页全部就位（共用 _row.html）。"""
+    """行内增删控件（tag-add 按钮＋chip 链接）在 P1/P3/P4/P6 四页全部就位（共用 _row.html）。
+
+    T-026 适配：榜单三页显式 board=all 全量语境（默认单榜 language-java 不渲染 a/py 行）。"""
     _seed_cloud(client)
-    for path in ("/", "/quarter", "/total"):
+    for path in ("/?board=all", "/quarter?board=all", "/total?board=all"):
         text = client.get(path).text
         assert 'class="tag-add" data-repo="a/py"' in text, path
         assert f'<a class="tag-link" href="/tags/{quote(TAG_CN, safe="")}">{TAG_CN}</a>' in text, path
@@ -209,11 +211,13 @@ def test_row_tag_controls_on_all_pages(client):
 
 
 def test_tags_persist_after_refresh(client):
-    """刷新后仍在：打标后重新 GET 页面断言 chip SSR 持久；删除后刷新不再出现。"""
+    """刷新后仍在：打标后重新 GET 页面断言 chip SSR 持久；删除后刷新不再出现。
+
+    T-026 适配：/total?board=all 全量语境（a/py 不在默认首榜）。"""
     client.post("/api/tags", json={"full_name": "a/py", "tag": TAG_CN})
-    total = client.get("/total")
+    total = client.get("/total?board=all")
     assert f'<span class="tag"><a class="tag-link" href="/tags/{quote(TAG_CN, safe="")}">{TAG_CN}</a>' in total.text
     assert 'class="tag-add" data-repo="a/py"' in total.text
     client.delete(f"/api/tags/a/py?tag={quote(TAG_CN)}")
-    after = client.get("/total")
+    after = client.get("/total?board=all")
     assert TAG_CN not in after.text

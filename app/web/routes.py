@@ -53,7 +53,15 @@ from app.collector.github import (
 from app.config import BASE_DIR, get_settings
 from app.db import get_conn
 from app.follows import follow_repo, unfollow_repo
-from app.report import Board, ReportRow, RisingRow, compute_boards, compute_repo_deltas, pool_days_label
+from app.report import (
+    OTHER_TOPIC_KEY,
+    Board,
+    ReportRow,
+    RisingRow,
+    compute_boards,
+    compute_repo_deltas,
+    pool_days_label,
+)
 
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"  # 供 app.main 挂载 StaticFiles（/static）
@@ -556,6 +564,77 @@ def _board_view(board: Board, **row_ctx) -> dict:
     }
 
 
+# ===== T-026 单榜整页（§13.1）：board 查询参数解析与边栏整页链接 =====
+
+_BOARD_ALL = "all"  # board=all → 全量 17 榜（保留全量入口，边栏顶部"全部"项）
+
+
+def _board_key_whitelist(topic_table: dict) -> frozenset[str]:
+    """17 榜 key 白名单（§13.1）：语言 7 + 主题（词表数 + 1），与 compute_boards 返回的 kind-key 同形态。
+
+    词表增删主题时榜数随之变化，白名单动态跟随（不写死 17）。
+    """
+    keys = [f"language-{k}" for k in (*LANGUAGES.values(), OTHER_LANGUAGE_KEY)]
+    keys += [f"topic-{k}" for k in (*topic_table, OTHER_TOPIC_KEY)]
+    return frozenset(keys)
+
+
+def _resolve_board(raw: str | None, topic_table: dict) -> str:
+    """board 查询参数解析（§13.1）：合法榜 key → 该榜；all → 全量；缺省/非法 → 默认首榜（静默降级不报错）。
+
+    默认首榜 = 语言组第一榜（language-java，LANGUAGES 顺序首项）。
+    """
+    if raw == _BOARD_ALL:
+        return _BOARD_ALL
+    if raw is not None and raw in _board_key_whitelist(topic_table):
+        return raw
+    return f"language-{next(iter(LANGUAGES.values()))}"
+
+
+def _sidebar_items(boards: list[Board], *, base: str, period_query: str, current: str) -> list[dict]:
+    """边栏项数据（T-026 §13.1 起边栏项为整页链接，原页内锚点 scrollspy 移除，active 由服务端渲染）。
+
+    - base/period_query：整页 URL 形态——P1/P2 `/?board=xxx`（历史周携带 `week=...`）、
+      P3 `/quarter?board=xxx`（携带 `quarter=...`）、P4 `/total?board=xxx`（无期次）；
+    - current：当前榜 key 或 "all"（全量/降级页当前为全部项）；
+    - 结构：顶部"全部"项（样式同 sb-item，灰点色，徽标=榜总数）→ 语言组头 + 7 项 → 主题组头 + 10 项；
+    - 徽标 = 单榜模式非当前榜用 Board.count（只计数不建行），全量模式 len(rows)——两边栏数据同源同语义。
+    """
+    items = [
+        {
+            "key": _BOARD_ALL,
+            "label": "全部",
+            "dot": _DEFAULT_LANG_COLOR,
+            "count": len(boards),
+            "active": current == _BOARD_ALL,
+            "href": f"{base}?board={_BOARD_ALL}" + (f"&{period_query}" if period_query else ""),
+        }
+    ]
+    last_kind: str | None = None
+    for b in boards:
+        kind_label = "语言" if b.kind == "language" else "主题"
+        if kind_label != last_kind:
+            items.append({"group": kind_label})
+            last_kind = kind_label
+        key = f"{b.kind}-{b.key}"
+        dot = (
+            LANG_COLORS.get(_LANG_KEY_TO_NAME.get(b.key, ""), _DEFAULT_LANG_COLOR)
+            if b.kind == "language"
+            else _DEFAULT_LANG_COLOR
+        )
+        items.append(
+            {
+                "key": key,
+                "label": b.label,
+                "dot": dot,
+                "count": b.count if b.count is not None else len(b.rows),
+                "active": current == key,
+                "href": f"{base}?board={key}" + (f"&{period_query}" if period_query else ""),
+            }
+        )
+    return items
+
+
 def _boards_context(
     request: Request,
     *,
@@ -565,23 +644,44 @@ def _boards_context(
     as_of_date: date,
     now: datetime,
     show_sidebar: bool,
+    board: str | None = None,
 ) -> dict:
-    """三页面共用的上下文装配：榜单（含首期空态降级）→ 元信息 → 期次控件。
+    """榜单四页共用的上下文装配：榜单（含首期空态降级）→ 元信息 → 期次控件 → 边栏。
 
-    show_sidebar（T-021 §12.1）：P1/P2/P3 榜单页 True → 模板以左侧边栏替代顶部 chips 区；
-    P4 总星页 False → 布局逐像素保持现状（首期空态降级随 handler 走，不因降级改变边栏与否）。
+    show_sidebar（T-021 §12.1，v2.1 修订）：榜单四页全部 True → 模板以左侧边栏替代顶部 chips 区
+    （P4 总星页 v2.1 起纳入，其顶部 chips 与榜头回顶部随之移除）。
+
+    board（T-026 §13.1）：board 查询参数解析结果——"all" 全量 17 榜；具体榜 key 单榜模式
+    （当前榜查全内容，其余 15 榜只 count 喂边栏徽标）；缺省/非法已静默降级为默认首榜；
+    首期空态降级页维持全量现状（不单榜化），board 参数忽略、当前边栏项为"全部"。
 
     DB 连接请求级获取/关闭（不持全局长连接）；WAL 下读榜单不阻塞每日采集写入。
     """
+    topic_table = _topic_table()
+    board_key = _resolve_board(board, topic_table)
     conn = get_conn()
     try:
-        boards = compute_boards(conn, _topic_table(), period=period, as_of=as_of, top_n=30)
+        boards = compute_boards(
+            conn,
+            topic_table,
+            period=period,
+            as_of=as_of,
+            top_n=30,
+            full_keys=None if board_key == _BOARD_ALL else {board_key},
+        )
         notice = None
         effective_period = period
-        if period in _NOMINAL_DAYS and all(not b.rows and not b.rising_rows for b in boards):
+        if period in _NOMINAL_DAYS and all(
+            not b.rows and not (b.count or 0) and not b.rising_rows for b in boards
+        ):
             # 首期空态降级（流程说明 §4，T-018 起主榜＋新区全空才降级）：增量榜全缺席 → 显示总星榜 + 顶部提示条
-            boards = compute_boards(conn, _topic_table(), period="total", as_of=as_of, top_n=30)
+            # （单榜模式同样走此判定，count 参与判定恢复两模式恒等（k3 初审 F2-1）：全量模式 count 恒 None，
+            #   not (b.count or 0) 恒真，本式退化为原判定；单榜模式非当前榜 count=min(归桶出席数, top_n)，
+            #   count>0 ⟺ 归桶非空 ⟺ 全量模式该榜 rows 非空（bucket 非空则 _top 至少 1 行）——两模式
+            #   "主榜＋新区全空"逐榜等价，单榜空榜 URL 不再误触发降级）
+            boards = compute_boards(conn, topic_table, period="total", as_of=as_of, top_n=30)
             effective_period = "total"
+            board_key = _BOARD_ALL  # 降级页维持全量现状（§13.1）：board 参数忽略，当前边栏项="全部"
             notice = _fallback_notice(conn, period, label, as_of_date, any(b.rows for b in boards))
 
         # 关注集只取两处展示用途：行内星标 on/off 态、顶栏"我的关注"计数徽标（v1.3 起关注区在 P6 独立页）
@@ -606,8 +706,24 @@ def _boards_context(
             "reason_label": rec_ctx["reason_label"],
             "show_recommend": rec_ctx["show_recommend"],
         }
-        lang_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "language"]
-        topic_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "topic"]
+        if board_key == _BOARD_ALL:
+            lang_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "language"]
+            topic_boards = [_board_view(b, **row_ctx) for b in boards if b.kind == "topic"]
+        else:
+            # 单榜模式（§13.1）：只对当前榜装配行视图（其余榜仅 count 已喂边栏徽标，不做行 view/渲染）
+            target = next(b for b in boards if f"{b.kind}-{b.key}" == board_key)
+            view = _board_view(target, **row_ctx)
+            lang_boards = [view] if target.kind == "language" else []
+            topic_boards = [view] if target.kind == "topic" else []
+
+        # T-026 边栏整页链接（§13.1）：历史周页携带 week=、季页携带 quarter=、最新周与总星页不带期次
+        period_query = ""
+        if period == "week" and label != _week_label(now.date()):
+            period_query = f"week={label}"
+        elif period == "quarter":
+            period_query = f"quarter={label}"
+        base = {"week": "/", "quarter": "/quarter", "total": "/total"}[period]
+        sidebar = _sidebar_items(boards, base=base, period_query=period_query, current=board_key)
 
         switcher = None
         if period in _NOMINAL_DAYS:
@@ -624,11 +740,12 @@ def _boards_context(
             "page": period,  # 顶栏 active 态：历史周次仍归属"本周报告"
             "title": title,
             "switcher": switcher,
-            "show_sidebar": show_sidebar,  # T-021 §12.1：True → 左侧边栏替代顶部 chips（P1/P2/P3）
+            "show_sidebar": show_sidebar,  # T-021 §12.1（v2.1）：榜单四页 True → 左侧边栏替代顶部 chips
             "meta": _meta(conn, period, as_of_date),  # 窗口/口径按请求期次展示，不因降级改写成总星榜口径
             "notice": notice,
             "follow_count": len(follow_rows),
             "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
+            "sidebar": sidebar,  # T-026 §13.1：边栏项整页链接（含"全部"项、服务端 active）
             "lang_boards": lang_boards,
             "topic_boards": topic_boards,
         }
@@ -640,10 +757,11 @@ def _boards_context(
 
 
 @router.get("/", response_class=HTMLResponse)
-def weekly(request: Request, week: str | None = None) -> HTMLResponse:
+def weekly(request: Request, week: str | None = None, board: str | None = None) -> HTMLResponse:
     """P1 本周报告（=最新一期）；?week=2026-W32 回看历史周次（P2 与 P1 同页换期次，流程说明 §1）。
 
-    T-021 §12.1：P1/P2 页边栏 = True（首期空态降级为 total 榜单时页面仍是周报语境，边栏保留）。
+    T-021 §12.1（v2.1）：榜单四页边栏 = True（首期空态降级为 total 榜单时页面仍是周报语境，边栏保留）。
+    T-026 §13.1：?board=xxx 单榜整页（缺省/非法静默降级默认首榜；board=all 全量；历史周携带 week=）。
     """
     now = datetime.now(timezone.utc)
     label, as_of, as_of_date = _resolve_week(week, now)
@@ -658,13 +776,17 @@ def weekly(request: Request, week: str | None = None) -> HTMLResponse:
             as_of_date=as_of_date,
             now=now,
             show_sidebar=True,
+            board=board,
         ),
     )
 
 
 @router.get("/quarter", response_class=HTMLResponse)
-def quarterly(request: Request, quarter: str | None = None) -> HTMLResponse:
-    """P3 季度回顾（90 天增量榜）；?quarter=2026-Q3 回看往期。T-021：边栏 = True（同周报页）。"""
+def quarterly(request: Request, quarter: str | None = None, board: str | None = None) -> HTMLResponse:
+    """P3 季度回顾（90 天增量榜）；?quarter=2026-Q3 回看往期。T-021：边栏 = True（同周报页）。
+
+    T-026 §13.1：?board=xxx 单榜整页（携带当前 quarter=）。
+    """
     now = datetime.now(timezone.utc)
     label, as_of, as_of_date = _resolve_quarter(quarter, now)
     return templates.TemplateResponse(
@@ -678,13 +800,19 @@ def quarterly(request: Request, quarter: str | None = None) -> HTMLResponse:
             as_of_date=as_of_date,
             now=now,
             show_sidebar=True,
+            board=board,
         ),
     )
 
 
 @router.get("/total", response_class=HTMLResponse)
-def total(request: Request) -> HTMLResponse:
-    """P4 总星榜：最新快照总星数降序 Top 30/榜，无期次概念。T-021 §12.1：P4 无边栏，布局保持现状。"""
+def total(request: Request, board: str | None = None) -> HTMLResponse:
+    """P4 总星榜：最新快照总星数降序 Top 30/榜，无期次概念。
+
+    T-021 §12.1（v2.1 修订）：P4 纳入边栏（实测同为 17 榜长页、HTML 1.7MB 全站最重），
+    其顶部 chips 区与榜头回顶部随边栏到位同步移除（与 P1/P2/P3 一致）。
+    T-026 §13.1：?board=xxx 单榜整页（无期次参数）。
+    """
     now = datetime.now(timezone.utc)
     return templates.TemplateResponse(
         request=request,
@@ -696,7 +824,8 @@ def total(request: Request) -> HTMLResponse:
             as_of=now.strftime(_ISO_FMT),
             as_of_date=now.date(),
             now=now,
-            show_sidebar=False,
+            show_sidebar=True,
+            board=board,
         ),
     )
 

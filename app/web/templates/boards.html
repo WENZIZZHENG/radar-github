@@ -14,9 +14,11 @@
 
 {% block content %}
 {% if show_sidebar %}
-{# T-021 §12.1 左侧边栏（P1/P2/P3，替代原第 2 层顶部 chips）：桌面 sticky 常驻、可收起为 44px 细条；
+{# T-021 §12.1 左侧边栏（榜单四页 P1/P2/P3/P4，替代原顶部 chips）：桌面 sticky 常驻、可收起为 44px 细条；
    窄屏（≤640px）边栏本体变左侧抽屉，配合悬浮钮 FAB＋半透明遮罩（开合/记忆逻辑在 radar.js，样式在 radar.css）。
-   边栏项顺序 = 榜块顺序（context 顺序），label 与榜内数量 = 榜块同源；无"回顶部"项（§12.1 拍板：sticky 常驻后回顶部冗余）。 #}
+   T-026 §13.1：边栏项为整页链接（?board=xxx，携带当前期次参数），顶部"全部"项（board=all 全量）；
+   当前榜项 active 由服务端渲染（原 scrollspy 已移除）；徽标 = 榜内主榜行数（单榜模式非当前榜只计数）。
+   边栏项顺序 = 榜块顺序（sidebar 上下文顺序），label 与数量 = 榜块同源；无"回顶部"项（§12.1 拍板）。 #}
 <div class="with-sidebar">
   <aside class="sidebar" aria-label="榜单导航">
     <div class="sb-head">
@@ -26,10 +28,10 @@
       <button type="button" class="sb-close" title="收起抽屉" data-close-drawer aria-label="收起抽屉"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
     </div>
     <nav class="sb-nav">
-      <div class="sb-grp">语言</div>
-      {%- for b in lang_boards %}<a class="sb-item" href="#{{ b.anchor }}" title="{{ b.label }}"><span class="sb-dot" style="background:{{ b.dot }}"></span><span class="sb-txt">{{ b.label }}</span><i>{{ b.rows | length }}</i></a>{% endfor -%}
-      <div class="sb-grp">主题</div>
-      {%- for b in topic_boards %}<a class="sb-item" href="#{{ b.anchor }}" title="{{ b.label }}"><span class="sb-dot" style="background:{{ b.dot }}"></span><span class="sb-txt">{{ b.label }}</span><i>{{ b.rows | length }}</i></a>{% endfor -%}
+      {# 全部项样式同 sb-item（独立 class sb-all 防与榜项计数混淆）；active 服务端渲染（当前为 all/降级页时高亮） #}
+      {%- for it in sidebar %}
+      {%- if it.group %}<div class="sb-grp">{{ it.group }}</div>{% else %}<a class="sb-item{% if it.key == 'all' %} sb-all{% endif %}{% if it.active %} active{% endif %}" href="{{ it.href }}" title="{{ it.label }}"><span class="sb-dot" style="background:{{ it.dot }}"></span><span class="sb-txt">{{ it.label }}</span><i>{{ it.count }}</i></a>{% endif %}
+      {%- endfor %}
     </nav>
   </aside>
   {# 窄屏遮罩与悬浮钮（桌面隐藏，CSS 控显隐） #}
@@ -44,33 +46,24 @@
 {# 首期/缺席降级提示条（流程说明 §4）：增量榜全缺席时显示总星榜 + 明确提示 #}
 {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 
-{# 第 2 层：锚点导航 chips（P4 总星页保留，逐像素不变）；P1/P2/P3 已由上方左侧边栏替代（show_sidebar 分支） #}
-{% if not show_sidebar %}
-<section>
-  <h2 class="sec">榜单直达</h2>
-  <div class="chips">
-    <span class="grp">语言</span>
-    {%- for b in lang_boards %}<a class="chip" href="#{{ b.anchor }}">{{ b.label }}<i>{{ b.rows | length }}</i></a>{% endfor -%}
-    <span class="grp" style="margin-left:10px">主题</span>
-    {%- for b in topic_boards %}<a class="chip" href="#{{ b.anchor }}">{{ b.label }}<i>{{ b.rows | length }}</i></a>{% endfor -%}
-  </div>
-</section>
-{% endif %}
-
-{# 第 3/4 层：榜单区（17 榜直出，顺序 = compute_boards 返回顺序；空榜也渲染板块）＋项目行 #}
+{# 第 3/4 层：榜单区（board=all 全量 17 榜直出；单榜模式只渲染当前榜块，另一组 section 不渲染——§13.1）＋项目行 #}
+{% if lang_boards %}
 <section>
   <h2 class="sec">语言榜单</h2>
   <div class="boards">
     {% for b in lang_boards %}{% include "_board.html" %}{% endfor %}
   </div>
 </section>
+{% endif %}
 
+{% if topic_boards %}
 <section>
   <h2 class="sec">主题榜单</h2>
   <div class="boards">
     {% for b in topic_boards %}{% include "_board.html" %}{% endfor %}
   </div>
 </section>
+{% endif %}
 
 {% if show_sidebar %}
   </main>

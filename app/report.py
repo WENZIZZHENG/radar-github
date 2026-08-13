@@ -116,6 +116,8 @@ class Board:
 
     rising_rows（T-018 决策 4 v2）：新崛起区行——在池跨度不足最小窗口的缺席仓按在池增量降序 Top 10，
     分区展示不与主榜混排；跨窗空洞缺席老仓不收（准入判定见 compute_boards）；total 口径恒空（无缺席概念）。
+    count（T-026 单榜整页 §13.1）：full_keys 模式下非当前榜只归桶计数不建行对象——rows 空、count=主榜行数，
+    供边栏徽标；全量模式恒 None（徽标直接用 len(rows)）。
     """
 
     kind: str  # "language" | "topic"
@@ -123,6 +125,7 @@ class Board:
     label: str  # 展示名：语言用 GitHub 精确名（"Java"…），主题用词表 label，两个兜底榜为"其它语言"/"其他"
     rows: list[ReportRow]
     rising_rows: list[RisingRow] = field(default_factory=list)
+    count: int | None = None  # T-026：单榜整页模式下非当前榜的主榜行数；None = 全量模式
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -255,6 +258,7 @@ def compute_boards(
     period: str = "week",
     as_of: str | None = None,
     top_n: int = 30,
+    full_keys: Collection[str] | None = None,
 ) -> list[Board]:
     """算指定口径的全部分类榜：语言榜 7 张 + 主题榜（词表主题数 + 1）张，每榜 Top top_n 行。
 
@@ -267,7 +271,13 @@ def compute_boards(
     - 首周缺席/无快照的仓库不进任何增量榜行；不足 top_n 的榜有多少列多少（不补位）；
     - 新崛起区（决策 4 v2）：准入＝在池跨度不足最小窗口的缺席仓（ABSENT_FIRST_WEEK 且 pool_days < win_min），
       按语言/主题同主榜归组、在池增量降序 Top 10（_RISING_TOP_N）；跨窗空洞缺席老仓（pool_days > win_max）
-      不进新区（回 v1 两不见）；total 口径无缺席概念恒空。
+      不进新区（回 v1 两不见）；total 口径无缺席概念恒空；
+    - full_keys（T-026 单榜整页 §13.1）：非 None 时仅指定榜 key（"kind-key" 形态，如 "language-java"）的榜
+      构建主榜行对象（rows），其余榜只归桶计数（rows 空、count=min(出席数, top_n)——与全量模式徽标
+      len(rows) 截断语义一致，两模式徽标不因 >top_n 漂移）——单榜模式的边栏徽标数据源；省的是 _top 排序＋
+      行视图装配＋模板渲染（传输体积），归桶与 compute_repo_deltas 仍全量（徽标计数/降级判定需要）；
+      新区行保持全量计算（缺席仓量级小，且降级判定"主榜＋新区全空才降级"需要全库新区信息）；
+      None = 既有全量行为（count 恒 None）。
     """
     as_of = as_of or utc_now_iso()
     deltas = compute_repo_deltas(conn, period=period, as_of=as_of)
@@ -334,32 +344,24 @@ def compute_boards(
 
     rising_lang_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_lang.items()}
     rising_topic_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_topic.items()}
-    boards: list[Board] = [
-        Board("language", key, name, _top(lang_buckets[key], period, top_n), rising_lang_top[key])
-        for name, key in LANGUAGES.items()
-    ]
-    boards.append(
-        Board(
-            "language",
-            OTHER_LANGUAGE_KEY,
-            "其它语言",
-            _top(lang_buckets[OTHER_LANGUAGE_KEY], period, top_n),
-            rising_lang_top[OTHER_LANGUAGE_KEY],
-        )
-    )
-    boards.extend(
-        Board("topic", key, spec["label"], _top(topic_buckets[key], period, top_n), rising_topic_top[key])
-        for key, spec in topic_table.items()
-    )
-    boards.append(
-        Board(
-            "topic",
-            OTHER_TOPIC_KEY,
-            "其他",
-            _top(topic_buckets[OTHER_TOPIC_KEY], period, top_n),
-            rising_topic_top[OTHER_TOPIC_KEY],
-        )
-    )
+    # T-026 单榜整页（§13.1）：full_keys 非 None 时仅指定榜构建主榜行对象，其余榜只归桶计数
+    # （rows 空、count=主榜行数，min(len, top_n) 与全量模式徽标 len(rows) 同语义——_top 截断后长度
+    # 恰为 min(出席数, top_n)，两模式徽标不因 >30 仓/榜漂移）；新区行全量（缺席仓量级小，
+    # 且降级判定"主榜＋新区全空才降级"需要全库新区信息，不能按 full_keys 收窄）
+    def _full(kind: str, key: str) -> bool:
+        return full_keys is None or f"{kind}-{key}" in full_keys
+
+    def _board(kind: str, key: str, label: str, lang: bool) -> Board:
+        bucket = lang_buckets[key] if lang else topic_buckets[key]
+        rising = rising_lang_top[key] if lang else rising_topic_top[key]
+        if _full(kind, key):
+            return Board(kind, key, label, _top(bucket, period, top_n), rising)
+        return Board(kind, key, label, [], rising, count=min(len(bucket), top_n))
+
+    boards: list[Board] = [_board("language", key, name, True) for name, key in LANGUAGES.items()]
+    boards.append(_board("language", OTHER_LANGUAGE_KEY, "其它语言", True))
+    boards.extend(_board("topic", key, spec["label"], False) for key, spec in topic_table.items())
+    boards.append(_board("topic", OTHER_TOPIC_KEY, "其他", False))
     return boards
 
 

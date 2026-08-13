@@ -646,7 +646,9 @@ async function recommendMissing(btn) {
   }
 })();
 
-// ---- T-021 §12.1 左侧边栏（仅 P1/P2/P3，页面含 .sidebar 才激活）：收起/展开记忆、移动抽屉、scrollspy ----
+// ---- T-021 §12.1 左侧边栏（榜单四页，页面含 .sidebar 才激活）：收起/展开记忆、移动抽屉 ----
+// T-026 §13.1：边栏项已改为整页链接（?board=xxx，服务端渲染 active），原 scrollspy 移除；
+// 旧页内锚点链接 `/#b-xxx` 由下方 hash 兼容跳转自动改写为 ?board=xxx 整页。
 
 const SB_KEY = "t021-sb-collapsed"; // 桌面收起态记忆键（§12.1：localStorage 跨会话保持）
 const SB_MQ = window.matchMedia("(max-width: 640px)"); // 断点与 radar.css 同值
@@ -666,7 +668,7 @@ function applySidebarView() {
   } else {
     let collapsed = false;
     try {
-      collapsed = localStorage.getItem(SB_KEY) === "1"; // 读失败（隐私模式/禁用站点数据）按展开默认，不中断 scrollspy
+      collapsed = localStorage.getItem(SB_KEY) === "1"; // 读失败（隐私模式/禁用站点数据）按展开默认，不中断边栏交互
     } catch (err) {
       collapsed = false;
     }
@@ -675,27 +677,8 @@ function applySidebarView() {
   }
 }
 
-// scrollspy（§12.1，原型已确认交互）：滚动时高亮当前所在榜对应边栏项（根 = 视口，与页面滚动一体）
-function initScrollSpy() {
-  const sidebar = document.querySelector(".sidebar");
-  if (!sidebar) return;
-  const items = [...sidebar.querySelectorAll(".sb-item")];
-  const boards = items.map((a) => document.getElementById(a.getAttribute("href").slice(1))).filter(Boolean);
-  if (!boards.length) return;
-  const io = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((en) => {
-        if (!en.isIntersecting) return;
-        items.forEach((a) => a.classList.toggle("active", a.getAttribute("href") === "#" + en.target.id));
-      });
-    },
-    { rootMargin: "-70px 0px -62% 0px", threshold: 0 } // 顶栏+榜头区让出 70px，底部 62% 判区（原型同参数）
-  );
-  boards.forEach((b) => io.observe(b));
-}
-
 // 边栏交互（桌面收起/展开、移动抽屉开合、抽屉内点选自动收回）：
-// 边栏项跳榜走原生锚点（href="#anchor"，全页 scroll-behavior: smooth 已就位），JS 不拦
+// 边栏项是整页链接（?board=xxx，T-026 §13.1），点击整页导航由浏览器处理，JS 不拦
 document.addEventListener("click", (e) => {
   const toggle = e.target.closest(".sb-toggle");
   if (toggle) {
@@ -721,10 +704,28 @@ document.addEventListener("click", (e) => {
   if (e.target.closest(".sb-item") && SB_MQ.matches) closeSidebarDrawer(); // 抽屉内点选后自动收回
 });
 
+// ---- T-026 §13.1 旧页内锚点链接兼容：`/#b-xxx` → `?board=xxx` 整页跳转 ----
+// 页面加载时若 hash 形如 #b-<合法榜 key> 且 URL 尚无 board 参数，location.replace 到对应 ?board= URL；
+// 已有 board 参数（含 board=all）不动，防循环。合法 key 集合 = 当前页边栏整页链接的 board 值
+// （服务端白名单渲染，客户端直接复用为白名单）。
+function redirectHashBoard() {
+  if (new URLSearchParams(location.search).has("board")) return; // URL 已有 board 参数：不动（防循环）
+  const m = /^#b-([a-z0-9-]+)$/.exec(location.hash);
+  if (!m) return;
+  const key = m[1];
+  const valid = [...document.querySelectorAll(".sidebar .sb-item[href*='board=']")].some((a) => {
+    const u = new URL(a.getAttribute("href"), location.href);
+    return u.searchParams.get("board") === key;
+  });
+  if (!valid) return;
+  const sep = location.search ? "&" : "?";
+  location.replace(location.pathname + location.search + sep + "board=" + key);
+}
+
 if (document.querySelector(".sidebar")) {
   applySidebarView();
   SB_MQ.addEventListener("change", applySidebarView);
-  initScrollSpy();
+  redirectHashBoard();
 }
 
 // ---- T-021 §12.2 P6 标签筛选（客户端筛选，不发请求；与取消关注即时移除兼容） ----

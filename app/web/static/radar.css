@@ -530,3 +530,16 @@ header.top .translate-all ~ .recommend-all { margin-left: 0; }
   .sb-toggle { display: none; }  /* 抽屉用关闭钮，收起钮无意义 */
   .sb-close { display: grid; margin-left: auto; }
 }
+
+/* ===== T-026 追加（单榜整页 §13.1 无样式变更——边栏项形态不变，仅 href 语义；移动端行两行布局 §13.2） ===== */
+
+/* 移动端（≤640px，断点与既有页面同值；置于文件末覆盖上方桌面规则）：榜单行两行布局——
+   第一行 = 排名＋项目名独占整宽（ellipsis 保留，宽度充足）；第二行 = 语言徽标＋本周增星＋总星＋关注星标。
+   纯展示层：不改数据与交互（整行可点/详情面板展开不变）；共用行模板，P1~P6 窄屏同步生效；桌面端形态不变（§13.2）。
+   实现：.row flex-wrap 强制换行，repo-wrap 让出 rank(14px)+gap(5px) 后独占整宽；
+   详情面板 .panel 是行后兄弟 div，不在 .row 内，不受换行影响。 */
+@media (max-width: 640px) {
+  .row { flex-wrap: wrap; }
+  .row .repo-wrap { flex-basis: calc(100% - 19px); }  /* rank 14px + gap 5px：项目名独占第一行 */
+  .row .badge { margin-right: auto; }  /* 第二行语言徽标左置、数字列贴右（与桌面右列定宽右对齐语义一致） */
+}

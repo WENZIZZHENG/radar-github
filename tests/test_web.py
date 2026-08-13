@@ -1,11 +1,13 @@
 """T-008 榜单页面测试：TestClient 打真实 app（lifespan 会跑 init_db），tmp_path 独立库（RADAR_DB_PATH 覆盖）+ 调度关闭。
 
 断言分两类：
-- 结构断言（时间稳健）：三页面 200、17 榜区块、P1/P2/P3 边栏 17 项（T-021 起替代顶部 chips，P4 保留 chips）、
+- 结构断言（时间稳健）：三页面 200、榜单区块数（T-026 起默认单榜 1 块、?board=all 17 块、降级页全量 17 块）、
+  P1/P2/P3/P4 边栏 18 项（17 榜项 + 1 "全部"项，T-026 §13.1 起 P4 纳入边栏替代 chips）、
   默认展开态、空态降级提示、期次参数 200/400；
   周/季出席数据随"今天"推移会滑出窗口，故不做数据内容断言（口径语义归 tests/test_report.py）。
-- 内容断言全走 /total（最新快照降序，无窗口概念，时间稳健）与首期空态（快照仅同一天）；
-  例外：历史期次页（/?week=2026-W32、/quarter?quarter=2026-Q3）as_of 固定、种子快照恒出席，允许内容断言（T-017 复验打回修复起）。
+- 内容断言全走 /total?board=all（最新快照降序，无窗口概念，时间稳健）与首期空态（快照仅同一天）；
+  例外：历史期次页（/?week=2026-W32&board=all、/quarter?quarter=2026-Q3&board=all）as_of 固定、
+  种子快照恒出席，允许内容断言（T-017 复验打回修复起；T-026 单榜后加 board=all 恢复全量语境）。
 """
 
 import json
@@ -131,18 +133,35 @@ def test_three_pages_ok(client):
 
 
 def test_index_has_17_boards_and_sidebar(client):
-    """T-021：17 榜齐备（语言 7 + 主题 10），空榜也渲染板块；左侧边栏 17 项一一对应（原顶部 chips 已由边栏替代）。"""
+    """T-021：17 榜齐备（语言 7 + 主题 10），空榜也渲染板块；左侧边栏 17 榜项一一对应（原顶部 chips 已由边栏替代）。
+
+    T-026 §13.1：无 board 参数 → 默认单榜（默认首榜 language-java，_seed_full 无 Java 仓 → 空态），
+    只渲染 1 个榜块；board=all 才全量 17 榜块。边栏恒为 18 项 = 17 榜项（class="sb-item"，与既有计数
+    兼容）+ 1 "全部"项（class="sb-item sb-all" 独立 class 防混淆）。
+    """
     text = client.get("/").text
-    assert text.count('class="board"') == 17  # class="boards" 容器不带右引号，不会被误计
+    assert text.count('class="board"') == 1  # 默认单榜：只渲染当前榜块（class="boards" 容器不带右引号，不会被误计）
+    assert 'id="b-language-java"' in text  # 默认首榜 = 语言组第一榜
+    assert text.count('id="b-language-') == 1 and text.count('id="b-topic-') == 0  # 单榜：语言榜块 1、主题榜块 0
+    assert "本期暂无数据" in text  # _seed_full 无 Java 仓 → 当前榜空态文案
     assert '<aside class="sidebar"' in text
-    assert text.count('class="sb-item"') == 17  # 边栏项 = 语言 7 + 主题 10
+    assert _sb_item_count(text) == 17  # 边栏榜项 = 语言 7 + 主题 10（"全部"项是 sb-all 独立 class）
+    assert _sb_all_count(text) == 1  # "全部"项（board=all 全量入口，§13.1）
     assert text.count('<a class="chip" href="#b-') == 0  # 顶部 chips 区不再渲染（边栏替代）
+    # board=all 全量 17 榜块（保留全量入口）
+    text_all = client.get("/?board=all").text
+    assert text_all.count('class="board"') == 17
+    assert _sb_item_count(text_all) == 17 and _sb_all_count(text_all) == 1
+    assert 'class="sb-item sb-all active"' in text_all  # 全量模式当前为"全部"项（服务端渲染 active）
 
 
 def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
     """首期降级判定变更（T-018）：主榜全空但新区有行 → 不降级（无 notice 无总星榜降级）；
-    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；17 板块仍在、边栏仍 17 项。"""
-    resp = fresh_client.get("/")
+    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；17 板块仍在、边栏仍 17 项。
+
+    T-026 适配：board=all 显式全量语境断言（默认单榜只渲染当前榜块，17 板块的全量断言归 board=all；
+    降级判定本身在单榜模式同样成立——?board=language-java 时全库新区有行 → 不降级，见新增测试）。"""
+    resp = fresh_client.get("/?board=all")
     assert resp.status_code == 200
     assert 'class="notice"' not in resp.text  # 新区有行 → 不降级
     assert "初始总星榜" not in resp.text  # 不降级到总星榜
@@ -150,7 +169,7 @@ def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
     assert "新崛起 · 入池未满一个统计窗口" in resp.text
     assert resp.text.count("本期暂无数据") == 17  # 主榜全空：每榜空态照常
     assert resp.text.count('class="board"') == 17
-    assert resp.text.count('class="sb-item"') == 17  # T-021：顶部 chips 已由左侧边栏替代（17 项）
+    assert _sb_item_count(resp.text) == 17  # T-021：顶部 chips 已由左侧边栏替代（17 项）
     assert "follows-sec" not in resp.text  # v1.3：P1 顶部关注区已移出为独立页 P6
     # 默认全部展开（D1/D3 v1.1）：行即展开态、面板 open、aria 同步
     assert 'class="row expanded"' in resp.text
@@ -160,8 +179,11 @@ def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
 
 def test_history_week_param(fresh_client):
     """历史周次参数：合法周 200 且页内显示该周次；快照首日所在周主榜空但新区有行 → 不降级；
-    跟踪池建立前的周次主榜新区全空 → 降级无数据提示。"""
-    resp = fresh_client.get(f"/?week={WEEK_LABEL}")
+    跟踪池建立前的周次主榜新区全空 → 降级无数据提示。
+
+    T-026 适配：a/new 属 Rust 语言＋devtools 主题，默认单榜（language-java）不渲染它——
+    指定 board=topic-devtools（其新区所在榜）做内容断言；board 参数与 week= 叠加生效（§13.1）。"""
+    resp = fresh_client.get(f"/?week={WEEK_LABEL}&board=topic-devtools")
     assert resp.status_code == 200
     assert WEEK_LABEL in resp.text  # 期次控件当前期标签
     # T-018：a/new 单张快照 → 新区有行 → 不再降级（as_of 恒 2026-08-09 期末，时间稳健）
@@ -171,7 +193,7 @@ def test_history_week_param(fresh_client):
     assert "首份周报预计将于" not in resp.text
     resp = fresh_client.get(f"/?week={PREV_WEEK_LABEL}")
     assert resp.status_code == 200
-    assert "暂无可展示数据" in resp.text  # 2026-08-02 之前无任何快照：主榜新区全空 → 降级
+    assert "暂无可展示数据" in resp.text  # 2026-08-02 之前无任何快照：主榜新区全空 → 降级（降级页全量现状）
 
 
 def test_week_param_invalid_and_future(client):
@@ -199,8 +221,10 @@ def test_quarter_param(client):
 
 
 def test_total_page_content(client):
-    """总星榜（时间稳健的内容断言载体）：中文描述两行形态、推荐语块、标签只读 chip、已关注星标实心。"""
-    resp = client.get("/total")
+    """总星榜（时间稳健的内容断言载体）：中文描述两行形态、推荐语块、标签只读 chip、已关注星标实心。
+
+    T-026 适配：内容断言走 /total?board=all（全量语境——默认单榜只渲染 language-java 空榜）。"""
+    resp = client.get("/total?board=all")
     assert resp.status_code == 200
     text = resp.text
     assert "a/py" in text and "a/go" in text
@@ -222,8 +246,10 @@ def test_follow_section_moved_off_weekly(client):
 
 
 def test_star_buttons_wired(client):
-    """T-009 接线：星标启用（不再 disabled）、带 data-repo 与关注/取消关注 title；toast 容器就位。"""
-    text = client.get("/total").text
+    """T-009 接线：星标启用（不再 disabled）、带 data-repo 与关注/取消关注 title；toast 容器就位。
+
+    T-026 适配：行断言走 /total?board=all（a/py/a/go 不在默认首榜）。"""
+    text = client.get("/total?board=all").text
     assert "关注功能开发中" not in text  # T-008 禁用态文案已移除
     assert "disabled" not in text  # 星标不再带 disabled 属性
     assert 'data-repo="a/py"' in text  # 未关注 → JS 据此 POST 关注
@@ -414,8 +440,10 @@ def test_display_maps_summary_fixed_mapping(tmp_path, monkeypatch):
 
 
 def test_total_page_shows_total_dimension_reason(client):
-    """总星榜页展示 ('total','all') 维度文本（§8.1）；行内推荐按钮按 total 维度渲染。"""
-    text = client.get("/total").text
+    """总星榜页展示 ('total','all') 维度文本（§8.1）；行内推荐按钮按 total 维度渲染。
+
+    T-026 适配：走 /total?board=all（a/py/a/go 不在默认首榜）。"""
+    text = client.get("/total?board=all").text
     assert "本周亮点：测试推荐语" in text  # total 行文本（_seed_full 插入）
     assert "<b>总星榜推荐语</b>" in text  # 块标题维度标识（2026-08-12 复验反馈钉死）
     assert 'class="recommend-btn" data-repo="a/py" data-dim="total" data-period-label="all" data-has-reason="1">重新生成</button>' in text
@@ -427,8 +455,9 @@ def test_week_page_shows_week_dimension_reason_with_label(client):
 
     历史周页 as_of 固定（2026-08-09 期末，起点 08-02 span=7 恒出席），时间稳健——当期 / 断言会随
     "今天"滑窗转红，故不走默认周页。
+    T-026 适配：board=all 全量语境（默认单榜 language-java 空榜无行）。
     """
-    text = client.get("/?week=2026-W32").text
+    text = client.get("/?week=2026-W32&board=all").text
     assert "周报亮点：周推荐语" in text  # week 行文本（_seed_full 按固定期次标签插入）
     assert "<b>周榜推荐语 · 2026-W32</b>" in text  # 维度标题带期次：与总星榜文本一眼可辨
 
@@ -438,8 +467,9 @@ def test_quarter_page_shows_quarter_dimension_reason_with_label(client):
 
     种子 05-11→08-09 跨度 90 天落在 86~94 季窗口内：历史季页 as_of 恒 2026-09-30（期末端点 08-09、
     起点候选 05-11 恒出席）；当前季取 now 时 08-09 仍为期末端点，两种取值下均出席，时间稳健。
+    T-026 适配：board=all 全量语境（默认单榜 language-java 空榜无行）。
     """
-    text = client.get("/quarter?quarter=2026-Q3").text
+    text = client.get("/quarter?quarter=2026-Q3&board=all").text
     assert "季报亮点：季推荐语" in text  # quarter 行文本（_seed_full 按固定期次标签插入）
     assert "<b>季榜推荐语 · 2026-Q3</b>" in text  # 维度标题带期次：与总星榜文本一眼可辨
 
@@ -455,8 +485,10 @@ def test_follows_page_has_recommend_button(follows_client):
 
 def test_row_summary_block_on_history_week_page(client):
     """历史周页（as_of 固定，时间稳健）：行面板推荐语块下方渲染"AI 概要"块＋概要文本；
-    无概要行的仓（a/rise 新区行）不渲染概要块。"""
-    text = client.get(f"/?week={WEEK_LABEL}").text
+    无概要行的仓（a/rise 新区行）不渲染概要块。
+
+    T-026 适配：board=all 全量语境（默认单榜 language-java 空榜无行）。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=all").text
     assert "概要文本：Python 库" in text and "概要文本：Go 库" in text  # 概要文本随行渲染
     # a/py、a/go 各跨两个榜（语言榜＋主题榜）渲染两行 → 4 块；a/rise 新区行无概要行 → 无块（降级）
     assert text.count('<div class="summary"><b>AI 概要</b>') == 4
@@ -489,8 +521,10 @@ def test_no_summary_row_renders_no_summary_block(fresh_client):
 
 
 def test_week_history_page_rising_section(client):
-    """新区小节渲染（历史周页 as_of 固定，时间稳健）：区头/小字说明/计数徽标/入池标注 +X（入池 N 天）。"""
-    text = client.get(f"/?week={WEEK_LABEL}").text
+    """新区小节渲染（历史周页 as_of 固定，时间稳健）：区头/小字说明/计数徽标/入池标注 +X（入池 N 天）。
+
+    T-026 适配：board=all 全量语境（a/rise 属 Rust＋cli，不在默认首榜 language-java）。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=all").text
     assert "新崛起 · 入池未满一个统计窗口" in text
     assert "以下项目入池不足 7 天，按入池以来增星排序" in text
     assert "a/rise" in text
@@ -500,8 +534,10 @@ def test_week_history_page_rising_section(client):
 
 
 def test_quarter_history_page_rising_section(client):
-    """季页新区同款（历史季页 as_of 固定）：小字说明 90 天版＋入池标注。"""
-    text = client.get("/quarter?quarter=2026-Q3").text
+    """季页新区同款（历史季页 as_of 固定）：小字说明 90 天版＋入池标注。
+
+    T-026 适配：board=all 全量语境（a/rise 不在默认首榜）。"""
+    text = client.get("/quarter?quarter=2026-Q3&board=all").text
     assert "新崛起 · 入池未满一个统计窗口" in text
     assert "以下项目入池不足 90 天，按入池以来增星排序" in text
     assert "+300（入池 3 天）" in text
@@ -512,20 +548,24 @@ def test_rising_section_absent_on_total_and_empty_boards(client):
     text = client.get("/total").text
     assert "新崛起" not in text
     assert "入池未满" not in text
-    text = client.get(f"/?week={WEEK_LABEL}").text
-    # _seed_full 中仅 a/rise（Rust＋cli）缺席：语言 rust 榜与主题 other 榜各一个新区小节，其余榜无区头
+    # T-026 适配：board=all 全量语境（默认单榜只渲染 language-java 空榜）
+    text = client.get(f"/?week={WEEK_LABEL}&board=all").text
+    # _seed_full 中仅 a/rise（Rust＋cli）缺席：语言 rust 榜与主题 devtools 榜各一个新区小节，其余榜无区头
     assert text.count("新崛起 · 入池未满一个统计窗口") == 2
 
 
 def test_sidebar_badges_exclude_rising_rows(client):
-    """T-021：边栏项徽标只计主榜行数不计新区（历史周页 as_of 固定）：rust 榜主榜 0 行但新区 1 行，徽标仍 0。"""
-    text = client.get(f"/?week={WEEK_LABEL}").text
+    """T-021：边栏项徽标只计主榜行数不计新区（历史周页 as_of 固定）：rust 榜主榜 0 行但新区 1 行，徽标仍 0。
+
+    T-026 适配：边栏项改整页链接（href 携带 board= 与当前 week=，§13.1）；board=all 全量语境。
+    （Jinja autoescape：href 中 & 渲染为 &amp;，浏览器点击时还原为 &——断言匹配转义后形态）"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=all").text
     assert (
-        'class="sb-item" href="#b-language-rust" title="Rust"><span class="sb-dot" style="background:#dea584">'
+        'class="sb-item" href="/?board=language-rust&amp;week=2026-W32" title="Rust"><span class="sb-dot" style="background:#dea584">'
         '</span><span class="sb-txt">Rust</span><i>0</i></a>' in text
     )
     assert (
-        'class="sb-item" href="#b-language-python" title="Python"><span class="sb-dot" style="background:#4b8bbe">'
+        'class="sb-item" href="/?board=language-python&amp;week=2026-W32" title="Python"><span class="sb-dot" style="background:#4b8bbe">'
         '</span><span class="sb-txt">Python</span><i>1</i></a>' in text
     )
 
@@ -585,14 +625,18 @@ def test_endpoint_note_slice_shape():
 
 
 def test_row_endpoint_note_on_history_week_page(client):
-    """历史周页（as_of 固定，时间稳健）：主榜行＋新区行面板都渲染端点快照日期标注（_seed_full 端点恒 2026-08-09）。"""
-    text = client.get(f"/?week={WEEK_LABEL}").text
+    """历史周页（as_of 固定，时间稳健）：主榜行＋新区行面板都渲染端点快照日期标注（_seed_full 端点恒 2026-08-09）。
+
+    T-026 适配：board=all 全量语境（默认单榜 language-java 空榜无行）。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=all").text
     assert text.count("端点快照 2026-08-09") >= 3  # 主榜 a/py、a/go 两行＋新区 a/rise 行
 
 
 def test_row_endpoint_note_on_total_page(client):
-    """total 页端点日期标注（时间稳健：种子端点恒 2026-08-09）。"""
-    assert "端点快照 2026-08-09" in client.get("/total").text
+    """total 页端点日期标注（时间稳健：种子端点恒 2026-08-09）。
+
+    T-026 适配：/total?board=all 全量语境（a/py 不在默认首榜）。"""
+    assert "端点快照 2026-08-09" in client.get("/total?board=all").text
 
 
 def test_row_endpoint_note_on_follows_page(follows_client):
@@ -654,7 +698,7 @@ def test_sidebar_on_week_and_quarter_pages(client):
         assert '<span class="sb-title">榜单直达</span>' in text
         assert 'class="sb-toggle"' in text
         assert 'class="sb-grp">语言' in text and 'class="sb-grp">主题' in text
-        assert text.count('class="sb-item"') == 17  # 语言 7 + 主题 10，顺序 = 榜块顺序
+        assert _sb_item_count(text) == 17  # 语言 7 + 主题 10，顺序 = 榜块顺序
         assert '<div class="chips"' not in text  # 顶部 chips 区已由边栏替代
         assert '<a class="chip" href="#b-' not in text
         assert '<a class="top" href="#top">' not in text  # 榜头回顶部移除
@@ -662,12 +706,21 @@ def test_sidebar_on_week_and_quarter_pages(client):
 
 
 def test_total_page_keeps_chips_and_top_links(client):
-    """P4 总星榜（§12.1 范围外，零改动）：无边栏；顶部 chips 区保留（17 chips）；每榜头"回顶部"保留（17 处）。"""
+    """P4 总星榜（§12.1 v2.1 修订，T-026 落地）：纳入边栏——边栏就位（17 榜项＋1 全部项）、
+    顶部 chips 区移除、每榜头"回顶部"移除（与 P1/P2/P3 一致）。"""
     text = client.get("/total").text
-    assert '<aside class="sidebar"' not in text
-    assert '<div class="chips"' in text
-    assert text.count('<a class="chip" href="#b-') == 17
-    assert text.count('<a class="top" href="#top">') == 17
+    assert '<aside class="sidebar"' in text
+    assert _sb_item_count(text) == 17
+    assert _sb_all_count(text) == 1
+    assert text.count('class="board"') == 1  # 默认单榜（language-java 空榜）
+    assert 'id="b-language-java"' in text
+    assert '<div class="chips"' not in text  # 顶部 chips 区已由边栏替代
+    assert text.count('<a class="chip" href="#b-') == 0
+    assert '<a class="top" href="#top">' not in text  # 榜头回顶部移除
+    assert "回顶部" not in text
+    # 边栏 href 为 /total?board=xxx（P4 无期次参数）
+    assert 'href="/total?board=language-java"' in text
+    assert 'href="/total?board=all"' in text
 
 
 def test_follows_filter_row_and_data_tags(follows_client):
@@ -739,3 +792,176 @@ def test_follows_filter_comma_tag_json_encoding(follows_comma_client):
     assert 'data-tags="[&#34;a,b&#34;]"' in text  # f/c-tag：单枚含逗号标签（JSON ["a,b"]）
     assert 'data-tags="[&#34;a&#34;, &#34;b&#34;]"' in text  # f/i-tags：两枚独立标签（tojson 分隔符含空格）
     assert text.count('data-tags="[&#34;') == 2  # 仅两行带标签 JSON，互不混淆
+
+
+# ---------- T-026：单榜整页（§13.1）＋P4 纳入边栏（§12.1 v2.1） ----------
+# 内容断言全部走历史期次页（as_of 固定时间稳健）＋board 参数叠加，遵守本文件时间稳健约定。
+
+
+def _sb_item_count(text: str) -> int:
+    """边栏榜项数（T-026 起 active 由服务端渲染）：纯 `class="sb-item"` 项 + `class="sb-item active"` 项
+    （两形态精确子串互斥：active 项不落入纯形态计数），任一 active 组合下总数恒 = 17 榜项。"""
+    return text.count('class="sb-item"') + text.count('class="sb-item active"')
+
+
+def _sb_all_count(text: str) -> int:
+    """边栏"全部"项数（同 _sb_item_count 口径）：非 active 与 active 两形态互斥，合计恒 = 1。"""
+    return text.count('class="sb-item sb-all"') + text.count('class="sb-item sb-all active"')
+
+
+def test_board_param_renders_only_that_board(client):
+    """指定 board 只渲染该榜内容（行＋新区＋空态），其余 15 榜只供边栏徽标（17 项仍在）；
+    单榜主题榜同样只渲染当前主题榜块（另一组 section 不渲染）。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=language-python").text
+    assert text.count('class="board"') == 1
+    assert 'id="b-language-python"' in text
+    assert text.count('id="b-language-') == 1 and text.count('id="b-topic-') == 0
+    assert "a/py" in text  # 历史周出席行
+    assert "a/go" not in text  # Go 仓不在 Python 榜：不渲染
+    assert "新崛起" not in text  # python 榜无新区（a/rise 属 Rust＋cli）
+    assert _sb_item_count(text) == 17  # 其余 15 榜徽标照常（只计数）
+    assert _sb_all_count(text) == 1
+    # 单榜主题榜：只渲染 ai 主题榜块
+    text_ai = client.get(f"/?week={WEEK_LABEL}&board=topic-ai").text
+    assert text_ai.count('class="board"') == 1
+    assert 'id="b-topic-ai"' in text_ai
+    assert text_ai.count('id="b-language-') == 0 and text_ai.count('id="b-topic-') == 1
+    assert "a/py" in text_ai  # a/py 命中 ai 主题（pytorch）
+    assert "a/go" not in text_ai
+
+
+def test_single_board_rising_section(client):
+    """单榜模式当前榜内容区 = 主榜行＋新崛起区＋空态文案（§13.1）：历史周 rust 榜新区 a/rise 照常渲染。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=language-rust").text
+    assert text.count('class="board"') == 1 and 'id="b-language-rust"' in text
+    assert "新崛起 · 入池未满一个统计窗口" in text
+    assert "a/rise" in text
+    assert "+300（入池 3 天）" in text
+
+
+def test_invalid_board_falls_back_to_first_board(client):
+    """非法 board → 静默降级默认首榜（不报错页，§13.1）。"""
+    for bad in ("foo", "b-language-java", ""):
+        resp = client.get(f"/?board={bad}")
+        assert resp.status_code == 200, bad
+        assert resp.text.count('class="board"') == 1, bad
+        assert 'id="b-language-java"' in resp.text, bad
+
+
+def test_history_week_board_param_and_sidebar_href(client):
+    """P1 历史周页 week+board 叠加生效；边栏整页链接携带当前 week=（§13.1）；"全部"项也在；
+    最新周（无 week 参数）边栏 href 不带期次。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=language-python").text
+    assert text.count('class="board"') == 1 and 'id="b-language-python"' in text
+    # href 中 & 经 Jinja autoescape 渲染为 &amp;（浏览器点击时还原为 &，跳转语义不变）
+    assert 'class="sb-item active" href="/?board=language-python&amp;week=2026-W32"' in text
+    assert 'href="/?board=language-java&amp;week=2026-W32"' in text
+    assert 'class="sb-item sb-all" href="/?board=all&amp;week=2026-W32"' in text
+    text_now = client.get("/?board=language-python").text
+    assert 'href="/?board=language-java"' in text_now
+    assert 'class="sb-item sb-all" href="/?board=all"' in text_now
+
+
+def test_quarter_board_param_carries_quarter(client):
+    """P3 季度页 board 叠加：?quarter=2026-Q3&board=language-python 渲染 python 榜（a/py 历史季恒出席）；
+    边栏 href 携带当前 quarter=（§13.1）。"""
+    text = client.get("/quarter?quarter=2026-Q3&board=language-python").text
+    assert text.count('class="board"') == 1 and 'id="b-language-python"' in text
+    assert "a/py" in text  # 05-11→08-09 跨度 90 天恒出席（历史季 as_of 固定）
+    # href 中 & 经 Jinja autoescape 渲染为 &amp;（浏览器点击时还原为 &，跳转语义不变）
+    assert 'class="sb-item active" href="/quarter?board=language-python&amp;quarter=2026-Q3"' in text
+    assert 'href="/quarter?board=language-java&amp;quarter=2026-Q3"' in text
+    assert 'class="sb-item sb-all" href="/quarter?board=all&amp;quarter=2026-Q3"' in text
+
+
+def test_sidebar_active_rendered_server_side(client):
+    """当前榜项 active 由服务端渲染（原 scrollspy 移除，§13.1）：单榜页对应项高亮、其余项不高亮；
+    默认首榜与 all 全量各自高亮对应项。"""
+    text = client.get("/?board=topic-ai").text
+    assert 'class="sb-item active" href="/?board=topic-ai"' in text
+    assert 'class="sb-item active" href="/?board=language-java"' not in text  # 非当前榜不高亮
+    assert 'class="sb-item sb-all active"' not in text
+    text_default = client.get("/").text
+    assert 'class="sb-item active" href="/?board=language-java"' in text_default  # 默认首榜高亮
+    assert 'class="sb-item sb-all active"' not in text_default
+    text_all = client.get("/?board=all").text
+    assert 'class="sb-item sb-all active"' in text_all  # 全量：全部项高亮
+
+
+def test_single_board_sidebar_badges_match_full(client):
+    """单榜模式边栏徽标与全量模式一致（其余 15 榜只 count，不因单榜化失真）：
+    _seed_full 历史周——Java 0 行、Python 1 行、ai 主题 1 行、后端/云原生 0 行、other 主题 1 行（a/go）。"""
+    text = client.get(f"/?week={WEEK_LABEL}&board=language-python").text
+    assert (
+        'title="Java"><span class="sb-dot" style="background:#c9842a"></span><span class="sb-txt">Java</span><i>0</i></a>'
+        in text
+    )
+    assert (
+        'title="Python"><span class="sb-dot" style="background:#4b8bbe"></span><span class="sb-txt">Python</span><i>1</i></a>'
+        in text
+    )
+    assert 'title="AI与智能"><span class="sb-dot" style="background:#8b98a9"></span><span class="sb-txt">AI与智能</span><i>1</i></a>' in text
+    assert 'title="后端/云原生"><span class="sb-dot" style="background:#8b98a9"></span><span class="sb-txt">后端/云原生</span><i>0</i></a>' in text
+    assert 'title="其他"><span class="sb-dot" style="background:#8b98a9"></span><span class="sb-txt">其他</span><i>1</i></a>' in text
+
+
+def test_fallback_page_ignores_board_param(tmp_path, monkeypatch):
+    """首期降级页维持全量现状（§13.1：不单榜化）：带 board 参数仍全量 17 榜＋notice＋当前边栏项="全部"。"""
+
+    def _get_page(db_name):
+        db = tmp_path / db_name
+        init_db(db)
+        conn = get_conn(db)
+        _add_repo(conn, "a/no-snap", language="Python", snapshots=[])
+        conn.commit()
+        conn.close()
+        monkeypatch.setenv("RADAR_DB_PATH", str(db))
+        monkeypatch.setenv("RADAR_JOBS_ENABLED", "0")
+        with TestClient(app) as c:
+            return c.get("/?board=language-java")
+
+    resp = _get_page("web-fallback-board.db")
+    assert resp.status_code == 200
+    assert 'class="notice"' in resp.text and "暂无可展示数据" in resp.text
+    assert resp.text.count('class="board"') == 17  # 降级页全量（board 参数忽略，不单榜化）
+    assert _sb_item_count(resp.text) == 17
+    assert 'class="sb-item sb-all active"' in resp.text  # 当前边栏项="全部"（降级页非单榜）
+
+
+def _seed_partial_boards_old_repos(conn):
+    """F2-1 回归种子（独立种子函数，不动 _seed_full/_seed_first_day 共享 fixture 平衡）：
+    历史周部分榜有行＋全库无新区行——a/py 两端快照跨度 7 天（≥ 周窗口下限 5 天）出席进 python 榜主榜；
+    不造任何缺席仓（单快照仓会进新区，见 _seed_first_day）→ 全库无新区行，锁定"主榜部分有行"是唯一非空来源。
+
+    复现场景：?board=language-java（当前榜空）时非当前榜 python 有出席行——修复前判定式 all(not b.rows ...)
+    只认 rows，单榜模式非当前榜 rows 恒空 → 误判全空触发降级；修复后 count 参与判定（count>0 ⟺ 归桶非空
+    ⟺ 全量模式该榜 rows 非空），两模式判定恒等，不再误降级。"""
+    _add_repo(
+        conn,
+        "a/py",
+        language="Python",
+        topics=[],
+        description_en="Python lib",
+        snapshots=[("2026-08-02T00:00:00Z", 300), (f"{SNAP_DAY}T00:00:00Z", 400)],
+    )
+
+
+def test_single_board_fallback_equivalence_partial_boards(tmp_path, monkeypatch):
+    """F2-1（k3 初审中）：单榜模式降级判定与全量模式恒等——部分榜有行时，主榜为空的单榜 URL
+    不再误触发降级。
+
+    种子＝历史周（WEEK_LABEL，as_of 恒 2026-08-09 期末）部分榜有行＋全库无新区行；?board=language-java
+    （当前榜空）→ 200、无降级 notice（class="notice" 不出现）、当前榜块渲染既有空态"本期暂无数据"；
+    对照 ?board=all 同期次正常渲染全量（a/py 出席行在，本就不降级）。"""
+    with _make_client(tmp_path, monkeypatch, _seed_partial_boards_old_repos) as c:
+        resp = c.get(f"/?week={WEEK_LABEL}&board=language-java")
+        assert resp.status_code == 200
+        assert 'class="notice"' not in resp.text  # 修复前此处误触发降级（假 notice 文案）
+        assert resp.text.count('class="board"') == 1  # 未降级：仍单榜页
+        assert 'id="b-language-java"' in resp.text
+        assert "本期暂无数据" in resp.text  # 当前榜空态照常
+        assert 'class="sb-item sb-all active"' not in resp.text  # 未降级：当前边栏项不是"全部"
+        text_all = c.get(f"/?week={WEEK_LABEL}&board=all").text
+        assert 'class="notice"' not in text_all  # 对照：同期全量模式本就不降级
+        assert "a/py" in text_all
+        assert text_all.count('class="board"') == 17

@@ -522,7 +522,7 @@ def test_row_recommend_button_ssr_states(tmp_path, monkeypatch):
         conn.commit()
 
     with _make_client(tmp_path, monkeypatch, seed=seed) as client:
-        text = client.get("/total").text
+        text = client.get("/total?board=all").text  # T-026：board=all 全量语境（a/en/a/zh 无语言 → 其它语言榜）
     assert 'class="recommend-btn" data-repo="a/en" data-dim="total" data-period-label="all" data-has-reason="1">重新生成</button>' in text  # a/en 有 total 行
     assert 'class="recommend-btn" data-repo="a/zh" data-dim="total" data-period-label="all" data-has-reason="0">生成推荐语</button>' in text  # a/zh 无 → 按态
     header_section = text.split("</header>", 1)[0]

@@ -396,7 +396,7 @@ def test_row_translate_button_ssr_states(tmp_path, monkeypatch):
         _add_repo(conn, "a/zh", description_en="english too", description_zh="已译")
 
     with _make_client(tmp_path, monkeypatch, seed=seed) as client:
-        text = client.get("/total").text
+        text = client.get("/total?board=all").text  # T-026：board=all 全量语境（a/en/a/zh 无语言 → 其它语言榜）
     assert 'class="translate-btn" data-repo="a/en" data-has-zh="0">翻译</button>' in text
     assert 'class="translate-btn" data-repo="a/zh" data-has-zh="1">重新翻译</button>' in text
     header_section = text.split("</header>", 1)[0]  # 顶栏段：批量按钮必须在 header.top 内

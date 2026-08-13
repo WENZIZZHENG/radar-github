@@ -222,6 +222,34 @@ def test_boards_structure_and_order(conn, topic_table):
     assert all(isinstance(b.rows, list) for b in boards)
 
 
+def test_full_keys_badge_count_equals_full_rows(conn, topic_table):
+    """T-026 单榜整页徽标恒等（k3 初审 F3-6）：full_keys 模式非当前榜 count=min(出席数, top_n)，
+    与全量模式该榜 len(rows) 恒等（>top_n 截断两模式同口径）；非当前榜 rows 恒空、当前榜全量构建
+    （count 恒 None，页面徽标走 len(rows)），两模式徽标不因单榜化漂移。"""
+    for i in range(35):  # >top_n=30：截断语义两模式对齐
+        _add_repo(conn, f"a/py{i:02d}", language="Python", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+    for i in range(3):
+        _add_repo(conn, f"a/go{i}", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+
+    single = compute_boards(conn, topic_table, period="week", as_of=AS_OF, full_keys={"language-python"})
+    full = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+
+    py_single, py_full = _board(single, "language", "python"), _board(full, "language", "python")
+    assert py_single.count is None  # 当前榜全量构建：count 恒 None（全量语义）
+    assert len(py_single.rows) == len(py_full.rows) == 30  # _top 截断 top_n=30
+    assert len(py_single.rows) == min(35, 30)
+
+    go_single, go_full = _board(single, "language", "go"), _board(full, "language", "go")
+    assert go_single.rows == []  # 非当前榜不建行对象（full_keys 语义）
+    assert go_single.count == len(go_full.rows) == 3 == min(3, 30)  # 徽标恒等
+
+    java_single, java_full = _board(single, "language", "java"), _board(full, "language", "java")
+    assert java_single.rows == [] and java_single.count == 0  # 空榜：count=0 ≡ 全量 rows=[]
+    assert len(java_full.rows) == 0
+
+    assert py_single.rising_rows == [] and go_single.rising_rows == []  # 全库无缺席仓 → 新区恒空（两模式一致）
+
+
 def test_repo_without_snapshots_not_in_deltas(conn, topic_table):
     """零快照仓库不进 deltas（docstring 承诺锁定）：无总星数可展示，任何榜都安放不了。"""
     repo_empty = _add_repo(conn, "a/empty", language="Go")  # 无快照
