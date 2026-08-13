@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>原型 · T-021 左侧边栏导航 + P6 标签筛选（新视觉元素提案）</title>
+<link rel="stylesheet" href="../../app/web/static/radar.css">
+<!--
+  T-021 同保真原型（2026-08-13，开发前本人确认用）：
+  - 依据：《交互流程说明》§12.1 左侧边栏导航（仅 P1/P2/P3）＋§12.2 P6 标签筛选（v2.0 已拍板口径）
+  - 范围：四个视图锚点陈列 —— ① 桌面边栏展开态（1440px） ② 桌面边栏收起态 ③ 移动端收起态＋抽屉展开态（375px） ④ P6 标签筛选行
+  - 样式：既有视觉基线直接 link ../app/web/static/radar.css 复用；边栏/筛选行/FAB/抽屉等
+    新组件样式在本文件 <style> 内定义（标注"提案样式，确认后迁 radar.css"）
+  - 红线遵守：仅本文件＋原型-T021-shots/ 为新增；不改 app/、不改既有示意图.html；
+    不引任何外部资源（无字体外链，系统字体栈），静态 HTML＋少量 vanilla JS，零依赖零构建
+  - 假数据沿用示意图 v4 风格（仓库名/星数/增量）；榜单仅渲染 3 块示意（Python/Java/AI与智能），
+    其余边栏项点击弹提示（原型范围说明）
+-->
+<style>
+  /* ================= T-021 提案样式（确认后迁 radar.css；未确认前仅本原型生效） ================= */
+
+  /* 原型演示骨架：工具条 / 视图分区（非产品 UI，不迁移） */
+  .proto-bar {
+    position: sticky; top: 0; z-index: 60;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 20px;
+    background: rgba(11,18,32,.96); border-bottom: 1px solid rgba(34,197,94,.35);
+  }
+  .proto-bar .pb-title { font-size: 13px; font-weight: 600; color: var(--accent-hi); }
+  .proto-bar .pb-sub { font-size: 12px; color: var(--text-3); }
+  .proto-bar a.pb-jump {
+    font-size: 12px; color: var(--blue); border: 1px solid rgba(88,166,255,.35);
+    border-radius: var(--r-pill); padding: 3px 12px; text-decoration: none;
+    transition: background var(--t-fast) ease;
+  }
+  .proto-bar a.pb-jump:hover { background: rgba(88,166,255,.12); }
+  .proto-bar .pb-note { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
+
+  .view { position: relative; }
+  .view + .view { border-top: 1px dashed var(--line-strong); margin-top: 36px; padding-top: 26px; }
+  .view-label { max-width: 1440px; margin: 0 auto 12px; padding: 0 20px; font-size: 14px; color: var(--text-1); }
+  .view-label b { color: var(--accent); font-family: var(--font-mono); font-weight: 600; margin-right: 4px; }
+  .view-label .hint { margin-left: 12px; font-size: 12px; color: var(--text-3); }
+
+  /* 演示容器：内部独立滚动（sticky 在容器内生效，四个视图互不串台） */
+  .stage { position: relative; background: var(--bg); }
+  .stage-scroll { height: 800px; overflow-y: auto; }
+  .stage ::-webkit-scrollbar { width: 10px; }
+  .stage ::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 8px; border: 2px solid var(--bg); }
+  .stage ::-webkit-scrollbar-track { background: transparent; }
+  [hidden] { display: none !important; }
+
+  /* 移动端双态并排 */
+  .m-stages { display: flex; gap: 28px; justify-content: center; align-items: flex-start; }
+  .m-tag { text-align: center; font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
+  .m-tag b { color: var(--text-2); font-weight: 600; }
+  .stage-m { width: 375px; height: 640px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 14px; }
+  .stage-m .stage-inner { height: 100%; overflow-y: auto; }
+
+  /* ===== 提案① 左侧边栏（桌面 sticky 常驻） ===== */
+  /* 布局：榜单区左侧 flex 列；边栏 sticky top 52px（顶栏 51px 之下），滚动时随视口常驻 */
+  .with-sidebar { display: flex; gap: 24px; align-items: flex-start; }
+  .with-sidebar .content { flex: 1; min-width: 0; }
+
+  .sidebar {
+    position: sticky; top: 52px;
+    width: 220px; flex: none;
+    background: var(--bg); border-right: 1px solid var(--line);
+    padding: 4px 12px 12px 8px;
+    transition: width var(--t-mid) ease;
+  }
+  .sb-head { display: flex; align-items: center; min-height: 36px; padding: 0 4px; }
+  .sb-title { font-size: 12px; color: var(--text-3); letter-spacing: .08em; white-space: nowrap; }
+  .sb-toggle {
+    margin-left: auto; width: 28px; height: 28px; display: grid; place-items: center;
+    background: none; border: none; border-radius: var(--r-s); cursor: pointer; color: var(--text-3);
+    transition: color var(--t-fast) ease, background var(--t-fast) ease;
+  }
+  .sb-toggle:hover { color: var(--text-1); background: rgba(148,163,184,.09); }
+  .sb-toggle .ic-expand { display: none; }
+
+  .sb-nav { margin-top: 2px; }
+  .sb-grp { font-size: 11px; color: var(--text-3); letter-spacing: .06em; padding: 10px 6px 4px; white-space: nowrap; }
+  .sb-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-radius: var(--r-m);
+    font-size: 12.5px; color: var(--text-2); text-decoration: none;
+    white-space: nowrap; cursor: pointer;
+    transition: background var(--t-fast) ease, color var(--t-fast) ease;
+  }
+  .sb-item:hover { background: rgba(148,163,184,.09); color: var(--text-1); }
+  .sb-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; }
+  /* 当前位置高亮：左侧 2px 品牌绿条（与 .row.expanded 同语义），背景淡绿 */
+  .sb-item.active { background: rgba(34,197,94,.10); color: var(--text-1); box-shadow: inset 2px 0 0 var(--accent); }
+  .sb-item i {
+    margin-left: auto; font-style: normal; font-family: var(--font-mono); font-size: 10.5px;
+    color: var(--text-3); background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px;
+  }
+  .sb-item.active i { color: var(--text-2); }
+
+  /* 收起态：细条 44px，仅留展开钮＋各项点位色（语言彩点 / 主题灰点），hover 看全名 */
+  .stage.collapsed .sidebar { width: 44px; }
+  .stage.collapsed .sb-title, .stage.collapsed .sb-grp,
+  .stage.collapsed .sb-item .sb-txt, .stage.collapsed .sb-item i { display: none; }
+  .stage.collapsed .sb-head { justify-content: center; padding: 0; }
+  .stage.collapsed .sb-toggle { margin-left: 0; }
+  .stage.collapsed .sb-toggle .ic-collapse { display: none; }
+  .stage.collapsed .sb-toggle .ic-expand { display: grid; }
+  .stage.collapsed .sb-item { justify-content: center; padding: 6px 0; }
+  .stage.collapsed .sb-item.active .sb-dot { box-shadow: 0 0 0 2px rgba(34,197,94,.4); }
+
+  /* ===== 提案② 移动端：悬浮钮 + 左侧抽屉 ===== */
+  /* 悬浮钮：右下角圆形，surface 底＋品牌绿描边，浮起阴影 */
+  .fab {
+    position: absolute; right: 14px; bottom: 16px; z-index: 15;
+    width: 52px; height: 52px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--surface); border: 1px solid var(--accent); color: var(--accent);
+    box-shadow: 0 8px 24px rgba(2,6,23,.55);
+    cursor: pointer; transition: transform .1s ease, background var(--t-fast) ease;
+  }
+  .fab:hover { background: rgba(34,197,94,.12); }
+  .fab:active { transform: scale(.92); }
+  /* 抽屉：左侧滑出 280px，覆盖全屏（含顶栏）；遮罩半透明；点选榜单项自动收回 */
+  .drawer-mask {
+    position: absolute; inset: 0; z-index: 25;
+    background: rgba(2,6,23,.55);
+    opacity: 0; pointer-events: none;
+    transition: opacity var(--t-mid) ease;
+  }
+  .drawer {
+    position: absolute; inset: 0 auto 0 0; z-index: 30;
+    width: 280px; max-width: 82%;
+    background: var(--bg); border-right: 1px solid var(--line-strong);
+    overflow-y: auto;
+    transform: translateX(-102%);
+    transition: transform var(--t-mid) ease;
+  }
+  .stage-m.drawer-open .drawer-mask { opacity: 1; pointer-events: auto; }
+  .stage-m.drawer-open .drawer { transform: none; }
+  .drawer .sb-head { padding: 10px 4px 4px 12px; }
+  .drawer .sb-nav { padding-bottom: 16px; }
+
+  /* ===== 提案③ P6 标签筛选行（元信息行与分组区之间） ===== */
+  /* 行形态：chips 横排；选中态＝品牌绿底＋绿描边＋亮绿文字（区别于导航激活的 muted 底） */
+  .tag-filter {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+    padding: 12px 2px 10px; margin-top: var(--s3);
+    border-bottom: 1px solid var(--line);
+  }
+  .tag-filter .grp { font-size: 12px; color: var(--text-3); letter-spacing: .06em; margin-right: 2px; }
+  .fchip {
+    display: inline-flex; align-items: center; gap: 7px; min-height: 32px;
+    font-size: 12.5px; background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--r-pill); padding: 4px 12px;
+    color: var(--text-2); text-decoration: none; cursor: pointer;
+    transition: border-color var(--t-fast) ease, background var(--t-fast) ease, color var(--t-fast) ease;
+  }
+  .fchip:hover { border-color: var(--blue); color: var(--text-1); background: rgba(88,166,255,.07); }
+  .fchip i {
+    font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
+    background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px;
+  }
+  .fchip.on { background: rgba(34,197,94,.14); border-color: var(--accent); color: var(--accent-hi); font-weight: 600; }
+  .fchip.on i { color: var(--text-2); background: rgba(34,197,94,.18); }
+  /* 筛选空态（§12.2：该标签下无关注仓 → 明确文案，不留空架） */
+  .filter-empty {
+    margin-top: var(--s5); padding: 34px var(--s4); text-align: center;
+    font-size: 12.5px; color: var(--text-3);
+    background: var(--card); border: 1px dashed var(--line-strong); border-radius: var(--r-l);
+  }
+</style>
+</head>
+<body>
+
+<div class="proto-bar" id="proto-top">
+  <span class="pb-title">原型 · T-021</span>
+  <span class="pb-sub">左侧边栏导航（§12.1）＋ P6 标签筛选（§12.2）· 新视觉元素提案，确认后开发</span>
+  <a class="pb-jump" href="#v-desktop">① 桌面展开</a>
+  <a class="pb-jump" href="#v-collapsed">② 桌面收起</a>
+  <a class="pb-jump" href="#v-mobile">③ 移动端</a>
+  <a class="pb-jump" href="#v-follows">④ P6 筛选</a>
+  <span class="pb-note">边栏收起/展开、移动抽屉、筛选 chips 均可点击演示 · 仅渲染 Python / Java / AI与智能 三个示意榜块</span>
+</div>
+
+<!-- ============ 视图 1 · 桌面端 P1 边栏展开态 ============ -->
+<section class="view" id="v-desktop">
+  <div class="view-label"><b>视图 1</b>桌面端 P1 周报页 · 边栏<u>展开态</u>（1440px）
+    <span class="hint">边栏 sticky 常驻、当前位置高亮（随滚动联动）；点「⟪」收起为细条 · 榜单仅示意 3 块</span>
+  </div>
+  <div class="stage stage-scroll" id="stage-v1">
+    <header class="top">
+      <div class="wrap">
+        <h1 class="logo">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" opacity=".45"/>
+            <circle cx="12" cy="12" r="5" opacity=".7"/>
+            <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+            <path d="M12 12 19 5"/>
+            <circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+          </svg>
+          GitHub 雷达
+        </h1>
+        <nav class="tabs" aria-label="主导航">
+          <a href="#" class="active" aria-current="page">本周报告</a>
+          <a href="#">我的关注<i>6</i></a>
+          <a href="#">季度回顾</a>
+          <a href="#">总星榜</a>
+          <a href="#">标签</a>
+        </nav>
+        <div class="week-switch">
+          <a href="#">‹ 上一周</a><b>2026-W32</b><span class="off" title="已是最新一期">下一周 ›</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="wrap with-sidebar">
+      <aside class="sidebar" id="sb-v1" aria-label="榜单导航"></aside>
+      <main class="content">
+        <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库 · 增量 = 两端快照差</p>
+        <div class="boards" id="boards-v1"></div>
+        <footer class="note">原型仅渲染 3 个示意榜块（Python / Java / AI与智能），边栏其余 14 项为占位（点击弹提示） · 行形态与数据风格沿用示意图 v4 · 原顶部「榜单直达」chips 区已由边栏替代，本页不再出现</footer>
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 视图 2 · 桌面端边栏收起态 ============ -->
+<section class="view" id="v-collapsed">
+  <div class="view-label"><b>视图 2</b>桌面端 P1 · 边栏<u>收起态</u>（细条 44px）
+    <span class="hint">细条仅留展开钮＋各项点位（语言彩点 / 主题灰点），hover 见全名；点「⟫」展开恢复</span>
+  </div>
+  <div class="stage stage-scroll collapsed" id="stage-v2">
+    <header class="top">
+      <div class="wrap">
+        <h1 class="logo">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" opacity=".45"/>
+            <circle cx="12" cy="12" r="5" opacity=".7"/>
+            <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+            <path d="M12 12 19 5"/>
+            <circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+          </svg>
+          GitHub 雷达
+        </h1>
+        <nav class="tabs" aria-label="主导航">
+          <a href="#" class="active" aria-current="page">本周报告</a>
+          <a href="#">我的关注<i>6</i></a>
+          <a href="#">季度回顾</a>
+          <a href="#">总星榜</a>
+          <a href="#">标签</a>
+        </nav>
+        <div class="week-switch">
+          <a href="#">‹ 上一周</a><b>2026-W32</b><span class="off" title="已是最新一期">下一周 ›</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="wrap with-sidebar">
+      <aside class="sidebar" id="sb-v2" aria-label="榜单导航"></aside>
+      <main class="content">
+        <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库 · 增量 = 两端快照差</p>
+        <div class="boards" id="boards-v2"></div>
+        <footer class="note">榜单区与视图 1 一致（此处仅示意 Python 一块） · 收起/展开状态开发时由 localStorage 记住（本原型视图 1 已演示记忆逻辑）</footer>
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 视图 3 · 移动端 375px：默认收起 ＋ 抽屉展开 ============ -->
+<section class="view" id="v-mobile">
+  <div class="view-label"><b>视图 3</b>移动端（375px）· 左：默认收起＋悬浮钮 / 右：抽屉展开态
+    <span class="hint">点左图右下悬浮钮开抽屉（可交互演示）；抽屉内点选榜单项后自动收回</span>
+  </div>
+  <div class="m-stages">
+    <div class="m-stages-col">
+      <div class="m-tag"><b>收起态</b>（默认）</div>
+      <div class="stage stage-m" id="stage-m-collapsed">
+        <div class="stage-inner">
+          <header class="top">
+            <div class="wrap">
+              <h1 class="logo">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" opacity=".45"/>
+                  <circle cx="12" cy="12" r="5" opacity=".7"/>
+                  <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+                  <path d="M12 12 19 5"/>
+                  <circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+                </svg>
+                GitHub 雷达
+              </h1>
+              <nav class="tabs" aria-label="主导航">
+                <a href="#" class="active" aria-current="page">本周报告</a>
+                <a href="#">我的关注<i>6</i></a>
+                <a href="#">季度回顾</a>
+                <a href="#">总星榜</a>
+                <a href="#">标签</a>
+              </nav>
+              <div class="week-switch">
+                <a href="#">‹ 上一周</a><b>2026-W32</b><span class="off" title="已是最新一期">下一周 ›</span>
+              </div>
+            </div>
+          </header>
+          <div class="wrap">
+            <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库</p>
+            <div class="boards" id="boards-m1"></div>
+            <footer class="note">移动端边栏默认收起：右下悬浮钮展开为抽屉 · 榜单区与视图 1 一致（此处仅示意 Python 一块）</footer>
+          </div>
+        </div>
+        <div class="drawer-mask" data-close-drawer></div>
+        <aside class="drawer" id="drawer-m1" aria-label="榜单导航抽屉">
+          <div class="sb-head"><span class="sb-title">榜单直达</span><button class="sb-close" title="收起抽屉" data-close-drawer><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+          <nav class="sb-nav" id="drawer-nav"></nav>
+        </aside>
+        <button class="fab" id="fab-m1" aria-label="展开榜单导航" title="榜单导航">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="m-stages-col">
+      <div class="m-tag"><b>展开态</b>（点选后自动收回）</div>
+      <div class="stage stage-m drawer-open" id="stage-m-open">
+        <div class="stage-inner">
+          <header class="top">
+            <div class="wrap">
+              <h1 class="logo">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" opacity=".45"/>
+                  <circle cx="12" cy="12" r="5" opacity=".7"/>
+                  <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+                  <path d="M12 12 19 5"/>
+                  <circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+                </svg>
+                GitHub 雷达
+              </h1>
+              <nav class="tabs" aria-label="主导航">
+                <a href="#" class="active" aria-current="page">本周报告</a>
+                <a href="#">我的关注<i>6</i></a>
+                <a href="#">季度回顾</a>
+                <a href="#">总星榜</a>
+                <a href="#">标签</a>
+              </nav>
+            </div>
+          </header>
+          <div class="wrap">
+            <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天） · 生成于 2026-08-09 08:00 · 跟踪池 64,137 个仓库</p>
+            <div class="boards" id="boards-m2"></div>
+          </div>
+        </div>
+        <div class="drawer-mask" data-close-drawer></div>
+        <aside class="drawer" id="drawer-m2" aria-label="榜单导航抽屉">
+          <div class="sb-head"><span class="sb-title">榜单直达</span><button class="sb-close" title="收起抽屉" data-close-drawer><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+          <nav class="sb-nav" id="drawer-nav2"></nav>
+        </aside>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 视图 4 · P6 我的关注页：标签筛选行 ============ -->
+<section class="view" id="v-follows">
+  <div class="view-label"><b>视图 4</b>P6 我的关注页 · 标签筛选行（1440px）
+    <span class="hint">标签 chips 按字典序＋「全部」；选中态绿色高亮；筛选仅收窄行集、分组结构不变 · 点「AI基础设施」（计数 0）可看空态 · 再点当前标签或「全部」取消筛选</span>
+  </div>
+  <div class="stage stage-scroll" id="stage-follows">
+    <header class="top">
+      <div class="wrap">
+        <h1 class="logo">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" opacity=".45"/>
+            <circle cx="12" cy="12" r="5" opacity=".7"/>
+            <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+            <path d="M12 12 19 5"/>
+            <circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+          </svg>
+          GitHub 雷达
+        </h1>
+        <nav class="tabs" aria-label="主导航">
+          <a href="#">本周报告</a>
+          <a href="#" class="active" aria-current="page">我的关注<i>6</i></a>
+          <a href="#">季度回顾</a>
+          <a href="#">总星榜</a>
+          <a href="#">标签</a>
+        </nav>
+      </div>
+    </header>
+
+    <div class="wrap">
+      <p class="meta">窗口：2026-08-02 → 2026-08-09（7 天，与当期周报同口径） · 关注 <b class="mono">6</b> 个仓库 · 按语言分组 · 组内按当周增量降序</p>
+
+      <div class="tag-filter" id="tag-filter" role="group" aria-label="标签筛选"></div>
+      <div class="filter-empty" id="filter-empty" hidden>该标签下暂无关注项目</div>
+
+      <div class="boards" id="boards-follows"></div>
+
+      <footer class="note">筛选不是分组：一仓可有多标签，任何时刻每行在页面上只出现一次 · 组内「—— 下周起有数据」与「已失效」沉组尾（v1.3 §2A） · 行内 ★ 点击取消关注，该行即时移除（计数徽标同步）</footer>
+    </div>
+  </div>
+</section>
+
+<footer class="note" style="max-width:1440px;margin:36px auto 40px;padding:0 20px 12px;">
+  原型范围说明：本文件仅提案新视觉元素（左侧边栏／收起细条／移动抽屉／P6 标签筛选行）；既有组件（顶栏、榜单块、紧凑行、详情面板、标签、toast）直接复用 radar.css 未改动 · 边栏宽度 220px、细条 44px、抽屉 280px、筛选选中态等取舍详见交付说明 · 主题榜 10 项按 config/topics.yaml 真实主题名（9 项＋零命中"其它主题"）· 假数据沿用示意图 v4 风格
+</footer>
+
+<div id="toasts" aria-live="polite" role="status"></div>
+
+<script>
+/* ===== T-021 原型演示脚本（纯 vanilla，零依赖；非产品逻辑，不迁移） ===== */
+const ESC = s => s.replace(/"/g, "&quot;");
+const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
+const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
+const STAR_S = '<svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
+const CHEV = '<svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+const EXT = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5.5"/></svg>';
+const IC_COL = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>';
+const IC_EXP = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>';
+
+/* GitHub Linguist 语言点色（与示意图同款；边栏语言项点色与行 badge 呼应） */
+const LC = {
+  "JavaScript":"#f1e05a","TypeScript":"#5ca9e6","Python":"#4b8bbe","Go":"#00ADD8",
+  "Rust":"#dea584","Java":"#c9842a","C++":"#f34b7d","C":"#9aa7b8","CSS":"#a074c4",
+  "Ruby":"#e15b4c","Zig":"#ec915c","Scala":"#d05a4d"
+};
+
+/* 边栏导航数据：语言 7 项（§12.1 口径）+ 主题 10 项（topics.yaml 真实主题名 9 项＋零命中"其它主题"） */
+const LANG_NAV = [
+  {name:"JavaScript", dot:"#f1e05a", n:30, target:"board-javascript"},
+  {name:"TypeScript", dot:"#5ca9e6", n:30, target:"board-typescript"},
+  {name:"Python",     dot:"#4b8bbe", n:30, target:"board-python"},
+  {name:"Go",         dot:"#00ADD8", n:30, target:"board-go"},
+  {name:"Rust",       dot:"#dea584", n:30, target:"board-rust"},
+  {name:"Java",       dot:"#c9842a", n:24, target:"board-java"},
+  {name:"其它",       dot:"#8b98a9", n:30, target:"board-other-lang"},
+];
+const TOPIC_NAV = [
+  {name:"AI与智能",          dot:"#8b98a9", n:30, target:"board-ai"},
+  {name:"前端/UI",           dot:"#8b98a9", n:30, target:"board-frontend"},
+  {name:"后端/云原生",       dot:"#8b98a9", n:30, target:"board-backend"},
+  {name:"数据库与数据工程",  dot:"#8b98a9", n:30, target:"board-data"},
+  {name:"DevOps/监控",       dot:"#8b98a9", n:30, target:"board-devops"},
+  {name:"开发者工具",        dot:"#8b98a9", n:30, target:"board-devtools"},
+  {name:"安全",              dot:"#8b98a9", n:18, target:"board-security"},
+  {name:"游戏/图形",         dot:"#8b98a9", n:30, target:"board-game"},
+  {name:"自动化/脚本",       dot:"#8b98a9", n:30, target:"board-automation"},
+  {name:"其它主题",          dot:"#8b98a9", n:30, target:"board-other-topic"},
+];
+
+/* 榜单假数据（沿用示意图 v4 风格；仅示意 3 块 + 移动/收起视图复用 Python 块） */
+const BOARDS = [
+  {id:"board-python", name:"Python", n:30, items:[
+    ["openai/whisper","Python","+1,203","88.9k",{f:1}],
+    ["langchain-ai/langchain","Python","+987","115.0k",{tags:["AI"]}],
+    ["pytorch/pytorch","Python","+542","92.4k",{}],
+    ["fastapi/fastapi","Python","+356","89.2k",{}]]},
+  {id:"board-java", name:"Java", n:24, items:[
+    ["spring-projects/spring-boot","Java","+289","78.4k",{}],
+    ["elastic/elasticsearch","Java","+198","73.1k",{}],
+    ["apache/kafka","Java","+122","30.0k",{}],
+    ["netty/netty","Java","+45","34.2k",{}]]},
+  {id:"board-ai", name:"AI与智能", n:30, items:[
+    ["n8n-io/n8n","TypeScript","+3,905","118.4k",{f:1,tags:["选型观察","AI"]}],
+    ["modelcontextprotocol/servers","TypeScript","+2,012","61.7k",{tags:["AI"]}],
+    ["ollama/ollama","Go","+1,847","152.3k",{f:1,tags:["AI"]}],
+    ["openai/whisper","Python","+1,203","88.9k",{f:1}]]},
+];
+
+const DESC = {
+  en: "Workflow automation tool with native AI capabilities, 400+ integrations, fair-code license.",
+  zh: "工作流自动化工具，原生集成 AI 能力，支持 400 多个服务互联，fair-code 许可。"
+};
+const REASON = "本周增星领跑分类，AI Agent 编排场景热度持续走高；低代码自动化是近期值得跟踪的选型方向。";
+
+function panelHTML(opt){
+  return `<div class="desc-en">${DESC.en}</div>
+    <div class="desc-zh">${DESC.zh}</div>
+    <div class="reason"><b>推荐理由</b>${REASON}</div>
+    <div class="acts">
+      <a class="gh" href="#" onclick="return false">在 GitHub 打开 ${EXT}</a>
+      ${(opt.tags||[]).map(t=>`<span class="tag">${ESC(t)}<b title="删除标签">×</b></span>`).join("")}
+      <button class="tag-add">＋ 标签</button>
+    </div>`;
+}
+function rowHTML(it, i, boardId){
+  return `<div class="row expanded" data-b="${boardId}" data-i="${i}" tabindex="0" role="button" aria-expanded="true">
+      <span class="rank">${i+1}</span>
+      <span class="repo-wrap"><span class="repo" title="${it[0]}">${it[0]}</span>${CHEV}</span>
+      ${it[1] ? `<span class="badge"><span class="dot" style="background:${LC[it[1]]||"#8b98a9"}"></span>${it[1]}</span>` : ""}
+      <span class="up">${it[2]}</span>
+      <span class="total">${STAR_S}${it[3]}</span>
+      <button class="star ${it[4].f?"on":""}" aria-label="${it[4].f?"取消关注":"关注"}" title="${it[4].f?"取消关注":"关注"}">${it[4].f?STAR_F:STAR_O}</button>
+    </div>
+    <div class="panel open" data-b="${boardId}" data-i="${i}">${panelHTML(it[4])}</div>`;
+}
+function renderBoard(board, host){
+  const div = document.createElement("div");
+  div.className = "board"; div.id = board.id;
+  div.innerHTML = `<h3>${board.name}<span class="n">Top ${board.n}</span></h3>` +
+    board.items.map((it,i)=>rowHTML(it,i,board.id)).join("");
+  host.appendChild(div);
+}
+
+/* 边栏渲染（桌面 220px / 收起细条 / 移动抽屉共用同一份 DOM）；
+   targetMap 把通用榜块 id 映射到各容器内的实际 id（视图 2 / 移动端只渲染 Python 块） */
+function renderSidebar(sb, targetMap){
+  const map = targetMap || (id => id);
+  const groups = [
+    ['<div class="sb-grp">语言</div>', LANG_NAV],
+    ['<div class="sb-grp">主题</div>', TOPIC_NAV],
+  ];
+  const items = groups.map(([grp, list]) => grp + list.map(it =>
+    `<a class="sb-item" data-target="${map(it.target)}" title="${it.name}">
+      <span class="sb-dot" style="background:${it.dot}"></span>
+      <span class="sb-txt">${it.name}</span><i>${it.n}</i></a>`).join("")).join("");
+  sb.innerHTML = `<div class="sb-head"><span class="sb-title">榜单直达</span>
+      <button class="sb-toggle" title="收起边栏"><span class="ic-collapse">${IC_COL}</span><span class="ic-expand">${IC_EXP}</span></button></div>
+    <nav class="sb-nav" aria-label="榜单导航">
+      ${items}
+    </nav>`;
+}
+
+/* ===== 渲染各视图 ===== */
+const v1 = document.getElementById("stage-v1");
+renderSidebar(document.getElementById("sb-v1"));
+BOARDS.forEach(b => renderBoard(b, document.getElementById("boards-v1")));
+
+const v2 = document.getElementById("stage-v2");
+renderSidebar(document.getElementById("sb-v2"), id => id === "board-python" ? "board-python-v2" : id);
+renderBoard({id:"board-python-v2", name:"Python", n:30, items:BOARDS[0].items.slice(0,3)}, document.getElementById("boards-v2"));
+
+["boards-m1","boards-m2"].forEach((id, idx) => {
+  const host = document.getElementById(id);
+  const b = {id: idx===0 ? "board-python-m1" : "board-python-m2", name:"Python", n:30, items:BOARDS[0].items.slice(0,3)};
+  renderBoard(b, host);
+});
+const mMap = id => id === "board-python" ? "board-python-m1" : id;
+renderSidebar(document.getElementById("drawer-nav"), mMap);
+renderSidebar(document.getElementById("drawer-nav2"), mMap);
+
+/* ===== P6：标签筛选行 + 关注分组 ===== */
+const FOLLOWS = [
+  {name:"TypeScript", items:[
+    {repo:"n8n-io/n8n", lang:"TypeScript", up:"+3,905", total:"118.4k", tags:["选型观察","AI"]},
+    {repo:"asteroid-shooter/tiny", lang:"TypeScript", na:1, total:"386", tags:["重点"]}]},
+  {name:"Go", items:[
+    {repo:"ollama/ollama", lang:"Go", up:"+1,847", total:"152.3k", tags:["AI"]},
+    {repo:"old/dead-repo", lang:"Go", na:1, dead:1, total:"4.2k", tags:["长期跟踪"]}]},
+  {name:"Python", items:[
+    {repo:"openai/whisper", lang:"Python", up:"+1,203", total:"88.9k", tags:[]}]},
+  {name:"JavaScript", items:[
+    {repo:"facebook/react", lang:"JavaScript", up:"+1,102", total:"238.5k", tags:["选型观察"]}]},
+];
+/* 标签集按字典序（Unicode 码点）＋「全部」；计数＝该标签下关注仓数 */
+const TAGS = [
+  {tag:"all",  label:"全部", n:6},
+  {tag:"AI", label:"AI", n:2},
+  {tag:"AI基础设施", label:"AI基础设施", n:0},
+  {tag:"选型观察", label:"选型观察", n:2},
+  {tag:"重点", label:"重点", n:1},
+  {tag:"长期跟踪", label:"长期跟踪", n:1},
+];
+
+const fstage = document.getElementById("stage-follows");
+const filterHost = document.getElementById("tag-filter");
+filterHost.innerHTML = `<span class="grp">标签筛选</span>` + TAGS.map(t =>
+  `<a class="fchip${t.tag==="选型观察"?" on":""}" data-tag="${t.tag}" href="#" onclick="return false">
+    ${t.label}<i>${t.n}</i></a>`).join("");
+
+const fboards = document.getElementById("boards-follows");
+const fdata = [];
+FOLLOWS.forEach((g, gi) => {
+  const host = document.createElement("div");
+  host.className = "board"; host.dataset.group = gi;
+  host.innerHTML = `<h3>${g.name}<span class="n" data-count>${g.items.length} 个关注</span></h3>` +
+    g.items.map((it, i) => {
+      const tags = it.tags.map(t=>`<span class="tag" data-tag-item>${ESC(t)}<b title="删除标签">×</b></span>`).join("");
+      return `<div class="row expanded ${it.dead?"dead":""}" data-b="f${gi}" data-i="${i}" data-tags="${(it.tags||[]).join(",")}" tabindex="0" role="button" aria-expanded="true">
+        <span class="rank">${i+1}</span>
+        <span class="repo-wrap"><span class="repo" title="${it.repo}">${it.repo}</span>${it.dead?'<span class="dead-tag">已失效</span>':""}${CHEV}</span>
+        ${it.lang?`<span class="badge"><span class="dot" style="background:${LC[it.lang]||"#8b98a9"}"></span>${it.lang}</span>`:""}
+        <span class="up ${(it.na||it.dead)?"na":""}">${it.dead?"——":it.na?"—— 下周起有数据":it.up}</span>
+        <span class="total">${STAR_S}${it.total}</span>
+        <button class="star on" aria-label="取消关注" title="取消关注">${STAR_F}</button>
+      </div>
+      <div class="panel open" data-b="f${gi}" data-i="${i}">${panelHTML({tags:it.tags||[]})}</div>`;
+    }).join("");
+  fboards.appendChild(host);
+  fdata.push(host);
+});
+
+/* 筛选：仅收窄行集，分组结构/排序口径不变；行不重复；组内全隐则整组隐藏 */
+const emptyBox = document.getElementById("filter-empty");
+function countVisible(groupEl){
+  return groupEl.querySelectorAll('.row:not([hidden])').length;
+}
+function applyFilter(tag){
+  let any = false;
+  fdata.forEach(g => {
+    let vis = 0;
+    g.querySelectorAll(".row").forEach(r => {
+      const hit = tag === "all" || (r.dataset.tags||"").split(",").includes(tag);
+      r.hidden = !hit; vis += hit;
+      const p = g.querySelector(`.panel[data-b="${r.dataset.b}"][data-i="${r.dataset.i}"]`);
+      if (p) p.hidden = !hit;
+    });
+    g.hidden = vis === 0;
+    if (!g.hidden) { g.querySelector("[data-count]").textContent = `${vis} 个关注`; any = true; }
+  });
+  emptyBox.hidden = any;
+  const allChip = filterHost.querySelector('.fchip[data-tag="all"] i');
+  if (allChip) allChip.textContent = String(fdata.reduce((s,g)=>s+countVisible(g),0));
+}
+filterHost.addEventListener("click", e => {
+  const chip = e.target.closest(".fchip");
+  if (!chip) return;
+  if (chip.classList.contains("on")) {            /* 再点当前标签 → 取消筛选 */
+    chip.classList.remove("on");
+    applyFilter("all");
+  } else {
+    filterHost.querySelectorAll(".fchip").forEach(c=>c.classList.remove("on"));
+    chip.classList.add("on");
+    applyFilter(chip.dataset.tag);
+  }
+});
+
+/* ===== 视图 1 收起/展开（localStorage 记忆演示：跨会话保持，§12.1） ===== */
+const SB_KEY = "t021-sb-collapsed-v1";
+function setCollapsed(stage, collapsed){
+  stage.classList.toggle("collapsed", collapsed);
+  const sb = stage.querySelector(".sidebar");
+  const btn = sb.querySelector(".sb-toggle");
+  btn.title = collapsed ? "展开边栏" : "收起边栏";
+}
+if (localStorage.getItem(SB_KEY) === "1") setCollapsed(v1, true);
+v1.addEventListener("click", e => {
+  const t = e.target.closest(".sb-toggle");
+  if (!t) return;
+  const collapsed = !v1.classList.contains("collapsed");
+  setCollapsed(v1, collapsed);
+  localStorage.setItem(SB_KEY, collapsed ? "1" : "0");
+});
+v2.addEventListener("click", e => {
+  const t = e.target.closest(".sb-toggle");
+  if (!t) return;
+  setCollapsed(v2, !v2.classList.contains("collapsed"));
+});
+
+/* ===== 移动抽屉开合 ===== */
+function bindDrawer(stage){
+  stage.addEventListener("click", e => {
+    if (e.target.closest(".fab")) { stage.classList.add("drawer-open"); return; }
+    if (e.target.closest("[data-close-drawer]")) { stage.classList.remove("drawer-open"); }
+  });
+}
+bindDrawer(document.getElementById("stage-m-collapsed"));
+bindDrawer(document.getElementById("stage-m-open"));
+
+/* ===== 通用：边栏锚点滚动（容器内平滑滚动到目标榜块）＋当前位置高亮 ===== */
+function renderRenderedIds(){
+  const ids = new Set();
+  document.querySelectorAll(".stage .board").forEach(b=>ids.add(b.id));
+  return ids;
+}
+document.querySelectorAll(".stage").forEach(stage => {
+  stage.addEventListener("click", e => {
+    const item = e.target.closest(".sb-item");
+    if (item && item.dataset.target){
+      const target = stage.querySelector("#" + item.dataset.target);
+      if (target){ target.scrollIntoView({behavior:"smooth", block:"start"}); }
+      else toast("原型仅渲染 Python / Java / AI与智能 三个示意榜块");
+      /* 抽屉内点选后自动收回（§12.1：移动端点选后自动收回） */
+      if (item.closest(".drawer")) stage.classList.remove("drawer-open");
+    }
+  });
+});
+
+/* 当前位置高亮：滚动容器内 IntersectionObserver 观察已渲染榜块 */
+document.querySelectorAll(".stage .sb-nav").forEach(nav => {
+  const stage = nav.closest(".stage");
+  const items = [...nav.querySelectorAll(".sb-item[data-target]")];
+  const boards = items.map(a => stage.querySelector("#" + a.dataset.target)).filter(Boolean);
+  if (!boards.length) return;
+  const io = new IntersectionObserver(entries => {
+    entries.forEach(en => {
+      if (!en.isIntersecting) return;
+      items.forEach(a => a.classList.toggle("active", a.dataset.target === en.target.id));
+    });
+  }, { root: stage, rootMargin: "-70px 0px -62% 0px", threshold: 0 });
+  boards.forEach(b => io.observe(b));
+});
+
+/* ===== 行交互（沿用示意图：折叠/展开、★ 关注、标签编辑；P6 内取消关注行即时移除） ===== */
+function toggleRow(row){
+  const panel = document.querySelector(`.panel[data-b="${row.dataset.b}"][data-i="${row.dataset.i}"]`);
+  const open = row.classList.toggle("expanded");
+  row.setAttribute("aria-expanded", String(open));
+  panel.classList.toggle("open", open);
+}
+function toast(msg){
+  const t = document.createElement("div");
+  t.className = "toast"; t.textContent = msg;
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(()=>t.remove(), 4000);
+}
+document.addEventListener("click", e => {
+  const star = e.target.closest(".star");
+  if (star){
+    e.stopPropagation();
+    const on = star.classList.toggle("on");
+    star.innerHTML = on ? STAR_F : STAR_O;
+    star.title = on ? "取消关注" : "关注";
+    star.setAttribute("aria-label", star.title);
+    const row = star.closest(".row");
+    if (!on && row && row.closest("#stage-follows")){
+      const p = document.querySelector(`.panel[data-b="${row.dataset.b}"][data-i="${row.dataset.i}"]`);
+      if (p) p.remove();
+      row.remove();
+      fdata.forEach(g => {
+        if (g.querySelectorAll(".row:not([hidden])").length === 0) g.hidden = true;
+      });
+      const allChip = filterHost.querySelector('.fchip[data-tag="all"] i');
+      if (allChip) allChip.textContent = String(fdata.reduce((s,g)=>s+countVisible(g),0));
+    }
+    toast(on ? "已关注" : "已取消关注（跟踪保留）");
+    return;
+  }
+  const row = e.target.closest(".row");
+  if (row){ toggleRow(row); return; }
+  const x = e.target.closest(".tag b");
+  if (x){ x.parentElement.remove(); toast("已删除标签"); return; }
+  const add = e.target.closest(".tag-add");
+  if (add){
+    const input = document.createElement("input");
+    input.className = "tag-input"; input.maxLength = 20; input.placeholder = "1~20 字符，回车确认";
+    input.setAttribute("aria-label", "新标签名称");
+    add.replaceWith(input); input.focus();
+    input.addEventListener("keydown", ev => {
+      if (ev.key === "Enter" && input.value.trim()){
+        const chip = document.createElement("span");
+        chip.className = "tag";
+        chip.innerHTML = ESC(input.value.trim()) + `<b title="删除标签">×</b>`;
+        input.replaceWith(chip); toast("已添加标签");
+      }
+      if (ev.key === "Escape"){ input.replaceWith(add); }
+    });
+    input.addEventListener("blur", () => { if (input.isConnected) input.replaceWith(add); });
+  }
+});
+document.addEventListener("keydown", e => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.classList && e.target.classList.contains("row")){
+    e.preventDefault(); toggleRow(e.target);
+  }
+});
+
+/* 初始筛选态：默认选中「选型观察」（截图 05 展示） */
+applyFilter("选型观察");
+</script>
+</body>
+</html>
