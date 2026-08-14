@@ -1,4 +1,11 @@
-"""榜单计算：周/季增量榜与总星榜，全部本地 SQL 实时计算、不物化（《架构决策记录》决策 3/4）。
+"""榜单计算：周/季增量榜与总星榜（《架构决策记录》决策 3/4 的唯一实现）。
+
+存储形态（T-027 起）：每日采集后 precompute_boards 对三口径各全量算一次、序列化落 board_cache
+（JSON blob，schema.sql 建表）；页面打开直读缓存，缓存缺失/过期（load_board_cache 三条判定）
+时降级实时算——缓存只换"何时算、结果存哪"，计算口径仍走本模块 compute_boards/compute_repo_deltas，
+实时路径一字不改。预计算把 as_of 钉在采集时刻（两次采集之间库内快照不变，"as_of=now"与
+"as_of=采集时刻"取同一组端点快照，等价性依据）；代价是当日内"假如此刻实时算"与缓存值在边界仓
+起点候选上可能差一个，属可接受且更稳定（消除同日内多次打开间的 now 漂移）。
 
 口径（决策 4 逐字落实，勿自由发挥）：
 - 周/季增量 = 两端快照差（端点星数 − 名义窗口天数前端点星数）；
@@ -24,7 +31,7 @@ import json
 import sqlite3
 from collections.abc import Collection
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.classify import LANGUAGES, OTHER_LANGUAGE_KEY, TopicSpec, classify_language, classify_topics
 from app.collector.github import utc_now_iso
@@ -45,6 +52,21 @@ ABSENT_FIRST_WEEK = "first_week"  # 缺席原因：不满最小窗口跨度（�
 _RISING_TOP_N = 10  # 新崛起区每分类榜行数上限（决策 4 v2 钉死：Top 10，不足按实际）
 
 _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长，字典序即时间序
+
+
+def week_label(d: date) -> str:
+    """date → ISO 周标签（%G-W%V 定宽零填充，字符串比较即时间序）。
+
+    T-027 起为期次标签单一事实源：precompute_boards 落表 label 与页面期次换算（routes 同名私有别名）
+    共用本函数，格式口径（2026-W33 形态）不得改动——recommendations.period_label 同款标签依赖此格式。
+    """
+    iso = d.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def quarter_label(d: date) -> str:
+    """date → 季标签（2026-Q3 形态）。T-027 单一事实源，理由同 week_label。"""
+    return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
 
 # 端点快照 SQL 单独提为常量：__main__ 自检与测试可用 EXPLAIN QUERY PLAN 核对同一条语句的索引 seek 性质
 _ENDPOINT_SQL = (
@@ -363,6 +385,153 @@ def compute_boards(
     boards.extend(_board("topic", key, spec["label"], False) for key, spec in topic_table.items())
     boards.append(_board("topic", OTHER_TOPIC_KEY, "其他", False))
     return boards
+
+
+# ===== T-027 榜单预计算缓存：board_cache 表读写 =====
+# payload 为 list[Board] 的 JSON 序列化，字段白名单手工展开（不用 dataclasses.asdict 一把梭：
+# 防字段漂移静默丢——新增字段未写进白名单时反序列化缺键直接报错 fail-loud，而不是静默变 None）。
+
+
+def _board_to_payload(boards: list[Board]) -> str:
+    """list[Board] → JSON 字符串。Board.count 不存（全量模式恒 None，还原时置 None）。"""
+    return json.dumps(
+        [
+            {
+                "kind": b.kind,
+                "key": b.key,
+                "label": b.label,
+                "rows": [
+                    {
+                        "full_name": r.full_name,
+                        "description_en": r.description_en,
+                        "language": r.language,
+                        "stars": r.stars,
+                        "delta": r.delta,
+                        "window_days": r.window_days,
+                        "captured_at": r.captured_at,
+                    }
+                    for r in b.rows
+                ],
+                "rising_rows": [
+                    {
+                        "full_name": r.full_name,
+                        "description_en": r.description_en,
+                        "language": r.language,
+                        "stars": r.stars,
+                        "pool_delta": r.pool_delta,
+                        "pool_days": r.pool_days,
+                        "captured_at": r.captured_at,
+                    }
+                    for r in b.rising_rows
+                ],
+            }
+            for b in boards
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _board_from_payload(raw: str) -> list[Board]:
+    """JSON 字符串 → list[Board]（frozen dataclass，与 compute_boards 返回同型，count 恒 None）。
+
+    字段显式展开不撒 **row：白名单缺字段时 KeyError fail-loud，与序列化白名单互为镜像。
+    """
+    boards = []
+    for item in json.loads(raw):
+        boards.append(
+            Board(
+                kind=item["kind"],
+                key=item["key"],
+                label=item["label"],
+                rows=[
+                    ReportRow(
+                        full_name=row["full_name"],
+                        description_en=row["description_en"],
+                        language=row["language"],
+                        stars=row["stars"],
+                        delta=row["delta"],
+                        window_days=row["window_days"],
+                        captured_at=row["captured_at"],
+                    )
+                    for row in item["rows"]
+                ],
+                rising_rows=[
+                    RisingRow(
+                        full_name=row["full_name"],
+                        description_en=row["description_en"],
+                        language=row["language"],
+                        stars=row["stars"],
+                        pool_delta=row["pool_delta"],
+                        pool_days=row["pool_days"],
+                        captured_at=row["captured_at"],
+                    )
+                    for row in item["rising_rows"]
+                ],
+            )
+        )
+    return boards
+
+
+def save_board_cache(conn: sqlite3.Connection, *, period: str, label: str, as_of: str, boards: list[Board]) -> None:
+    """序列化并落一行缓存（INSERT OR REPLACE：同日重跑幂等覆盖，与快照同口径）。
+
+    本函数不提交事务，由调用方 commit（precompute_boards 每口径落一行即 commit，部分失败不丢已算好的口径）；
+    页面层无写入入口，只服务预计算路径。period 必须是 PERIODS 之一（'week'/'quarter'/'total'）。
+    """
+    if period not in PERIODS:
+        raise ValueError(f"未知榜单口径：{period!r}，可选 {PERIODS}")
+    conn.execute(
+        "INSERT OR REPLACE INTO board_cache (period, label, as_of, payload, computed_at) VALUES (?, ?, ?, ?, ?)",
+        (period, label, as_of, _board_to_payload(boards), utc_now_iso()),
+    )
+
+
+def load_board_cache(conn: sqlite3.Connection, *, period: str, label: str) -> list[Board] | None:
+    """读一行缓存并还原 list[Board]；三条降级判定任一不过返回 None（调用方走实时算路径，不白屏）：
+
+    ① 表无该 period 行（未预计算/预计算失败）；
+    ② 缓存 label 与请求 label 不符（跨周/跨季凌晨窗口：旧期缓存未覆盖当前期；total 恒 'all' 不受影响）；
+    ③ 库内 MAX(captured_at) 晚于缓存 as_of（采集写了新快照但预计算未跑/失败——新快照口径未落缓存，
+       缓存数据已过期；定长 ISO 字典序比较，schema 硬约定）。
+    命中则反序列化还原（frozen dataclass，与 compute_boards 返回同型、count 恒 None）。
+    """
+    row = conn.execute("SELECT label, as_of, payload FROM board_cache WHERE period = ?", (period,)).fetchone()
+    if row is None:
+        return None
+    if row["label"] != label:
+        return None
+    latest = conn.execute("SELECT MAX(captured_at) FROM star_snapshots").fetchone()[0]
+    if latest is not None and latest > row["as_of"]:
+        return None
+    return _board_from_payload(row["payload"])
+
+
+def precompute_boards(
+    conn: sqlite3.Connection, topic_table: dict[str, TopicSpec], *, as_of: str | None = None
+) -> dict:
+    """每日采集后调用：同一 as_of（缺省 utc_now_iso()）对 PERIODS 三口径各 compute_boards 全量一次并落表。
+
+    - as_of 钉在采集时刻（调用方传 run_daily 完成时刻）：两次采集之间库内快照不变，页面读缓存与
+      "此刻实时算"取同一组端点快照；as_of 晚于本轮快照 captured_at 时判定③恒过（同日不误判过期）；
+    - label 按 as_of 日期换算（week_label/quarter_label；total 固定 'all'），与页面期次换算同一事实源；
+    - 每口径落一行即 commit（save_board_cache 不提交事务）：部分口径失败不丢已算好的行，
+      页面按 period 独立降级（缺哪口径实时算哪口径）；
+    - 返回摘要 dict {period: {"boards": 榜数, "rows": 主榜总行数, "rising": 新区总行数}} 供调用方记日志。
+    """
+    as_of = as_of or utc_now_iso()
+    as_of_date = date.fromisoformat(as_of[:10])
+    labels = {"week": week_label(as_of_date), "quarter": quarter_label(as_of_date), "total": "all"}
+    summary: dict[str, dict[str, int]] = {}
+    for period in PERIODS:
+        boards = compute_boards(conn, topic_table, period=period, as_of=as_of)
+        save_board_cache(conn, period=period, label=labels[period], as_of=as_of, boards=boards)
+        conn.commit()
+        summary[period] = {
+            "boards": len(boards),
+            "rows": sum(len(b.rows) for b in boards),
+            "rising": sum(len(b.rising_rows) for b in boards),
+        }
+    return summary
 
 
 if __name__ == "__main__":

@@ -60,7 +60,10 @@ from app.report import (
     RisingRow,
     compute_boards,
     compute_repo_deltas,
+    load_board_cache,
     pool_days_label,
+    quarter_label,
+    week_label,
 )
 
 _WEB_DIR = Path(__file__).resolve().parent
@@ -118,13 +121,14 @@ def _topic_table() -> dict:
 
 
 def _week_label(d: date) -> str:
-    """date → ISO 周标签（%G-W%V 定宽零填充，字符串比较即时间序）。"""
-    iso = d.isocalendar()
-    return f"{iso.year}-W{iso.week:02d}"
+    """date → ISO 周标签。T-027 起换算单一事实源迁至 app.report.week_label（precompute_boards 落表
+    label 与页面期次换算共用），本层保留同名私有别名，调用点零改动；格式口径见 report.week_label。"""
+    return week_label(d)
 
 
 def _quarter_label(d: date) -> str:
-    return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+    """date → 季标签。T-027 别名同 _week_label，见 report.quarter_label。"""
+    return quarter_label(d)
 
 
 def _parse_week_param(raw: str) -> date:
@@ -676,24 +680,54 @@ def _boards_context(
     board_key = _resolve_board(board, topic_table)
     conn = get_conn()
     try:
-        boards = compute_boards(
-            conn,
-            topic_table,
-            period=period,
-            as_of=as_of,
-            full_keys=None if board_key == _BOARD_ALL else {board_key},
+        # T-027 榜单预计算：仅当前期次尝试读缓存（week 时 label==当前周标签、quarter 时 label==当前季标签、
+        # total 恒当前）；历史期次永远实时算、不查表（其 as_of 与缓存采集时刻不同口径）。
+        # 命中缓存（全量 17 榜、Board.count 恒 None）直接反序列化使用，跳过 compute_boards 全池逐仓 seek；
+        # load 返回 None（三条降级判定任一不过）→ 走原 compute_boards 路径（含 full_keys 单榜收窄），代码保持原样。
+        # 单榜模式不需要补 count：模板边栏徽标取 b.count if b.count is not None else len(b.rows)，
+        # 缓存 rows 已截 top_n，len(rows)=min(出席数,top_n) 与单榜实时路径的 count 同值，徽标不漂移。
+        use_cache = period == "total" or (
+            period == "week" and label == week_label(now.date())
+        ) or (
+            period == "quarter" and label == quarter_label(now.date())
         )
+        cache_label = label if period != "total" else "all"
+        boards = load_board_cache(conn, period=period, label=cache_label) if use_cache else None
+        if (
+            boards is not None
+            and board_key != _BOARD_ALL
+            and not any(f"{b.kind}-{b.key}" == board_key for b in boards)
+        ):
+            # k3 评审 F2-1：词表/语言集变更并重启后、次日预计算前的窗口期，_resolve_board 按新词表放行
+            # 新榜 key，而缓存 payload 是预计算时刻的旧词表——单榜 URL 查无此榜会 StopIteration 500。
+            # 按本函数"缓存答不了→实时算"的既有哲学置 None 降级（下方走原 compute_boards 路径）
+            boards = None
+        if boards is None:
+            boards = compute_boards(
+                conn,
+                topic_table,
+                period=period,
+                as_of=as_of,
+                full_keys=None if board_key == _BOARD_ALL else {board_key},
+            )
         notice = None
         effective_period = period
         if period in _NOMINAL_DAYS and all(
             not b.rows and not (b.count or 0) and not b.rising_rows for b in boards
         ):
             # 首期空态降级（流程说明 §4，T-018 起主榜＋新区全空才降级）：增量榜全缺席 → 显示总星榜 + 顶部提示条
-            # （单榜模式同样走此判定，count 参与判定恢复两模式恒等（k3 初审 F2-1）：全量模式 count 恒 None，
-            #   not (b.count or 0) 恒真，本式退化为原判定；单榜模式非当前榜 count=min(归桶出席数, top_n)，
-            #   count>0 ⟺ 归桶非空 ⟺ 全量模式该榜 rows 非空（bucket 非空则 _top 至少 1 行）——两模式
-            #   "主榜＋新区全空"逐榜等价，单榜空榜 URL 不再误触发降级）
-            boards = compute_boards(conn, topic_table, period="total", as_of=as_of)
+            # （判定原样跑在缓存 boards 上：缓存 count 恒 None，本式退化为全量模式原判定；单榜模式
+            #   count 参与判定恢复两模式恒等（k3 初审 F2-1）：全量模式 count 恒 None，not (b.count or 0)
+            #   恒真，本式退化为原判定；单榜模式非当前榜 count=min(归桶出席数, top_n)，count>0 ⟺ 归桶非空
+            #   ⟺ 全量模式该榜 rows 非空（bucket 非空则 _top 至少 1 行）——两模式"主榜＋新区全空"逐榜等价，
+            #   单榜空榜 URL 不再误触发降级）
+            # T-027 降级：先试 total 缓存（仅当前期次——其 as_of≈now、同库状态等价）；None 或历史期次
+            # 才实时算（历史期次降级须按请求 as_of 口径，不能用采集时刻缓存）
+            cached_total = load_board_cache(conn, period="total", label="all") if use_cache else None
+            if cached_total is not None:
+                boards = cached_total
+            else:
+                boards = compute_boards(conn, topic_table, period="total", as_of=as_of)
             effective_period = "total"
             board_key = _BOARD_ALL  # 降级页维持全量现状（§13.1）：board 参数忽略，当前边栏项="全部"
             notice = _fallback_notice(conn, period, label, as_of_date, any(b.rows for b in boards))

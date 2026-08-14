@@ -14,10 +14,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.ai import DeepSeekClient, ensure_daily_ai
+from app.classify import load_topics
 from app.collector.discover import get_job_logger, run_daily
-from app.collector.github import GitHubClient
-from app.config import get_settings
+from app.collector.github import GitHubClient, utc_now_iso
+from app.config import BASE_DIR, get_settings
 from app.db import get_conn, init_db
+from app.report import precompute_boards
 
 DAILY_JOB_ID = "daily_snapshot_discover"
 MISFIRE_GRACE_SECONDS = 3600
@@ -30,6 +32,10 @@ async def daily_job() -> None:
     同一 conn 复用 WAL 读写不互阻；github_client 复用 run_daily 的 GitHub 连接拉 README——token 缺失时
     ensure 内部降级跳过 README 拉取、输入退化元数据、新行 readme_sha 保持 NULL；旧行指纹不被失败拉取
     清除（F2-1：拉取失败不触发重生），不报错）。
+    T-027：run_daily 成功后、AI 段之前插入榜单预计算——同一 as_of（run_daily 完成时刻，晚于本轮快照
+    captured_at 使 load 判定③恒过）对三口径各 compute_boards 全量一次落 board_cache（页面打开直读）；
+    整段独立 try/except 吞掉记 ERROR 不抛出——预计算失败绝不阻断 AI 段与次日调度（页面缺缓存时
+    降级实时算，天然兜底）。
     AI 整段 try/except 吞掉记 ERROR 不抛出——AI 失败永不阻断快照主流程（key 缺失在
     ensure_daily_ai 内部降级返回零统计，此路径行为与接线前一致）。
     """
@@ -40,6 +46,14 @@ async def daily_job() -> None:
         log = get_job_logger()
         async with GitHubClient(settings.github_token) as client:  # token 空/无效由客户端在使用点报清晰错误
             await run_daily(client, conn, log=log)
+        try:
+            # T-027 榜单预计算：as_of 取 run_daily 完成时刻（>= 本轮快照 captured_at，同日不误判过期）
+            table = load_topics(BASE_DIR / "config" / "topics.yaml")
+            as_of = utc_now_iso()
+            summary = precompute_boards(conn, table, as_of=as_of)
+            log.info("榜单预计算完成：as_of=%s，各口径榜数/主榜行数/新区行数=%s", as_of, summary)
+        except Exception:
+            log.exception("榜单预计算异常：吞掉不抛出（页面缺缓存时降级实时算兜底），次日调度自然重试")
         try:
             async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
                 await ensure_daily_ai(

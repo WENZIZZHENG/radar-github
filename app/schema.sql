@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS repos (
 -- 分语言榜单按 language 过滤仓库后再算增量
 CREATE INDEX IF NOT EXISTS idx_repos_language ON repos (language);
 
--- 星数快照：每日每仓库一行。榜单不做物化表，实时用两个截止日期各取"最近快照"求差值排序。
+-- 星数快照：每日每仓库一行。榜单端点快照源——预计算（T-027）与实时降级两条路径都从本表取数，
+-- 快照只在每日采集时写入，两次采集之间库内不变，预计算等价性以此为依据。
 CREATE TABLE IF NOT EXISTS star_snapshots (
     repo_id INTEGER NOT NULL REFERENCES repos (id),
     captured_at TEXT NOT NULL,             -- 采集时间，ISO 8601
@@ -67,3 +68,14 @@ CREATE TABLE IF NOT EXISTS recommendations (
 );
 -- 按维度×期次取全量推荐理由（周报页按周取、季页按季取、总星/关注页取 total/'all'）
 CREATE INDEX IF NOT EXISTS idx_recommendations_dim_period ON recommendations (dimension, period_label);
+
+-- 榜单预计算缓存（T-027）：每日采集后对三口径各 compute_boards 全量一次落表（JSON blob，S 档简单优先），
+-- 页面打开直读；缺失/过期（采集写了新快照但预计算未跑/失败）时页面降级实时算——缓存只换"何时算、结果存哪"，
+-- 计算口径仍走 app.report.compute_boards，实时路径不改。period 主键一行一口径，无需额外索引。
+CREATE TABLE IF NOT EXISTS board_cache (
+    period TEXT PRIMARY KEY,             -- 'week'/'quarter'/'total'
+    label TEXT NOT NULL,                 -- 周/季期次标签（2026-W33/2026-Q3）；total 固定 'all'
+    as_of TEXT NOT NULL,                 -- 预计算口径端点（UTC 定长 ISO，schema 硬约定）
+    payload TEXT NOT NULL,               -- compute_boards 全量 17 榜的 JSON 序列化（字段白名单手工展开）
+    computed_at TEXT NOT NULL            -- 落表时刻（UTC 定长 ISO）
+);
