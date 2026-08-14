@@ -252,11 +252,12 @@ def _endpoint_note(captured_at: str | None) -> str | None:
 
 
 def _meta(conn: sqlite3.Connection, period: str, as_of_date: date) -> dict:
-    """元信息行（流程说明 §2 第 1 层，T-028 消歧）：统计窗口、数据截至（最新快照日）、页面渲染时刻、跟踪池规模、口径说明。
+    """元信息行（流程说明 §2 第 1 层，T-028 消歧）：统计窗口、数据截至（最新快照的北京日期）、页面渲染时刻、跟踪池规模、口径说明。
 
     T-028：原"生成于"实为渲染时刻，易被误读为数据时间——拆成 data_as_of（数据截至，
-    库内最新快照 captured_at 的日期）与 generated（页面渲染时刻）两段；模板改显三段
-    （数据截至 / 每日采集时刻 / 页面渲染于），"生成于"字样删除。
+    库内最新快照 captured_at 的北京日期，UTC+8；采集固定北京 05:00 = UTC 21:00）与
+    generated（页面渲染时刻）两段；模板改显三段（数据截至 / 每日采集时刻 / 页面渲染于），
+    "生成于"字样删除。
     """
     nominal = _NOMINAL_DAYS.get(period)
     window = None
@@ -264,14 +265,19 @@ def _meta(conn: sqlite3.Connection, period: str, as_of_date: date) -> dict:
         start = as_of_date - timedelta(days=nominal)
         window = f"{start.isoformat()} → {as_of_date.isoformat()}（{nominal} 天）"
     tracked = conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0]
-    # T-028：数据截至 = MAX(captured_at) 定长 ISO 前 10 字符直接切片（schema 硬约定，不做日期解析，
-    # 与 _endpoint_note 同做法）；全库无快照时（首期部署当日）显式"暂无快照"，不隐晦成渲染日期
+    # T-028：数据截至 = MAX(captured_at) 的北京日期——captured_at 定长 ISO（schema 硬约定，
+    # 与 _endpoint_note 同数据源）；采集在 UTC 21:00（北京 05:00）落库，UTC 日期比北京慢一天，
+    # 直接切前 10 位会让"数据截至"永远显示前一天（用户必误会），故 +8h 再取日期
     latest_captured = conn.execute("SELECT MAX(captured_at) FROM star_snapshots").fetchone()[0]
     beijing = timezone(timedelta(hours=8))  # 本人自用（中国时区），明示避免与库内 UTC 混淆
     return {
         "window": window,  # 总星榜无窗口概念 → None，模板改显"数据截至"
         "as_of": as_of_date.isoformat(),  # 期次口径基准日（模板不再直接渲染，保留供调试/后续用）
-        "data_as_of": latest_captured[:10] if latest_captured else "暂无快照",
+        "data_as_of": (
+            (datetime.strptime(latest_captured, _ISO_FMT) + timedelta(hours=8)).date().isoformat()
+            if latest_captured
+            else "暂无快照"
+        ),
         "generated": datetime.now(beijing).strftime("%Y-%m-%d %H:%M"),  # 页面渲染时刻（UTC+8），非数据时间
         "tracked": f"{tracked:,}",
         "method": "增量 = 两端快照差" if nominal is not None else "按最新快照总星数降序",

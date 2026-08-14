@@ -285,7 +285,7 @@ def test_whole_task_exception_swallowed_and_logged(tmp_path):
     assert any("每日任务汇总" in r.getMessage() for r in records)
 
 
-# ---------- 调度注册：UTC 00:00 cron＋错过策略；main.py 开关接线 ----------
+# ---------- 调度注册：每日 UTC 21:00（北京 05:00）cron＋错过策略；main.py 开关接线 ----------
 
 
 def test_create_scheduler_registers_daily_utc_cron():
@@ -296,7 +296,7 @@ def test_create_scheduler_registers_daily_utc_cron():
     assert job.id == DAILY_JOB_ID
     assert job.func is daily_job  # 注册的确实是每日任务本体，不是别的函数
     fields = {f.name: str(f) for f in job.trigger.fields}
-    assert fields["hour"] == "0" and fields["minute"] == "0"  # 每日 UTC 00:00
+    assert fields["hour"] == "21" and fields["minute"] == "0"  # 每日北京 05:00 = UTC 21:00（2026-08-14 拍板改定）
     assert "UTC" in str(job.trigger.timezone)  # 时区钉死 UTC，不随服务器本地时区漂移
     assert job.misfire_grace_time == 3600
     assert job.coalesce is True

@@ -238,12 +238,13 @@ def test_total_page_content(client):
 
 
 def test_meta_line_data_as_of_and_generated(client, tmp_path, monkeypatch):
-    """T-028 元信息行消歧：数据截至 = MAX(captured_at) 日期切片（种子库最新快照 2026-08-09），
-    页面渲染于独立于数据时间；无窗口分支（/total）显"数据截至"；全库无快照时显"暂无快照"。
+    """T-028 元信息行消歧：数据截至 = MAX(captured_at) 的北京日期（种子库最新快照 2026-08-09T00:00:00Z，
+    +8h 后北京日期仍为 2026-08-09），页面渲染于独立于数据时间；无窗口分支（/total）显"数据截至"；
+    全库无快照时显"暂无快照"。
     """
     text = client.get("/total?board=all").text
     assert "数据截至 2026-08-09" in text
-    assert "每日 08:00 采集（UTC 00:00）" in text
+    assert "每日 05:00 采集" in text
     assert "页面渲染于 " in text  # 渲染时刻独立字段（当天时间，不断言具体值）
     assert "跟踪池 3 个仓库" in text
     assert "生成于" not in text  # T-028：删除易误读为数据时间的"生成于"字样

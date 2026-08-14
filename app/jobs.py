@@ -1,6 +1,6 @@
 """进程内调度（架构决策 7：SSR + SQLite + 进程内 APScheduler，不引独立调度进程）。
 
-每日 UTC 00:00 跑一次全日任务（快照＋发现池，逻辑全在 app.collector.discover；T-011/T-017 串行接 AI 每日生成）：
+每日北京 05:00（UTC 21:00）跑一次全日任务（快照＋发现池，逻辑全在 app.collector.discover；T-011/T-017 串行接 AI 每日生成）：
 - misfire_grace_time=1 小时：进程重启错过整点，1 小时内醒来补跑一次；
 - coalesce=True：多次错过合并成一次，不连刷配额（共识 §8 允许数据空洞，没必要补）；
 - 时区钉死 UTC：服务器本地时区不可控，采集口径全部 UTC（与 UTC 定长时间戳硬约定一致）。
@@ -56,7 +56,7 @@ def create_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=timezone.utc)
     scheduler.add_job(
         daily_job,
-        CronTrigger(hour=0, minute=0, timezone=timezone.utc),
+        CronTrigger(hour=21, minute=0, timezone=timezone.utc),  # UTC 21:00 = 北京次日 05:00（2026-08-14 本人拍板改定）
         id=DAILY_JOB_ID,
         misfire_grace_time=MISFIRE_GRACE_SECONDS,
         coalesce=True,

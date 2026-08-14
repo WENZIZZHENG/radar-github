@@ -41,7 +41,7 @@
 {% endif %}
 
 {# 第 1 层：元信息行（T-028 消歧：数据截至 = 最新快照日，页面渲染于 = 渲染时刻，删除易误读的"生成于"） #}
-<p class="meta">{% if meta.window %}窗口：{{ meta.window }} · 数据截至 {{ meta.data_as_of }} · 每日 08:00 采集（UTC 00:00） · 页面渲染于 {{ meta.generated }} · 跟踪池 {{ meta.tracked }} 个仓库 · {{ meta.method }}{% else %}数据截至 {{ meta.data_as_of }} · 每日 08:00 采集（UTC 00:00） · 页面渲染于 {{ meta.generated }} · 跟踪池 {{ meta.tracked }} 个仓库 · {{ meta.method }}{% endif %}</p>
+<p class="meta">{% if meta.window %}窗口：{{ meta.window }} · 数据截至 {{ meta.data_as_of }} · 每日 05:00 采集 · 页面渲染于 {{ meta.generated }} · 跟踪池 {{ meta.tracked }} 个仓库 · {{ meta.method }}{% else %}数据截至 {{ meta.data_as_of }} · 每日 05:00 采集 · 页面渲染于 {{ meta.generated }} · 跟踪池 {{ meta.tracked }} 个仓库 · {{ meta.method }}{% endif %}</p>
 
 {# 首期/缺席降级提示条（流程说明 §4）：增量榜全缺席时显示总星榜 + 明确提示 #}
 {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
