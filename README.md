@@ -46,7 +46,7 @@ uv venv .venv && uv pip install -r pyproject.toml --extra dev   # 装依赖
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 ```
 
-环境变量（`.env`，不落仓）：`GITHUB_TOKEN`、`DEEPSEEK_API_KEY`、`RADAR_DB_PATH`（缺省 `data/radar.db`）、`RADAR_JOBS_ENABLED=0`（本地关调度防误采集）。
+环境变量：复制 `.env.example` 为 `.env` 后填实值（`.env` 不落仓）。键位：`GITHUB_TOKEN`、`DEEPSEEK_API_KEY`（两者缺失时对应功能降级、不阻塞出榜）、`RADAR_DB_PATH`（缺省 `data/radar.db`）、`RADAR_JOBS_ENABLED=0`（本地关调度防误采集）；逐键说明见 `.env.example` 注释。
 
 ## 生产部署
 
