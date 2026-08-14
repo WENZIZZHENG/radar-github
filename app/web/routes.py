@@ -252,18 +252,27 @@ def _endpoint_note(captured_at: str | None) -> str | None:
 
 
 def _meta(conn: sqlite3.Connection, period: str, as_of_date: date) -> dict:
-    """元信息行（流程说明 §2 第 1 层）：统计窗口、生成时间（UTC+8）、跟踪池规模、口径说明。"""
+    """元信息行（流程说明 §2 第 1 层，T-028 消歧）：统计窗口、数据截至（最新快照日）、页面渲染时刻、跟踪池规模、口径说明。
+
+    T-028：原"生成于"实为渲染时刻，易被误读为数据时间——拆成 data_as_of（数据截至，
+    库内最新快照 captured_at 的日期）与 generated（页面渲染时刻）两段；模板改显三段
+    （数据截至 / 每日采集时刻 / 页面渲染于），"生成于"字样删除。
+    """
     nominal = _NOMINAL_DAYS.get(period)
     window = None
     if nominal is not None:
         start = as_of_date - timedelta(days=nominal)
         window = f"{start.isoformat()} → {as_of_date.isoformat()}（{nominal} 天）"
     tracked = conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0]
+    # T-028：数据截至 = MAX(captured_at) 定长 ISO 前 10 字符直接切片（schema 硬约定，不做日期解析，
+    # 与 _endpoint_note 同做法）；全库无快照时（首期部署当日）显式"暂无快照"，不隐晦成渲染日期
+    latest_captured = conn.execute("SELECT MAX(captured_at) FROM star_snapshots").fetchone()[0]
     beijing = timezone(timedelta(hours=8))  # 本人自用（中国时区），明示避免与库内 UTC 混淆
     return {
-        "window": window,  # 总星榜无窗口概念 → None，模板改显"截至"
-        "as_of": as_of_date.isoformat(),
-        "generated": datetime.now(beijing).strftime("%Y-%m-%d %H:%M"),
+        "window": window,  # 总星榜无窗口概念 → None，模板改显"数据截至"
+        "as_of": as_of_date.isoformat(),  # 期次口径基准日（模板不再直接渲染，保留供调试/后续用）
+        "data_as_of": latest_captured[:10] if latest_captured else "暂无快照",
+        "generated": datetime.now(beijing).strftime("%Y-%m-%d %H:%M"),  # 页面渲染时刻（UTC+8），非数据时间
         "tracked": f"{tracked:,}",
         "method": "增量 = 两端快照差" if nominal is not None else "按最新快照总星数降序",
     }
@@ -666,7 +675,6 @@ def _boards_context(
             topic_table,
             period=period,
             as_of=as_of,
-            top_n=30,
             full_keys=None if board_key == _BOARD_ALL else {board_key},
         )
         notice = None
@@ -679,7 +687,7 @@ def _boards_context(
             #   not (b.count or 0) 恒真，本式退化为原判定；单榜模式非当前榜 count=min(归桶出席数, top_n)，
             #   count>0 ⟺ 归桶非空 ⟺ 全量模式该榜 rows 非空（bucket 非空则 _top 至少 1 行）——两模式
             #   "主榜＋新区全空"逐榜等价，单榜空榜 URL 不再误触发降级）
-            boards = compute_boards(conn, topic_table, period="total", as_of=as_of, top_n=30)
+            boards = compute_boards(conn, topic_table, period="total", as_of=as_of)
             effective_period = "total"
             board_key = _BOARD_ALL  # 降级页维持全量现状（§13.1）：board 参数忽略，当前边栏项="全部"
             notice = _fallback_notice(conn, period, label, as_of_date, any(b.rows for b in boards))
@@ -807,7 +815,7 @@ def quarterly(request: Request, quarter: str | None = None, board: str | None = 
 
 @router.get("/total", response_class=HTMLResponse)
 def total(request: Request, board: str | None = None) -> HTMLResponse:
-    """P4 总星榜：最新快照总星数降序 Top 30/榜，无期次概念。
+    """P4 总星榜：最新快照总星数降序 Top 50/榜（T-028：默认 top_n 30→50），无期次概念。
 
     T-021 §12.1（v2.1 修订）：P4 纳入边栏（实测同为 17 榜长页、HTML 1.7MB 全站最重），
     其顶部 chips 区与榜头回顶部随边栏到位同步移除（与 P1/P2/P3 一致）。
@@ -1258,7 +1266,7 @@ async def api_translate(request: Request, client: DeepSeekClient = Depends(_ai_c
 @router.post("/api/translate-missing", status_code=202)
 async def api_translate_missing() -> dict:
     """批量补译（§7.2 第 2 步，后台任务形态）：锁内原子检查＋占位 running → 统计待译 total（范围集 S
-    = 三口径榜 Top30 去重 ∪ 关注集内 description_zh IS NULL 且英文非空无 CJK 的仓——T-017 决策 5 v3
+    = 三口径榜 Top50 去重 ∪ 关注集内 description_zh IS NULL 且英文非空无 CJK 的仓——T-017 决策 5 v3
     收窄，S 之外不送译；SQL 预过滤 NULL/空串，Python 过 has_cjk）→ asyncio.create_task 起 worker（模块级
     持有防 GC）→ 立即返回 202 {"started": true, "total": T}；running 时重复触发 409（detail 即 §7.3 前端 toast
     文案）；不触碰 recommendations 表。进度/结果由 worker 写入 _batch_state，前端轮询 /status 读取。
@@ -1269,7 +1277,7 @@ async def api_translate_missing() -> dict:
         with _batch_state_lock:
             if _batch_state["running"]:
                 raise HTTPException(status_code=409, detail="补译任务进行中，请稍后再试")
-            # T-017 收窄（决策 5 v3，评审 F1-1）：翻译目标 = 范围集 S（三口径榜 Top30 去重 ∪ 关注集），
+            # T-017 收窄（决策 5 v3，评审 F1-1）：翻译目标 = 范围集 S（三口径榜 Top50 去重 ∪ 关注集），
             # S 之外（未上榜未关注）的仓不送译——与每日 ensure 翻译段同源口径
             pending = _pending_translate_in_scope(conn)
             _batch_state.update(running=True, translated=0, failed=0, total=len(pending), finished=False, error=None)
@@ -1282,7 +1290,7 @@ async def api_translate_missing() -> dict:
 def _pending_translate_in_scope(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """批量补译候选：范围集 S 内 description_zh IS NULL 且英文非空无 CJK 的仓库（评审 F1-1 收窄）。
 
-    与每日 ensure 翻译段同一范围口径（_scope_sets：三口径榜 Top30 去重 ∪ 关注集）；空描述/CJK 跳过
+    与每日 ensure 翻译段同一范围口径（_scope_sets：三口径榜 Top50 去重 ∪ 关注集）；空描述/CJK 跳过
     口径照旧（SQL 预过滤 NULL/空串，Python 过 has_cjk）；分块防旧 SQLite 变量上限。
     """
     listed_by_period, follow_names = _scope_sets(conn, now=datetime.now(timezone.utc))
@@ -1574,7 +1582,7 @@ def _recommend_missing_count(conn: sqlite3.Connection) -> int:
 @router.post("/api/recommend-missing", status_code=202)
 async def api_recommend_missing() -> dict:
     """批量补齐推荐语（§8.2 第 2 步，后台任务形态；与翻译批量并列独立不共用）：锁内原子检查＋占位
-    running → 统计补缺 total（S = 三口径榜 Top30 去重 ∪ 关注集 × 适用维度行缺失）→
+    running → 统计补缺 total（S = 三口径榜 Top50 去重 ∪ 关注集 × 适用维度行缺失）→
     asyncio.create_task 起 worker（模块级持有防 GC）→ 立即返回 202；running 时重复触发 409
     （detail 即 §8.3 前端 toast 文案）；不触碰翻译字段。进度/结果由 worker 写入 _rec_batch_state。
     """

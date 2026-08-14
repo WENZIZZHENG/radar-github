@@ -1,7 +1,7 @@
 """AI 服务（T-011→T-018）：范围内翻译＋三口径分维度推荐语生成＋全程降级（共识 §7 v4 / 决策 5 v2 / 决策 6 v2）。
 
 口径（任务书钉死，勿自由发挥）：
-- 范围集 S（T-017 收窄，v3 全池口径作废；T-018 起周/季榜集 = 主榜 Top30 ∪ 新区 Top10）：
+- 范围集 S（T-017 收窄，v3 全池口径作废；T-018 起周/季榜集 = 主榜 Top50 ∪ 新区 Top10；T-028 主榜 30→50）：
   三口径榜去重 ∪ 关注集——
   S 之外的仓库永远不译不生成（已译译文保留不清除；新上榜/新关注仓由每日 job 自动补译，自愈）；
 - 翻译段：只译 S 内 description_zh IS NULL 的仓（英文非空、不含 CJK 逐条翻译回填 repos.description_zh）；
@@ -341,7 +341,7 @@ def _load_repo_info(conn: sqlite3.Connection, full_names: list[str]) -> dict[str
 def _scope_sets(
     conn: sqlite3.Connection, *, now: datetime
 ) -> tuple[dict[str, dict[str, _ListedItem]], list[str]]:
-    """T-017/T-018 覆盖口径 S：三口径榜去重 ∪ 关注集（周/季 = 主榜 Top30 ∪ 新区 Top10；total = Top30）。
+    """T-017/T-018 覆盖口径 S：三口径榜去重 ∪ 关注集（周/季 = 主榜 Top50 ∪ 新区 Top10；total = Top50，T-028 30→50）。
 
     返回 (listed_by_period, follow_names)：listed_by_period[period] = full_name → _ListedItem（榜单序保序）；
     follow_names 按 follows.created_at 序（页面关注序）。S 之外的仓库永远不译不生成（共识 §7 v4）。
@@ -351,7 +351,7 @@ def _scope_sets(
     as_of_iso = now.strftime(_ISO_FMT)
     listed_by_period: dict[str, dict[str, _ListedItem]] = {}
     for period in ("week", "quarter", "total"):
-        boards = compute_boards(conn, topic_table, period=period, as_of=as_of_iso, top_n=30)
+        boards = compute_boards(conn, topic_table, period=period, as_of=as_of_iso)
         listed: dict[str, _ListedItem] = {}
         for board in boards:
             for row in board.rows:
@@ -665,7 +665,7 @@ async def ensure_daily_ai(
 ) -> dict[str, int]:
     """每日 AI 生成（T-017 重写，原名 ensure_weekly_ai）：范围集翻译收窄＋三维度推荐语补缺/刷新＋AI 概要（T-024）。
 
-    步骤：a) 计算范围集 S = 三口径榜去重 ∪ 关注集（周/季 = 主榜 Top30 ∪ 新区 Top10，T-018）；
+    步骤：a) 计算范围集 S = 三口径榜去重 ∪ 关注集（周/季 = 主榜 Top50 ∪ 新区 Top10，T-018；T-028 主榜 30→50）；
     b) 翻译段收窄：只译 S 内 description_zh IS NULL 且英文非空无 CJK 的仓（原文变更采集层已清译文，
     当日本轮自然重译；译过的不重译；S 之外永不翻译——v3 全池口径作废）；
     c) 推荐语三维度＋概要（口径详见 recommend_missing docstring；refresh=True → 概要段随行执行）；

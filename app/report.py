@@ -257,7 +257,7 @@ def compute_boards(
     *,
     period: str = "week",
     as_of: str | None = None,
-    top_n: int = 30,
+    top_n: int = 50,
     full_keys: Collection[str] | None = None,
 ) -> list[Board]:
     """算指定口径的全部分类榜：语言榜 7 张 + 主题榜（词表主题数 + 1）张，每榜 Top top_n 行。
@@ -346,7 +346,7 @@ def compute_boards(
     rising_topic_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_topic.items()}
     # T-026 单榜整页（§13.1）：full_keys 非 None 时仅指定榜构建主榜行对象，其余榜只归桶计数
     # （rows 空、count=主榜行数，min(len, top_n) 与全量模式徽标 len(rows) 同语义——_top 截断后长度
-    # 恰为 min(出席数, top_n)，两模式徽标不因 >30 仓/榜漂移）；新区行全量（缺席仓量级小，
+    # 恰为 min(出席数, top_n)，两模式徽标不因 >50 仓/榜漂移）；新区行全量（缺席仓量级小，
     # 且降级判定"主榜＋新区全空才降级"需要全库新区信息，不能按 full_keys 收窄）
     def _full(kind: str, key: str) -> bool:
         return full_keys is None or f"{kind}-{key}" in full_keys

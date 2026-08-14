@@ -450,11 +450,15 @@ def test_new_week_regenerates_recommendation(conn):
 
 
 def test_translate_scope_excludes_unlisted_and_dead(conn):
-    """T-017 范围收窄（v3 全池口径作废）：不占任何 Top30 的仓与 dead 仓不在 S → 不译不生成。"""
+    """T-017 范围收窄（v3 全池口径作废）：不占任何 Top50 的仓与 dead 仓不在 S → 不译不生成。
+
+    T-028：默认 top_n 30→50，占榜构造同步扩到 51 个 filler（51 个星数更高者占满 total Top50，
+    周榜 delta=10 并列按星数也占满 Top50）——a/off 星数最低仍不占任何榜。
+    """
     _add_repo(conn, "a/listed", description_en="on board")
-    # 35 个星数更高的仓占满周/总星两口径 Top30：a/off 星数最低 → 不占任何榜（total 榜无缺席概念，
+    # 51 个星数更高的仓占满周/总星两口径 Top50：a/off 星数最低 → 不占任何榜（total 榜无缺席概念，
     # "未上榜"必须靠占榜构造）
-    for i in range(35):
+    for i in range(51):
         _add_repo(conn, f"f/fill{i:02d}", description_en=f"filler {i}", base=2000 + i * 10, delta=10)
     _add_repo(conn, "a/off", description_en="off board", base=100, delta=10)
     dead_id = _add_repo(conn, "a/dead", description_en="dead repo", base=3000, delta=10)
@@ -462,7 +466,7 @@ def test_translate_scope_excludes_unlisted_and_dead(conn):
     conn.commit()
     fake = FakeDeepSeekClient()
     stats = _run_ensure(conn, fake)
-    assert stats["listed"] == 31  # S = 30 filler 占周/总星两口径 Top30 ＋ a/listed（周榜 delta 100 居首）
+    assert stats["listed"] == 51  # S = 50 filler 占周/总星两口径 Top50 ＋ a/listed（周榜 delta 100 居首）
     # 范围收窄：a/off（不占任何榜）与 a/dead（dead 剔除）不送译
     assert "off board" not in fake.translate_calls
     assert "dead repo" not in fake.translate_calls

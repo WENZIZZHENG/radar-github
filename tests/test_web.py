@@ -237,6 +237,33 @@ def test_total_page_content(client):
     assert "follow-boards" not in text  # v1.3：关注分组区只在 P6 独立页渲染（P3/P4 布局同 P1 榜单区，不含关注区）
 
 
+def test_meta_line_data_as_of_and_generated(client, tmp_path, monkeypatch):
+    """T-028 元信息行消歧：数据截至 = MAX(captured_at) 日期切片（种子库最新快照 2026-08-09），
+    页面渲染于独立于数据时间；无窗口分支（/total）显"数据截至"；全库无快照时显"暂无快照"。
+    """
+    text = client.get("/total?board=all").text
+    assert "数据截至 2026-08-09" in text
+    assert "每日 08:00 采集（UTC 00:00）" in text
+    assert "页面渲染于 " in text  # 渲染时刻独立字段（当天时间，不断言具体值）
+    assert "跟踪池 3 个仓库" in text
+    assert "生成于" not in text  # T-028：删除易误读为数据时间的"生成于"字样
+
+    week_text = client.get("/").text
+    assert "窗口：" in week_text and "数据截至 2026-08-09" in week_text  # 窗口分支同样显数据截至
+
+    # 全库无快照：不套 _make_client（其固定用 tmp_path/web.db，与 client fixture 同名复用会带上种子数据），
+    # 独立 empty.db 路径构造
+    db = tmp_path / "empty.db"
+    init_db(db)
+    conn = get_conn(db)
+    conn.close()
+    monkeypatch.setenv("RADAR_DB_PATH", str(db))
+    monkeypatch.setenv("RADAR_JOBS_ENABLED", "0")
+    with TestClient(app) as empty:
+        empty_text = empty.get("/total?board=all").text
+        assert "暂无快照" in empty_text  # 首期部署当日无快照：不隐晦成渲染日期
+
+
 def test_follow_section_moved_off_weekly(client):
     """v1.3：P1 顶部关注区移出为独立页 P6；周报页不再有关注区，顶栏"我的关注"徽标显示真实关注数。"""
     text = client.get("/").text

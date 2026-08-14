@@ -133,13 +133,16 @@ def test_dead_repo_excluded(conn, topic_table):
 
 
 def test_top_n_short_board_and_limit(conn, topic_table):
-    """不足 30 有多少列多少；超过 30 截 Top 30，被截掉的是增量最小者。"""
+    """不足 30 有多少列多少；超过 30 截 Top 30，被截掉的是增量最小者。
+
+    T-028：默认 top_n 已改 50，本测显式 top_n=30 钉"截断语义钉在显式参数上"，与默认值脱钩。
+    """
     for i in range(1, 32):  # 31 个 Python 仓库，增量 1..31
         _add_repo(conn, f"a/py-{i:02d}", language="Python", snapshots=[(_iso(7), 1000), (_iso(0), 1000 + i)])
     _add_repo(conn, "a/go-1", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
     _add_repo(conn, "a/go-2", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 150)])
 
-    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF, top_n=30)
     py_rows = _board(boards, "language", "python").rows
     assert len(py_rows) == 30
     assert py_rows[0].delta == 31
@@ -225,14 +228,19 @@ def test_boards_structure_and_order(conn, topic_table):
 def test_full_keys_badge_count_equals_full_rows(conn, topic_table):
     """T-026 单榜整页徽标恒等（k3 初审 F3-6）：full_keys 模式非当前榜 count=min(出席数, top_n)，
     与全量模式该榜 len(rows) 恒等（>top_n 截断两模式同口径）；非当前榜 rows 恒空、当前榜全量构建
-    （count 恒 None，页面徽标走 len(rows)），两模式徽标不因单榜化漂移。"""
+    （count 恒 None，页面徽标走 len(rows)），两模式徽标不因单榜化漂移。
+
+    T-028：默认 top_n 已改 50，本测显式 top_n=30 钉截断语义，与默认值脱钩。
+    """
     for i in range(35):  # >top_n=30：截断语义两模式对齐
         _add_repo(conn, f"a/py{i:02d}", language="Python", snapshots=[(_iso(7), 100), (_iso(0), 200)])
     for i in range(3):
         _add_repo(conn, f"a/go{i}", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
 
-    single = compute_boards(conn, topic_table, period="week", as_of=AS_OF, full_keys={"language-python"})
-    full = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    single = compute_boards(
+        conn, topic_table, period="week", as_of=AS_OF, top_n=30, full_keys={"language-python"}
+    )
+    full = compute_boards(conn, topic_table, period="week", as_of=AS_OF, top_n=30)
 
     py_single, py_full = _board(single, "language", "python"), _board(full, "language", "python")
     assert py_single.count is None  # 当前榜全量构建：count 恒 None（全量语义）
