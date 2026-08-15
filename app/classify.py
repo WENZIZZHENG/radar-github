@@ -2,7 +2,9 @@
 
 - 语言：6 个指定语言各自成榜（共识文档 §6），其余（含无语言）进"其它语言"；
   匹配用 GitHub primaryLanguage.name 的精确值（首字母大写，如 "TypeScript"），不做模糊匹配；
-- 主题：封闭词表（config/topics.yaml）精确匹配 repositoryTopics 值（小写 kebab-case）；
+- 主题：封闭词表（config/topics.yaml）匹配 repositoryTopics 值（小写 kebab-case）；命中判定带单复数归一
+  （决策 3 v2）：词条精确命中、或 topics 值 == 词条＋尾"s" 亦命中——词表只写单数即可覆盖复数 topics；
+  单向：不做反向（词条复数不命中单数 topic）、不做通用去 s（防 css 被剥成 cs 之类误伤）；
   命中多主题 → 多榜重复；零命中 → 空列表，由调用方解释为"其他"榜，本模块不发明 "other" 主题 key；
 - 词表由调用方显式 load_topics() 后传入，模块顶层不读文件：保持纯函数可测，路径决策留在调用方。
 """
@@ -65,8 +67,15 @@ def classify_language(language: str | None) -> str:
 def classify_topics(topics: list[str], table: dict[str, TopicSpec]) -> list[str]:
     """主题分类：返回命中主题的 key 列表（按词表顺序），零命中返回空列表。
 
+    命中规则（决策 3 v2 单复数归一）：词条精确命中、或 topics 值 == 词条＋尾"s" 亦命中——
+    词表只写单数即可覆盖复数 topics；单向：不做反向（词条复数不命中单数 topic）、
+    不做通用去 s（防 css 被剥成 cs 之类误伤）。
     空列表即"其他"榜，由调用方解释——"其他"不是主题 key，避免与词表主题混同；
     输入防御性 lower/strip（GitHub 规范为小写 kebab-case，脏数据也不影响命中判定）。
     """
     normalized = {t.strip().lower() for t in topics}
-    return [key for key, spec in table.items() if any(word in normalized for word in spec["words"])]
+    return [
+        key
+        for key, spec in table.items()
+        if any(word in normalized or word + "s" in normalized for word in spec["words"])
+    ]

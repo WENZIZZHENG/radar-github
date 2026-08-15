@@ -80,6 +80,31 @@ def test_classify_topics_result_follows_table_order_not_input_order():
     assert classify_topics(["docker", "react"], table) == ["frontend", "backend"]
 
 
+def test_classify_topics_singular_rule_hits_plural_topic():
+    # 决策 3 v2 单复数归一：词条精确命中、或 topics 值 = 词条＋尾"s" 亦命中（词表只写单数即可覆盖复数 topics）
+    # 迷你表直证 +s 规则本身（不依赖词表显式补词）：
+    table = {"ai": {"label": "AI", "words": ["ai-agent"]}}
+    assert classify_topics(["ai-agents"], table) == ["ai"]
+    # 真实词表：deepseek-harness 场景（topics 为复数 ai-agents）应进 ai 主题
+    table = load_topics(TOPICS_PATH)
+    assert classify_topics(["ai-agents"], table) == ["ai"]
+
+
+def test_classify_topics_singular_rule_is_one_way():
+    # 决策 3 v2 单向：不做反向（词条复数不命中单数 topic）、不做通用去 s——防 css 被剥成 cs 之类误伤
+    table = {"ai": {"label": "AI", "words": ["ai-agents"]}}
+    assert classify_topics(["ai-agent"], table) == []
+    table = load_topics(TOPICS_PATH)
+    assert classify_topics(["cs"], table) == []
+
+
+def test_classify_topics_exact_hit_unchanged():
+    # 决策 3 v2 只在精确命中之外加了 +s 变体：既有精确命中行为不变
+    table = load_topics(TOPICS_PATH)
+    assert classify_topics(["ai-agent"], table) == ["ai"]
+    assert classify_topics(["react"], table) == ["frontend"]
+
+
 def test_classify_topics_zero_hit_returns_empty_list():
     # 零命中返回空列表：调用方解释为"其他"榜，分类器不发明 "other" 主题 key
     table = load_topics(TOPICS_PATH)
@@ -130,7 +155,7 @@ def test_topics_table_word_counts_locked_to_architecture_doc():
     # 词条数量锁死：任一主题增删词条都会漂移，测试即告警——封板物不许偷偷改
     table = load_topics(TOPICS_PATH)
     assert {key: len(table[key]["words"]) for key in table} == {
-        "ai": 21,
+        "ai": 22,
         "frontend": 18,
         "backend": 17,
         "data": 17,

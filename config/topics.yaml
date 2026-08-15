@@ -1,8 +1,8 @@
-# config/topics.yaml —— 命中规则：仓库 topics 含任一词条即进该主题；命中多主题多榜重复；零命中进"其他"
+# config/topics.yaml —— 命中规则：仓库 topics 含任一词条即进该主题（决策 3 v2 单复数归一：词条精确命中、或 topics 值 = 词条＋尾"s" 亦命中，词表只写单数即可覆盖复数 topics，不做反向/不做通用去 s）；命中多主题多榜重复；零命中进"其他"
 ai:
   label: AI与智能
   words: [machine-learning, deep-learning, artificial-intelligence, ai, llm, large-language-model,
-          ai-agent, agents, nlp, natural-language-processing, computer-vision, neural-network,
+          ai-agent, ai-agents, agents, nlp, natural-language-processing, computer-vision, neural-network,
           transformer, diffusion-model, rag, retrieval-augmented-generation, mcp, generative-ai,
           chatgpt, pytorch, tensorflow]
 frontend:
