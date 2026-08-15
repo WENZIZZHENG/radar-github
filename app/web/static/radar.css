@@ -146,7 +146,7 @@ h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 }
 .board > h3 .top:hover { color: var(--blue); background: rgba(88,166,255,.08); }
 
-/* ===== T-018 新崛起区（决策 4 v2）：主榜行后分区展示 ===== */
+/* ===== T-018 新崛起区（决策 4 v2）：榜头之后、主榜行前分区展示（T-030 换序，§9.1 v2.5） ===== */
 .rising { border-top: 1px dashed var(--line); }
 .rising-h {
   display: flex; align-items: center; gap: var(--s2);
