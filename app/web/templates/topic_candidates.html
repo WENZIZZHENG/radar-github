@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+{# P7 候选词只读页（T-032，§15.1）：只读列表无写操作；入口在 P1 元信息行"候选词"小字链接（不占顶栏）；
+   空态两种（§15.3）：扫描过但无候选 / 从未成功扫描（AI 未配置，注明"扫描未运行过"）；页内附回首页链接 #}
+<p class="meta">候选词扫描 · 每周一随每日任务自动执行 · 词频 ≥ {{ threshold }} 且未命中词表 · AI 建议仅供收词参考（收词走会话拍板＋部署）</p>
+
+{% if rows %}
+<section>
+  <h2 class="sec">候选词</h2>
+  <div class="board">
+    <h3>候选词<span class="n">{{ rows | length }} 个</span></h3>
+    {% for r in rows %}
+    <div class="cand">
+      <span class="term">{{ r.term }}</span>
+      <span class="topic{% if r.rejected %} na{% endif %}">{{ r.suggested_topic }}</span>
+      <span class="count">{{ r.pool_count }} 次</span>
+      <span class="date">{{ r.scan_date }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% else %}
+{# 空态（§15.3）：从未成功扫描过（无扫描记录，如 AI 未配置）时额外注明"扫描未运行过（AI 未配置）" #}
+<p class="empty-follows">当前无候选词——上周扫描未发现高频未命中词{% if not has_scan %}；扫描未运行过（AI 未配置）{% endif %}。<a href="/">回首页</a></p>
+{% endif %}
+{% endblock %}

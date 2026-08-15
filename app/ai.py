@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sqlite3
@@ -106,6 +107,27 @@ def _extract_content(response: httpx.Response) -> str | None:
     if not isinstance(content, str):
         return None
     return content.strip() or None
+
+
+def _parse_suggested_topics(content: str) -> dict | None:
+    """解析 suggest_topics 返回的 JSON 对象（T-032，容错）：剥 markdown 代码围栏后取首尾大括号间文本解析；
+    无大括号/JSON 畸形/非对象 → None（调用方视为 AI 调用失败整段跳过，§15.3）。"""
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        obj = json.loads(stripped[start : end + 1])
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 class DeepSeekClient:
@@ -259,6 +281,28 @@ class DeepSeekClient:
             user="\n".join(lines),
             temperature=0.3,  # 低温度：概要求准不求发散（与推荐语同值）
         )
+
+    async def suggest_topics(self, terms: list[str], topic_names: list[str]) -> dict[str, str]:
+        """候选词 → 建议主题（T-032，§15.2）：批量一次调用返回 {词: 主题名或"不建议收录"}。
+
+        - 输入只含候选词与词表现有主题 label（§15.4 红线：不含任何仓库数据）；
+        - 输出 JSON 对象（键为候选词原样），markdown 围栏等杂质容错后解析；
+        - 解析失败抛 DeepSeekError——调用方按"AI 调用失败"整段跳过（不写表不清表，
+          页面显示上一轮，§15.3）；DeepSeekAuthError 直通（同其他方法）；
+        - 值合法性（主题名枚举/"不建议收录"）由调用方过滤，本方法只负责调用与解析。
+        """
+        system = (
+            "你是技术雷达的编辑。下面给出 GitHub 仓库上的候选主题标签（topics）清单与现有主题清单。"
+            "请为每个候选标签判断应归入哪个现有主题（给出主题名）；若该标签词义宽泛、属平台/通用词"
+            "或与现有主题无关，则写“不建议收录”。"
+            "只输出一个 JSON 对象：键为候选标签原样，值为主题名或“不建议收录”，不要输出其他内容。"
+        )
+        user = "候选标签：\n" + "\n".join(f"- {t}" for t in terms) + "\n\n现有主题：\n" + "、".join(topic_names)
+        content = await self._chat(system=system, user=user, temperature=0.2)  # 低温度：归类求稳不求发散
+        parsed = _parse_suggested_topics(content)
+        if parsed is None:
+            raise DeepSeekError(f"候选主题建议响应解析失败（期望 JSON 对象）：{content[:200]}")
+        return parsed
 
     async def _chat(self, *, system: str, user: str, temperature: float) -> str:
         """一次 chat/completions 调用：超时/传输错误/5xx/响应畸形重试一次后仍失败 → 抛清晰异常。"""

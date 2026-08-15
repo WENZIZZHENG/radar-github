@@ -18,6 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.ai import DeepSeekClient, ensure_daily_ai
+from app.candidates import scan_candidates
 from app.classify import load_topics
 from app.collector.discover import DailyStats, get_job_logger, run_daily
 from app.collector.github import GitHubClient, utc_now_iso
@@ -27,6 +28,12 @@ from app.report import precompute_boards
 
 DAILY_JOB_ID = "daily_snapshot_discover"
 MISFIRE_GRACE_SECONDS = 3600
+
+
+def _candidate_scan_due(now: datetime) -> bool:
+    """候选词扫描触发判定（T-032，§15.2）：仅 UTC 周一执行（与 _weekly_refill 同日判定口径，
+    date.weekday() == 0）；周一以外的日子零行为变化。"""
+    return now.date().weekday() == 0
 
 # T-029 手动同步与调度共用的运行锁/状态（§14.4：全局限额一个运行实例，手动/调度共用同一把锁；
 # 状态只存进程内存不落库——服务重启归零，被中断的任务由次日调度自愈）：
@@ -95,6 +102,9 @@ async def _run_sync() -> DailyStats:
       captured_at 使 load 判定③恒过）对三口径各 compute_boards 全量一次落 board_cache（页面打开直读）；
       整段独立 try/except 吞掉记 ERROR 不抛出——预计算失败绝不阻断 AI 段与次日调度（页面缺缓存时
       降级实时算，天然兜底）。
+    - T-032：候选词扫描（§15.2）在预计算后、AI ensure 前执行——仅 UTC 周一（_candidate_scan_due 判定，
+      与每周补捞同日口径），池内 topics 词频 → 未命中词表且达阈值的词 → DeepSeek 批量出建议主题 →
+      全量覆盖式落库；key 缺失/调用失败内部降级跳过不清表，外层 try/except 兜底记 ERROR 不阻断 AI 段。
     - AI 整段 try/except 吞掉记 ERROR 不抛出——AI 失败永不阻断快照主流程（key 缺失在
       ensure_daily_ai 内部降级返回零统计）。
     - T-029 整函数级再兜一层：run_daily 等段内部已吞异常，能到这的多为库级/客户端构造异常——
@@ -123,6 +133,15 @@ async def _run_sync() -> DailyStats:
                 log.exception("榜单预计算异常：吞掉不抛出（页面缺缓存时降级实时算兜底），次日调度自然重试")
             try:
                 async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
+                    # T-032 候选词扫描（§15.2）：仅 UTC 周一、每周补捞（run_daily 内）之后执行；
+                    # 扫描段内部自带 AI 降级（key 缺失/调用失败整段跳过不清表，页面显示上一轮），
+                    # 外层再兜一层防意外异常——扫描失败绝不阻断 AI 生成与次日调度（§15.3 记日志不报警）
+                    try:
+                        if _candidate_scan_due(datetime.now(timezone.utc)):
+                            cand_summary = await scan_candidates(conn, ai_client, log=log)
+                            log.info("候选词扫描段完成：%s", cand_summary)
+                    except Exception:
+                        log.exception("候选词扫描整段异常：吞掉不抛出（页面照旧显示上一轮），下周自然重试")
                     await ensure_daily_ai(
                         conn, ai_client, now=datetime.now(timezone.utc), log=log, github_client=client
                     )

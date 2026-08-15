@@ -79,3 +79,21 @@ CREATE TABLE IF NOT EXISTS board_cache (
     payload TEXT NOT NULL,               -- compute_boards 全量 17 榜的 JSON 序列化（字段白名单手工展开）
     computed_at TEXT NOT NULL            -- 落表时刻（UTC 定长 ISO）
 );
+
+-- 候选词扫描（T-032，§15）：每周一扫描池内 topics 词频，未命中词表且词频达阈值的词
+-- 经 DeepSeek 出建议主题（或"不建议收录"）后全量覆盖式落库（DELETE 后 INSERT，只留最近一轮）；
+-- 页面只读展示（P7 /topic-candidates），永不写 config/topics.yaml（决策 12，§15.4）。
+-- scanned_at 为扫描时刻（UTC 定长 ISO，schema 硬约定），页面取前 10 位显示日期。
+CREATE TABLE IF NOT EXISTS topic_candidates (
+    term TEXT PRIMARY KEY,          -- 候选词（GitHub topics 原值，小写 kebab-case）
+    suggested_topic TEXT NOT NULL,  -- AI 建议主题（词表主题 label）或"不建议收录"
+    pool_count INTEGER NOT NULL,    -- 池内出现次数（dead=0 仓库 topics 含该词的仓库数）
+    scanned_at TEXT NOT NULL        -- 最近扫描时刻（UTC 定长 ISO）
+);
+-- 最近一轮成功扫描记录（单行）：无候选时表空也能区分"扫描过但无候选"与"从未成功扫描"
+-- 两种空态（§15.3：后者注明"扫描未运行过（AI 未配置）"）；每次成功扫描 REPLACE 固定主键 1
+CREATE TABLE IF NOT EXISTS candidate_scans (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    scanned_at TEXT NOT NULL,       -- 成功扫描时刻（UTC 定长 ISO）
+    term_count INTEGER NOT NULL     -- 本轮候选词数（0 = 扫描成功但无候选）
+);

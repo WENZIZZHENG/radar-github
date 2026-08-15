@@ -45,6 +45,7 @@ from app.ai import (
     has_cjk,
     recommend_missing,
 )
+from app.candidates import NOT_RECOMMENDED, POOL_COUNT_THRESHOLD
 from app.classify import LANGUAGES, OTHER_LANGUAGE_KEY, classify_language, load_topics
 from app.collector.github import (
     GitHubAuthError,
@@ -920,6 +921,48 @@ def follows_page(request: Request) -> HTMLResponse:
                 "filter_tags": filter_tags,  # T-021：标签筛选行数据（含 0 计数）
                 "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
                 "groups": _follow_groups(cards, reasons, zh, tags, summaries),
+            },
+        )
+    finally:
+        conn.close()
+
+
+@router.get("/topic-candidates", response_class=HTMLResponse)
+def topic_candidates_page(request: Request) -> HTMLResponse:
+    """P7 候选词只读页（T-032，§15.1）：候选词｜建议主题｜池内出现次数｜最近扫描日期，按次数降序。
+
+    无按钮无写操作（收词走会话拍板＋部署，§15.2）；入口在 P1 元信息行"候选词"小字链接（不占顶栏，
+    §15.1——顶栏 5 项上限不破）；两种空态（§15.3）：扫描过但无候选 / 从未成功扫描（AI 未配置）——
+    后者凭 candidate_scans 单行记录区分（有记录 = 成功扫描过）。"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT term, suggested_topic, pool_count, scanned_at FROM topic_candidates"
+            " ORDER BY pool_count DESC, term"
+        ).fetchall()
+        scan = conn.execute("SELECT scanned_at FROM candidate_scans WHERE id = 1").fetchone()
+        view_rows = [
+            {
+                "term": r["term"],
+                "suggested_topic": r["suggested_topic"],
+                "rejected": r["suggested_topic"] == NOT_RECOMMENDED,  # "不建议收录"灰显（模板分支）
+                "pool_count": r["pool_count"],
+                "scan_date": r["scanned_at"][:10],  # 定长 ISO 前 10 位即日期（schema 硬约定，同 _endpoint_note）
+            }
+            for r in rows
+        ]
+        follow_count = conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0]
+        return templates.TemplateResponse(
+            request=request,
+            name="topic_candidates.html",
+            context={
+                "request": request,
+                "page": "candidates",  # 顶栏无此项（§15.1 不占顶栏）：任何导航项都不高亮
+                "title": "候选词",
+                "rows": view_rows,
+                "has_scan": scan is not None,  # False = 从未成功扫描（空态注明"扫描未运行过（AI 未配置）"）
+                "threshold": POOL_COUNT_THRESHOLD,  # 元信息行口径说明（词频阈值，实施定 5）
+                "follow_count": follow_count,
             },
         )
     finally:

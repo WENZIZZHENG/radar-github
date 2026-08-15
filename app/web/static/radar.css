@@ -547,3 +547,18 @@ header.top .translate-all ~ .sync-all { margin-left: 0; }
   .row .repo-wrap { flex-basis: calc(100% - 19px); }  /* rank 14px + gap 5px：项目名独占第一行 */
   .row .badge { margin-right: auto; }  /* 第二行语言徽标左置、数字列贴右（与桌面右列定宽右对齐语义一致） */
 }
+
+/* ===== T-032 追加（候选词只读页 §15.1）：纯文本列表行，视觉沿用 board 卡片体系（无按钮无写操作） ===== */
+.cand {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px var(--s4); border-top: 1px solid var(--line); font-size: 13px;
+}
+.cand:first-of-type { border-top: none; }
+.cand .term { flex: 1; min-width: 0; font-family: var(--font-mono); font-weight: 600; color: var(--text-1); }
+.cand .topic { flex: 1; min-width: 0; color: var(--text-2); }
+.cand .topic.na { color: var(--text-3); }  /* "不建议收录"灰显，与主题名可辨 */
+.cand .count { flex: none; font-family: var(--font-mono); font-size: 12px; color: var(--accent-hi); }
+.cand .date { flex: none; font-family: var(--font-mono); font-size: 12px; color: var(--text-3); }
+/* P1 元信息行末尾"候选词"入口（§15.1 小字链接，不占顶栏——顶栏 5 项上限不破） */
+.meta a.cand-link { color: var(--blue); text-decoration: none; white-space: nowrap; }
+.meta a.cand-link:hover { text-decoration: underline; }
