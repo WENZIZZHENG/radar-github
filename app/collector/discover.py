@@ -14,6 +14,11 @@
 - 发现池每日只捞 stars:>=1000 按 updated 降序前 5 页（500 条）：星数榜头部常年固化，
   按最近活跃排序才能轮到涨星中的新仓库；判重按 full_name＋node_id 双键（改名库不算新面孔，
   含死库——存在即不动），当行写基线快照，使新入池首周缺席口径（决策 4）有据可依。
+- 发现池每日另加一条"新仓定向"查询（stars:>=1000 created:>=45 天前，sort=stars，与每日同配额）：
+  补 GitHub 搜索索引视图不一致盲区——索引最终一致性会让刚爆炸的新仓在"星数门槛+按 updated 排序"
+  视图缺席、却在"按星数排序"视图可见（deepseek-harness 实测：updated 视图连捞两轮缺席；
+  星数排序视图里 ≥64000 波段排第 132、带 created 限定的本查询 total 161 排第 1）；
+  两条查询互为冗余，先 ingest 每日结果、定向查询从库重读 seen 自然判重。
 - T-019 每周补捞（仅 UTC 周一触发，嵌入 run_daily 每日发现之后）：星数区间 7 段指数划分
   （1000..2000 … >=64000）按 ISO 周序号轮换、sort=stars 捞前 500 条——补 updated 排序盲区：
   老仓慢涨过 1000 星但近期无更新永远翻不进每日前 500；7 周扫完全谱，长尾段 7 周轮转、
@@ -33,7 +38,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -44,6 +49,10 @@ from app.db import get_conn, init_db
 
 DISCOVER_QUERY = "stars:>=1000"  # 发现池查询：与核心池同下界，按 updated 排序捞新面孔
 DISCOVER_PAGES = 5  # 每日只看前 500 条活跃仓库：再深的页新面孔密度极低，不值得配额
+# 新仓定向窗口：45 天（约一个半月）内创建、且已过 1000 星门槛的仓库。GitHub 搜索索引最终一致性会让
+# 刚爆炸的新仓（如 deepseek-harness 两天 9.6 万星）在"星数门槛+按 updated 排序"视图缺席，却在
+# 按星数排序视图可见；45 天≈一个半月，兼顾"新仓"语义（更窄会漏掉涨得稍慢的爆款，更宽则退化回全谱）。
+DISCOVER_NEW_WINDOW_DAYS = 45
 # T-019 每周补捞：星数区间 7 段（指数划分），仅 UTC 周一按 ISO 周序号轮换，7 周扫完全谱
 DISCOVER_BANDS = [
     (1000, 2000),
@@ -244,11 +253,25 @@ async def _collect_new_faces(
 async def _discover(
     client: GitHubClient, conn: sqlite3.Connection, *, captured_at: str, stats: DailyStats, log: logging.Logger
 ) -> None:
-    """发现池：按 updated 降序捞前 500 条活跃仓库，新面孔入池＋基线快照；单页失败记日志继续下一页。"""
+    """发现池：updated 视图捞前 500 条活跃仓库＋新仓定向（stars 视图，created 45 天窗口）互为冗余，
+    新面孔入池＋基线快照；单页失败记日志继续下一页。
+
+    定向查询先 ingest 每日结果再执行：_collect_new_faces 每次从库重读 seen，同仓双命中只入池一次。
+    """
     new_items = await _collect_new_faces(
         client, conn, query=DISCOVER_QUERY, sort="updated", pages=DISCOVER_PAGES, label="发现池", log=log
     )
     stats.discovered += _ingest_discovered(conn, new_items, now_iso=captured_at, captured_at=captured_at)
+    # 新仓定向：GitHub 搜索索引最终一致性会让爆炸式新仓缺席 updated 视图但可见于 stars 视图（docstring 口径）
+    cutoff = date.fromisoformat(captured_at[:10]) - timedelta(days=DISCOVER_NEW_WINDOW_DAYS)
+    directed_query = f"{DISCOVER_QUERY} created:>={cutoff.isoformat()}"
+    directed_items = await _collect_new_faces(
+        client, conn, query=directed_query, sort="stars", pages=DISCOVER_PAGES, label="新仓定向", log=log
+    )
+    inserted = _ingest_discovered(conn, directed_items, now_iso=captured_at, captured_at=captured_at)
+    stats.discovered += inserted
+    # 独立日志行（仿每周补捞）：事后回溯"某仓是哪条查询捞进来的"时有直接证据
+    log.info("新仓定向执行：查询 %s、新面孔 %d 个、新入池 %d 个", directed_query, len(directed_items), inserted)
 
 
 async def _weekly_refill(

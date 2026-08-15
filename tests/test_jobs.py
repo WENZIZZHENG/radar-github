@@ -207,9 +207,9 @@ def test_discover_inserts_new_faces_with_node_id_and_baseline(tmp_path):
         ("new/one", NOW, 1500),
         ("new/two", NOW, 1200),
     }
-    # 发现池确实按 updated 排序捞"最近活跃"新面孔，而非默认星数榜
-    assert {call[0] for call in client.search_calls} == {"stars:>=1000"}
-    assert all(call[1] == "updated" for call in client.search_calls)
+    # 发现池确实按 updated 排序捞"最近活跃"新面孔，而非默认星数榜；新仓定向查询另测
+    updated_calls = [c for c in client.search_calls if c[0] == "stars:>=1000"]
+    assert len(updated_calls) == 5 and all(call[1] == "updated" for call in updated_calls)
     conn.close()
 
 
@@ -236,6 +236,66 @@ def test_discover_leaves_existing_repos_untouched(tmp_path):
     assert row["dead"] == 1 and row["source"] == "initial"  # 死库不因发现池复活
     # a/live 只有快照阶段一行；发现池不重复写基线
     assert conn.execute("SELECT COUNT(*) FROM star_snapshots WHERE repo_id = ?", (id_live,)).fetchone()[0] == 1
+    conn.close()
+
+
+# ---------- 新仓定向：补 GitHub 搜索索引视图不一致盲区（stars 视图捞近 45 天新仓） ----------
+
+
+def test_discover_directed_query_sent_with_45day_window(tmp_path):
+    """每日任务会发出新仓定向查询：created:>= 按 captured_at 的 UTC 日期往前推 45 天，sort=stars、与每日同 5 页配额。"""
+    conn = _open_db(tmp_path)
+    logger, _records = make_logger()
+    for now, expected_date in [(NOW, "2026-06-25"), ("2026-08-04T00:00:00Z", "2026-06-20")]:
+        client = FakeClient()
+        _run(client, conn, logger, now=now)
+        expected = f"stars:>=1000 created:>={expected_date}"
+        directed = [c for c in client.search_calls if c[0] == expected]
+        assert directed == [(expected, "stars", p) for p in range(1, 6)]
+        assert len(client.search_calls) == 10  # 每日 updated 5 页 + 新仓定向 5 页
+        client.search_calls.clear()
+    conn.close()
+
+
+def test_discover_same_repo_hit_by_both_queries_ingested_once(tmp_path):
+    """同一仓被每日 updated 与新仓定向两条查询都命中：只入池一次、基线快照只一行（定向从库重读 seen 判重）。"""
+    conn = _open_db(tmp_path)
+    shared = make_search_item("shared/boom", "nid-shared", stars=96000)
+    client = FakeClient(
+        search_pages={1: [shared]},  # 每日 updated 查询命中
+        search_pages_by_query={"stars:>=1000 created:>=2026-06-25": {1: [shared]}},  # 新仓定向也命中
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    assert stats.discovered == 1
+    rows = conn.execute("SELECT full_name, node_id FROM repos WHERE source = 'discover'").fetchall()
+    assert [(r["full_name"], r["node_id"]) for r in rows] == [("shared/boom", "nid-shared")]
+    assert conn.execute("SELECT COUNT(*) FROM star_snapshots s JOIN repos r ON r.id = s.repo_id").fetchone()[0] == 1
+    conn.close()
+
+
+def test_discover_directed_query_ingests_and_snapshots(tmp_path):
+    """新仓定向命中的仓正常入池＋当行基线快照（updated 视图缺席、stars 视图可见：模拟索引视图不一致）。"""
+    conn = _open_db(tmp_path)
+    client = FakeClient(
+        search_pages_by_query={
+            "stars:>=1000 created:>=2026-06-25": {
+                1: [make_search_item("boom/new", "nid-boom", stars=96000, description=None, language=None, topics=())]
+            }
+        }  # search_pages 空：updated 查询翻不到该仓
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    assert stats.discovered == 1
+    row = conn.execute(
+        "SELECT full_name, node_id, description_en, language, topics, dead FROM repos WHERE source = 'discover'"
+    ).fetchone()
+    assert row["full_name"] == "boom/new" and row["node_id"] == "nid-boom"
+    assert row["description_en"] is None and row["language"] is None and row["topics"] == "[]" and row["dead"] == 0
+    snaps = conn.execute("SELECT s.captured_at, s.stars FROM star_snapshots s JOIN repos r ON r.id = s.repo_id").fetchall()
+    assert [(s["captured_at"], s["stars"]) for s in snaps] == [(NOW, 96000)]
     conn.close()
 
 
@@ -666,14 +726,15 @@ MONDAY_W34 = "2026-08-17T00:00:00Z"  # 周一：ISO W34 → 34%7=6 → bands[6] 
 
 
 def test_weekly_refill_not_triggered_on_non_monday(tmp_path):
-    """非周一（NOW=2026-08-09 周日）：不触发补捞，搜索调用只有每日 updated 查询。"""
+    """非周一（NOW=2026-08-09 周日）：不触发补捞，搜索调用只有每日 updated 查询＋新仓定向。"""
     conn = _open_db(tmp_path)
     client = FakeClient()
     logger, _records = make_logger()
     _run(client, conn, logger)
 
-    assert len(client.search_calls) == 5  # 每日 5 页
-    assert all(query == "stars:>=1000" and sort == "updated" for query, sort, _page in client.search_calls)
+    assert len(client.search_calls) == 10  # 每日 updated 5 页 + 新仓定向 5 页
+    daily = [c for c in client.search_calls if c[0] == "stars:>=1000"]
+    assert len(daily) == 5 and all(query == "stars:>=1000" and sort == "updated" for query, sort, _page in daily)
     conn.close()
 
 
@@ -685,10 +746,12 @@ def test_weekly_refill_triggered_once_with_band_query(tmp_path):
     logger, records = make_logger()
     stats = _run(client, conn, logger, now=MONDAY_W32)
 
-    # 每日查询 5 次 updated；补捞恰一次（5 页，与每日同配额档）、sort=stars
+    # 每日查询 5 次 updated；新仓定向 5 页 stars；补捞恰一次（5 页，与每日同配额档）、sort=stars
     daily = [c for c in client.search_calls if c[0] == "stars:>=1000"]
-    refills = [c for c in client.search_calls if c[0] != "stars:>=1000"]
+    directed = [c for c in client.search_calls if c[0].startswith("stars:>=1000 created:>=")]
+    refills = [c for c in client.search_calls if c[0] != "stars:>=1000" and not c[0].startswith("stars:>=1000 created:>=")]
     assert len(daily) == 5 and all(c[1] == "updated" for c in daily)
+    assert len(directed) == 5 and all(c[1] == "stars" for c in directed)
     assert refills == [("stars:16000..32000", "stars", p) for p in range(1, 6)]
     # 新面孔入池＋当行基线快照（captured_at 与整轮共享）
     assert stats.discovered == 1
@@ -709,7 +772,7 @@ def test_weekly_refill_band_rotation_open_end(tmp_path):
     logger, _records = make_logger()
     stats = _run(client, conn, logger, now=MONDAY_W34)
 
-    refills = [c for c in client.search_calls if c[0] != "stars:>=1000"]
+    refills = [c for c in client.search_calls if c[0] != "stars:>=1000" and not c[0].startswith("stars:>=1000 created:>=")]
     assert refills == [("stars:>=64000", "stars", p) for p in range(1, 6)]
     assert stats.discovered == 1
     assert conn.execute("SELECT full_name FROM repos WHERE source = 'discover'").fetchone()["full_name"] == "band/huge"
@@ -762,7 +825,7 @@ def test_weekly_refill_page_failure_logged_and_continues(tmp_path):
     logger, records = make_logger()
     stats = _run(client, conn, logger, now=MONDAY_W32)
 
-    assert len(client.search_calls) == 10  # 每日 5 页 + 补捞 5 页
+    assert len(client.search_calls) == 15  # 每日 5 页 + 新仓定向 5 页 + 补捞 5 页
     assert stats.discovered == 2
     names = {r["full_name"] for r in conn.execute("SELECT full_name FROM repos WHERE source = 'discover'")}
     assert names == {"band/p1", "band/p3"}
