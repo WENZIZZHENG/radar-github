@@ -149,8 +149,9 @@ def test_scan_success_writes_and_replaces(conn):
     conn.execute("INSERT INTO candidate_scans (id, scanned_at, term_count) VALUES (1, '2026-08-01T00:00:00Z', 1)")
     conn.commit()
     for i in range(6):
-        _seed_repo(conn, f"a/r{i}", topics=["claude-code", "hacktoberfest", "ai"])  # ai 命中词表不算候选
-    client = FakeSuggestClient(mapping={"claude-code": "AI与智能", "hacktoberfest": "不建议收录"})
+        # brand-new-x 保证不在封板词表（2026-08-15 收词后 claude-code 已入词表，不能再当"未命中"种子）
+        _seed_repo(conn, f"a/r{i}", topics=["brand-new-x", "hacktoberfest", "ai"])  # ai 命中词表不算候选
+    client = FakeSuggestClient(mapping={"brand-new-x": "AI与智能", "hacktoberfest": "不建议收录"})
     stats = _run_scan(conn, client)
     assert stats["scanned"] is True and stats["candidates"] == 2
     assert stats["kept"] == 2 and stats["rejected"] == 1 and stats["dropped"] == 0
@@ -158,13 +159,13 @@ def test_scan_success_writes_and_replaces(conn):
         "SELECT term, suggested_topic, pool_count, scanned_at FROM topic_candidates ORDER BY pool_count DESC, term"
     ).fetchall()
     assert [(r["term"], r["suggested_topic"], r["pool_count"]) for r in rows] == [
-        ("claude-code", "AI与智能", 6),
+        ("brand-new-x", "AI与智能", 6),
         ("hacktoberfest", "不建议收录", 6),
     ]
     assert all(r["scanned_at"] == "2026-08-17T12:00:00Z" for r in rows)  # 全量覆盖：旧行消失
     scan = conn.execute("SELECT scanned_at, term_count FROM candidate_scans WHERE id = 1").fetchone()
     assert scan["scanned_at"] == "2026-08-17T12:00:00Z" and scan["term_count"] == 2
-    assert client.calls[0][0] == ["claude-code", "hacktoberfest"]  # 批量一次调用：候选词全量入参
+    assert client.calls[0][0] == ["brand-new-x", "hacktoberfest"]  # 批量一次调用：候选词全量入参
     assert "AI与智能" in client.calls[0][1]  # 主题名来自词表 label
 
 
@@ -195,7 +196,7 @@ def test_scan_ai_failure_and_empty_key_keep_previous_round(conn, monkeypatch):
     )
     conn.commit()
     for i in range(6):
-        _seed_repo(conn, f"a/r{i}", topics=["claude-code"])
+        _seed_repo(conn, f"a/r{i}", topics=["brand-new-x"])  # 词表外候选词（claude-code 已入词表，见上注）
     # AI 调用失败
     stats = _run_scan(conn, FakeSuggestClient(fail=True))
     assert stats["scanned"] is False

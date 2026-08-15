@@ -4,36 +4,73 @@ ai:
   words: [machine-learning, deep-learning, artificial-intelligence, ai, llm, large-language-model,
           ai-agent, ai-agents, agents, nlp, natural-language-processing, computer-vision, neural-network,
           transformer, diffusion-model, rag, retrieval-augmented-generation, mcp, generative-ai,
-          chatgpt, pytorch, tensorflow]
+          chatgpt, pytorch, tensorflow,
+          claude-code, codex, agent, openai, claude, agentic-ai, anthropic, gemini, agent-skills, opencode,
+          deepseek, mcp-server, multi-agent, openclaw, cursor, agentic, gpt, hermes-agent,
+          agentic-workflow, coding-agent, prompt-engineering, ai-coding, inference, context-engineering,
+          llama, qwen, agent-framework, chatbot, claude-skills, copilot, multi-agent-systems, ollama,
+          vibe-coding, agent-memory, ai-gateway, ai-tools, gemini-cli, genai, langchain, ai-memory,
+          llmops, model-context-protocol, reinforcement-learning, ai-assistant, antigravity,
+          claude-code-skills, deepseek-harness, fine-tuning, ml, ocr, video-generation, acp,
+          agent-orchestration, autonomous-agents, codex-cli, glm, llm-inference, local-ai, multimodal,
+          tts, vllm, agentic-coding, coding-agents, embeddings, github-copilot, image-generation, kimi,
+          llm-tools, speech-to-text, stable-diffusion, agent-skill, ai-video, claude-code-plugin, evals,
+          gemma, kiro, llm-agents, llm-evaluation, llm-gateway, local-llm, moe, openai-api,
+          semantic-search, agent-harness, aiagentframework, cline, diffusion, gpt-oss, lora, mcp-client,
+          mcp-gateway, minimax, mistral, mlops, mlx, onnx, parallel-agents, text-to-speech, tool-calling,
+          vlm, whisper, windsurf]
 frontend:
   label: 前端/UI
   words: [react, vue, angular, svelte, nextjs, nuxt, tailwindcss, css, frontend, front-end,
-          webassembly, wasm, ui, design-system, component-library, vite, threejs, webgl]
+          webassembly, wasm, ui, design-system, component-library, vite, threejs, webgl,
+          electron, flutter, tauri, desktop-app, react-native, dashboard, gui, desktop, svg,
+          chrome-extension, jetpack-compose, reactjs, vuejs, web-framework, animation, pwa,
+          browser-extension, canvas, swiftui, ui-components, webapp, html5, material-design, qt,
+          webui, charts, kotlin-multiplatform, shadcn, shadcn-ui, sveltekit, web-application]
 backend:
   label: 后端/云原生
   words: [spring-boot, nodejs, microservices, kubernetes, docker, serverless, api-gateway,
-          graphql, grpc, backend, api, rest-api, cloud-native, helm, istio, kafka, rabbitmq]
+          graphql, grpc, backend, api, rest-api, cloud-native, helm, istio, kafka, rabbitmq,
+          orchestration, cms, k8s, cloud, server, aws, azure, containers, streaming, cncf,
+          distributed, distributed-systems, networking, real-time, cloudflare, s3, django, fastapi,
+          openapi, laravel, websocket, messaging, realtime, mqtt, rails, rpc, stream-processing,
+          symfony, cloudflare-workers, gateway, high-availability, quic, rest, storage, swagger,
+          webrtc, headless-cms, hosting, infrastructure, orm, scheduler, supabase, webdav, webhooks]
 data:
   label: 数据库与数据工程
   words: [database, postgresql, mysql, mongodb, redis, elasticsearch, data-engineering, big-data,
-          spark, clickhouse, etl, data-pipeline, duckdb, sqlite, vector-database, olap, flink]
+          spark, clickhouse, etl, data-pipeline, duckdb, sqlite, vector-database, olap, flink,
+          sql, postgres, data-science, analytics, data-visualization, knowledge-graph, data-analysis,
+          distributed-database, mariadb, visualization, oracle, bigquery, dbms, geospatial, lakehouse,
+          data-analytics, database-management, key-value, knowledge-base, snowflake, vector-search]
 devops:
   label: DevOps/监控
   words: [devops, monitoring, logging, observability, terraform, ansible, ci-cd, prometheus,
-          grafana, alerting, sre, infrastructure-as-code, opentelemetry]
+          grafana, alerting, sre, infrastructure-as-code, opentelemetry,
+          github-actions, metrics, cicd, deployment, gitops, pipeline, ci, continuous-delivery,
+          devsecops, docker-compose]
 devtools:
   label: 开发者工具
   words: [cli, code-quality, testing, static-analysis, ide-plugin, developer-tools, productivity,
-          linter, formatter, debugging, vscode-extension, git, tui, terminal]
+          linter, formatter, debugging, vscode-extension, git, tui, terminal,
+          compiler, ide, github, devtools, package-manager, command-line, sdk, editor, vim,
+          build-tool, command-line-tool, monorepo, neovim, npm, code-review, homebrew, parser,
+          spec-driven-development, emacs, package-management, tmux, transpiler]
 security:
   label: 安全
   words: [security, vulnerability, cryptography, pentesting, infosec, privacy, encryption,
-          authentication, oauth, cve, malware-analysis, zero-trust]
+          authentication, oauth, cve, malware-analysis, zero-trust,
+          proxy, v2ray, vpn, vless, clash, ssh, cybersecurity, vmess, rdp, shadowsocks, ssr,
+          trojan, sandbox, malware, oauth2, osint, reverse-engineering, security-tools, ss, xray,
+          gfw, remote-desktop, compliance, hysteria2, mihomo, redteam, reverse-proxy, sftp,
+          socks5, threat-intelligence]
 game:
   label: 游戏/图形
   words: [game-development, game-engine, graphics, opengl, vulkan, unity, unreal-engine,
-          godot, shader, raytracing, directx, pixel-art]
+          godot, shader, raytracing, directx, pixel-art,
+          game, webgpu, 3d, gamedev, minecraft, computer-graphics, gaming]
 automation:
   label: 自动化/脚本
   words: [automation, scripting, workflow, bot, scraper, web-scraping, crawler, rpa,
-          home-automation, cron, playwright, selenium]
+          home-automation, cron, playwright, selenium,
+          shell, bash, workflow-automation, workflow-engine, browser-automation, powershell]

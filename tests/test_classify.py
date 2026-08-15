@@ -155,15 +155,15 @@ def test_topics_table_word_counts_locked_to_architecture_doc():
     # 词条数量锁死：任一主题增删词条都会漂移，测试即告警——封板物不许偷偷改
     table = load_topics(TOPICS_PATH)
     assert {key: len(table[key]["words"]) for key in table} == {
-        "ai": 22,
-        "frontend": 18,
-        "backend": 17,
-        "data": 17,
-        "devops": 13,
-        "devtools": 14,
-        "security": 12,
-        "game": 12,
-        "automation": 12,
+        "ai": 124,
+        "frontend": 49,
+        "backend": 61,
+        "data": 38,
+        "devops": 23,
+        "devtools": 36,
+        "security": 42,
+        "game": 19,
+        "automation": 18,
     }
 
 
