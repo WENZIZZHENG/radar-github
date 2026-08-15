@@ -8,10 +8,11 @@ import logging
 
 from fastapi.testclient import TestClient
 
+import app.jobs as jobs_module  # 同步后台任务/状态的模块级引用（运行时取最新值，非 import 时快照）
 from app.collector.discover import DailyStats, run_daily
 from app.collector.github import GitHubAuthError
 from app.db import get_conn, init_db
-from app.jobs import DAILY_JOB_ID, create_scheduler, daily_job
+from app.jobs import DAILY_JOB_ID, create_scheduler, daily_job, sync_status, try_start_sync
 from app.main import app
 
 NOW = "2026-08-09T00:00:00Z"
@@ -849,3 +850,106 @@ def test_weekly_refill_renamed_repo_not_duplicated(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 1
     assert conn.execute("SELECT full_name FROM repos").fetchone()["full_name"] == "old/name"  # 原名不动
     conn.close()
+
+
+# ---------- T-029：手动同步运行锁与状态（§14.4：手动/调度共用一把锁，状态只存进程内存不落库） ----------
+
+
+class FakeGitHubCM:
+    """模拟 GitHubClient 的 async with 协议（daily_job 全链路测试注入用）：进入返回 FakeClient，退出无事。"""
+
+    def __init__(self, fake):
+        self._fake = fake
+
+    async def __aenter__(self):
+        return self._fake
+
+    async def __aexit__(self, *exc_info):
+        pass
+
+
+def _prepare_sync_env(tmp_path, monkeypatch, *, nodes=None, conn_seed=None):
+    """daily_job 全链路测试环境：RADAR_DB_PATH 指向 tmp（真实 SQLite 建库落盘）、GitHubClient 换成
+    FakeGitHubCM 协议（内部 FakeClient，只把外部 API 换桩）、DEEPSEEK_API_KEY 清空走 ensure_daily_ai
+    内部降级（§14.3：key 未配置不算失败）——快照/发现/预计算都是真代码，不打真 API。
+    同步状态是进程级内存，每用例重置防串（生产语义是服务重启归零，测试里手动还原）。"""
+    with jobs_module._sync_state_lock:
+        jobs_module._sync_state.update(
+            running=False, started_at=None, last_finished_at=None, last_stats=None, last_error=None
+        )
+    db_path = tmp_path / "radar.db"
+    monkeypatch.setenv("RADAR_DB_PATH", str(db_path))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    init_db(db_path)  # 播种前先建表（daily_job 内部会再跑一次，幂等）
+    fake = FakeClient(nodes_by_id=nodes or {})
+    monkeypatch.setattr("app.jobs.GitHubClient", lambda *a, **k: FakeGitHubCM(fake))
+    if conn_seed is not None:
+        conn = get_conn(db_path)
+        try:
+            conn_seed(conn)
+            conn.commit()
+        finally:
+            conn.close()
+    return fake
+
+
+def test_sync_lock_mutex_and_scheduler_skip(tmp_path, monkeypatch):
+    """运行锁互斥（§14.4 全局限额一个运行实例）：抢占成功后未结束期间，再次触发（手动/调度）一律被拒；
+    调度撞锁跳过返回 None 且不改动状态。try_start_sync 内检查＋置位在同一把锁内原子，且本场景无 await
+    让后台任务抢先运行——running 恒 True，无需睡眠即可确定性断言互斥。"""
+    _prepare_sync_env(tmp_path, monkeypatch)
+
+    async def scenario():
+        assert try_start_sync() is True  # 手动抢占成功：后台任务已起
+        assert try_start_sync() is False  # 未 await：后台任务尚未运行，running 恒 True
+        assert await daily_job() is None  # 调度撞锁跳过：返回 None（非 DailyStats），不另起任务
+        assert sync_status()["running"] is True  # 状态未被撞锁路径扰动
+        await jobs_module._sync_task  # 等后台任务正常收尾（防 asyncio.run 取消未完成任务）
+
+    asyncio.run(scenario())
+
+
+def test_sync_completed_state_carries_daily_stats(tmp_path, monkeypatch):
+    """状态流转：daily_job 全链路完成返回 DailyStats（快照行数对）→ 状态 running=False＋last_stats
+    与返回值同源（web 层完成 toast 数字来源）＋last_finished_at 落时刻；last_error 保持 None。"""
+    _prepare_sync_env(
+        tmp_path,
+        monkeypatch,
+        nodes={"nid-live": make_node("a/live", stars=2000)},
+        conn_seed=lambda conn: seed_repo(conn, "a/live", "nid-live"),
+    )
+
+    async def scenario():
+        stats = await daily_job()  # 抢锁 → 全链路（快照/发现/预计算/AI 降级）→ 返回 DailyStats
+        assert isinstance(stats, DailyStats)
+        assert stats.snapshots_written == 1  # a/live 写入一张当日快照
+        st = sync_status()
+        assert st["running"] is False  # 任务结束锁已释放
+        assert st["last_stats"] == stats  # 状态里的统计与 daily_job 返回值同源
+        assert st["last_finished_at"] is not None
+        assert st["started_at"] is not None
+        assert st["last_error"] is None
+
+    asyncio.run(scenario())
+
+
+def test_sync_failure_records_last_error(tmp_path, monkeypatch):
+    """异常带 last_error：整函数级异常（库初始化失败）→ last_error="unknown"、锁必然释放、
+    last_stats 保持 None（无成功史）、按零统计返回不抛出（§14.3 前端 toast"同步失败，稍后再试"的依据）。"""
+    _prepare_sync_env(tmp_path, monkeypatch)
+
+    def _boom():
+        raise RuntimeError("模拟库初始化失败")
+
+    monkeypatch.setattr("app.jobs.init_db", _boom)
+
+    async def scenario():
+        stats = await daily_job()
+        assert stats == DailyStats()  # 异常兜底：零统计返回，任务必然结束
+        st = sync_status()
+        assert st["running"] is False  # 锁必然释放
+        assert st["last_error"] == "unknown"
+        assert st["last_stats"] is None
+        assert st["last_finished_at"] is not None  # 异常结束也落完成时刻（供前端判"已结束"）
+
+    asyncio.run(scenario())

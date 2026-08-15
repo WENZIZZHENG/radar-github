@@ -11,6 +11,9 @@
 // T-017 推荐语接线（§8）：行内按钮单个强制重生（按当前页维度，成功 toast＋面板推荐语块即时替换不刷新）；
 // 顶栏批量补齐推荐语（只补范围内缺失，独立后台任务不共用翻译的：POST 202 → 2s 轮询 /recommend-missing/status）；
 // 分支 toast 文案严格按 §8.3 文案表。推荐语生成中按钮置灰"生成中…"防连点。
+// T-029 手动同步接线（§14）：顶栏"立即同步"按钮手动触发 daily_job 全链路（独立后台任务不共用翻译/推荐批量的：
+// POST 202 → 2s 轮询 /api/sync/status；409 表示已在跑含调度器每日那轮）；完成 toast 带 run_daily 汇总数字
+// ＋"刷新页面查看最新榜单"提示；分支 toast 文案严格按 §14.2/§14.3。同步中按钮置灰"同步中…"防连点。
 const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 
@@ -39,6 +42,18 @@ function toast(msg, isErr, opts) {
       opts.action.onClick();
     });
     t.appendChild(btn);
+  }
+  // T-029 可选提示行（如同步完成附"刷新页面查看最新榜单"）：消息下方第二行小字，与消息同 toast；
+  // 既有全部调用点不带 hint，行为不变；.toast 是 flex 行（T-023），本 toast 单独改纵向让提示行独立成行
+  if (opts && opts.hint) {
+    t.style.flexDirection = "column";
+    t.style.alignItems = "flex-start";
+    const hint = document.createElement("div");
+    hint.textContent = opts.hint;
+    hint.style.color = "var(--text-3)";
+    hint.style.fontSize = "12px";
+    hint.style.marginTop = "3px";
+    t.appendChild(hint);
   }
   document.getElementById("toasts").appendChild(t);
   setTimeout(() => t.remove(), (opts && opts.duration) || 4000); // 普通 4s；撤销类 6s 由调用方传
@@ -154,6 +169,12 @@ document.addEventListener("click", (e) => {
   const recommendAll = e.target.closest("#recommend-all");
   if (recommendAll) {
     recommendMissing(recommendAll);
+    return;
+  }
+  // T-029 顶栏手动同步（§14.2）：手动触发 daily_job 全链路，独立后台任务＋轮询；409/异常文案见 §14.3
+  const syncAll = e.target.closest("#sync-all");
+  if (syncAll) {
+    syncNow(syncAll);
     return;
   }
   const row = e.target.closest(".row");
@@ -641,6 +662,110 @@ async function recommendMissing(btn) {
     btn.disabled = true;
     btn.textContent = recBatchProgress(state);
     pollRecBatchStatus(btn);
+  } catch (err) {
+    /* 接管查询网络异常：安静忽略，不影响页面 */
+  }
+})();
+
+// ---- T-029 手动同步（§14.2 主路径 / §14.3 分支文案钉死；与翻译/推荐批量并列独立不共用） ----
+
+let syncing = false; // 前端防连点（服务端另有 running 态 409 兜底，§14.3）
+let syncPollTimer = null; // 同步轮询句柄（409/202/页面加载接管共用单轮询）
+
+// 恢复按钮常态并解锁防连点
+function restoreSync(btn) {
+  syncing = false;
+  btn.disabled = false;
+  btn.textContent = "立即同步";
+}
+
+// 停止同步轮询（页面卸载自然停止；显式停止用于完成/轮询失败）
+function stopSyncPolling() {
+  if (syncPollTimer) {
+    clearInterval(syncPollTimer);
+    syncPollTimer = null;
+  }
+}
+
+// 2s 轮询同步状态（§14.2 后台形态）：running → 按钮保持"同步中…"；结束 → 停轮询＋按钮恢复＋
+// 按 last_error/统计分支 toast（完成 toast 数字取 run_daily 汇总：快照/新发现/漂移，§14.2 逐字；
+// 附"刷新页面查看最新榜单"提示——榜单已在任务内预计算，刷新即见，不自动刷新打断阅读）
+function pollSyncStatus(btn) {
+  if (syncPollTimer) return; // 已在轮询：409/202/页面接管共用同一轮询
+  const tick = async () => {
+    try {
+      const resp = await fetch("/api/sync/status");
+      const state = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      // 响应畸形（resp.ok 但 JSON 非预期/缺判态字段）：无法判态，按失败兜底（不误报完成）
+      if (typeof state !== "object" || state === null || !("running" in state) || !("last_finished_at" in state)) {
+        stopSyncPolling();
+        restoreSync(btn);
+        toast("同步失败，稍后再试", true);
+        return;
+      }
+      if (state.running === true) return; // 任务进行中：下一周期再查（按钮已置灰"同步中…"）
+      if (state.last_finished_at != null) {
+        stopSyncPolling();
+        restoreSync(btn);
+        if (state.last_error) toast("同步失败，稍后再试", true); // §14.3 任务异常：失败细节在服务器 jobs.log
+        else {
+          const s = state.last_stats || {}; // 服务端重启后状态归零（§14.4）：数字缺失按 0 兜底不报错
+          toast("同步完成：快照 " + (s.snapshots_written || 0) + " 行、新发现 " + (s.discovered || 0)
+            + " 个、漂移 " + (s.drift_updated || 0) + " 个", false, { hint: "刷新页面查看最新榜单" });
+        }
+        return;
+      }
+      // running/finished 双假且无完成史（如服务端重启丢内存态）：非完成终态，不误报"同步完成"，按失败兜底
+      stopSyncPolling();
+      restoreSync(btn);
+      toast("同步失败，稍后再试", true);
+    } catch (err) {
+      stopSyncPolling();
+      restoreSync(btn);
+      toast("同步失败，稍后再试", true); // 轮询网络层失败：停轮询恢复常态（服务端任务仍在跑，可再点，409 会接管）
+    }
+  };
+  syncPollTimer = setInterval(tick, 2000);
+  tick(); // 立即查一次：POST 202 后秒级反馈状态
+}
+
+// 顶栏"立即同步"（§14.2 第 1 步，后台形态，与翻译/推荐批量并列独立不共用）：点击置灰 → POST
+// （202 起任务 / 409 已有任务，含调度器每日那轮在跑，§14.3）→ 2s 轮询 /status；完成/进行中/
+// 网络失败文案严格按 §14.2/§14.3，轮询期间 syncing 保持锁防连点
+async function syncNow(btn) {
+  if (syncing) return;
+  syncing = true;
+  btn.disabled = true;
+  btn.textContent = "同步中…";
+  try {
+    const resp = await fetch("/api/sync", { method: "POST" });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 409) {
+      toast("同步进行中…"); // 服务端已有任务在跑：不另起，直接进轮询看它
+      pollSyncStatus(btn);
+      return;
+    }
+    if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status); // 其余异常（如 500）按失败兜底
+    pollSyncStatus(btn); // 202：后台任务已起
+  } catch (err) {
+    toast("同步失败，稍后再试", true); // 网络层失败（§14.3 兜底文案），按钮恢复可重试
+    restoreSync(btn);
+  }
+}
+
+// ---- T-029 页面加载接管在跑同步任务（§14.2：按钮在顶栏、各页通用，与翻译/推荐批量各自接管） ----
+(async () => {
+  const btn = document.getElementById("sync-all");
+  if (!btn) return;
+  try {
+    const resp = await fetch("/api/sync/status");
+    const state = await resp.json().catch(() => ({}));
+    if (!resp.ok || !state.running) return; // 无在跑任务/查询失败：安静忽略（已完成态不 toast 不动按钮）
+    syncing = true; // 接管在跑任务：锁防连点，轮询接手完成反馈
+    btn.disabled = true;
+    btn.textContent = "同步中…";
+    pollSyncStatus(btn);
   } catch (err) {
     /* 接管查询网络异常：安静忽略，不影响页面 */
   }

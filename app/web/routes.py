@@ -12,6 +12,8 @@
   《交互流程说明》§7.4 钉死口径；不触碰 recommendations 表）；
 - 推荐语写端点（T-017）：单个强制重生 / 批量只补缺失（见 /api/recommend、/api/recommend-missing，
   《交互流程说明》§8.4 钉死口径；不触碰 repos 翻译字段）；
+- 手动同步端点（T-029）：POST /api/sync 后台起任务／GET /api/sync/status 轮询（《交互流程说明》§14；
+  同步＝daily_job 全链路，运行锁与状态在 app.jobs、与调度器共用一把锁，本层只判返回值不重实现链路）；
 - 本层对 recommendations 表展示映射按 (dimension, period_label) 取（§8.1：周页→周文本、季页→季文本、
   总星/关注/标签页→总星文本），缺则该行无推荐语块（AI 降级形态）；
 - AI 概要（T-024，§11）：展示映射固定取 dimension='summary' 且 period_label='all'（文档视角、无维度概念、
@@ -53,6 +55,7 @@ from app.collector.github import (
 from app.config import BASE_DIR, get_settings
 from app.db import get_conn
 from app.follows import follow_repo, unfollow_repo
+from app.jobs import sync_status, try_start_sync
 from app.report import (
     OTHER_TOPIC_KEY,
     Board,
@@ -1698,3 +1701,25 @@ async def api_recommend_missing_status() -> dict:
     """批量补齐推荐语进度查询（§8.2）：前端每 2s 轮询；不依赖 AI/GitHub client，无任务史时全零/false/None。"""
     with _rec_batch_state_lock:
         return dict(_rec_batch_state)
+
+
+# ===== 手动同步 API（T-029；口径《交互流程说明》§14.4 钉死：同步＝daily_job 全链路，与调度器共用一把运行锁） =====
+
+
+@router.post("/api/sync", status_code=202)
+async def api_sync() -> dict:
+    """手动同步（§14.2 第 1 步，后台任务形态）：try_start_sync 原子抢占运行锁（锁与状态在 app.jobs，
+    调度器与手动共用，§14.4 全局限额一个运行实例；抢锁与起任务在 jobs 内部成对完成，本层只判返回值
+    防双跑）→ 202 {"started": True}；running 时重复触发 409（detail 即 §14.3 前端 toast 文案
+    "同步进行中…"）。同步＝daily_job 全链路（快照→发现→榜单预计算→AI ensure），与调度器走同一条
+    代码路径，不另实现一套；进度/结果由 jobs 写入 _sync_state，前端轮询 /status 读取。"""
+    if not try_start_sync():
+        raise HTTPException(status_code=409, detail="同步进行中，请稍后再试")
+    return {"started": True}
+
+
+@router.get("/api/sync/status")
+async def api_sync_status() -> dict:
+    """手动同步状态查询（§14.2 第 2 步）：前端每 2s 轮询；不依赖外部 API，无任务史（服务刚重启/
+    从未跑过）时 running=False 且各字段为 None。"""
+    return sync_status()

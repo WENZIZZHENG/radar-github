@@ -993,3 +993,74 @@ def test_single_board_fallback_equivalence_partial_boards(tmp_path, monkeypatch)
         assert 'class="notice"' not in text_all  # 对照：同期全量模式本就不降级
         assert "a/py" in text_all
         assert text_all.count('class="board"') == 17
+
+
+# ---------- T-029：手动同步 API（§14.2/§14.3；后台任务形态，锁与状态在 app.jobs——真全链路在 test_jobs，
+# 本层只验证路由契约与状态序列化，任务体换假实现/状态直接注入） ----------
+
+
+@pytest.fixture()
+def reset_sync_state():
+    """同步状态是进程级内存：每用例前后重置，防跨用例串状态（生产语义是服务重启归零，测试里手动还原）。"""
+    from app.jobs import _sync_state, _sync_state_lock
+
+    with _sync_state_lock:
+        _sync_state.update(running=False, started_at=None, last_finished_at=None, last_stats=None, last_error=None)
+    yield
+    with _sync_state_lock:
+        _sync_state.update(running=False, started_at=None, last_finished_at=None, last_stats=None, last_error=None)
+
+
+def test_sync_post_202_running_then_409(client, monkeypatch, reset_sync_state):
+    """POST /api/sync：真实锁链路——首次 202 起任务且状态 running；运行中重复触发 409，detail 即
+    §14.3 前端 toast 文案"同步进行中…"（409 分支直用）。任务体 _run_sync 换假实现（快速结束不碰状态），
+    真全链路（快照/发现/预计算/AI）由 test_jobs 覆盖。注意：下方 running is True 断言的确定性依赖
+    假实现"不复位状态"这一前提（真实现会在 finally 复位 running）——改假实现时别顺手加状态复位，
+    否则断言莫名变红（评审 F3 留痕）。"""
+    from app.collector.discover import DailyStats
+
+    async def fake_run_sync():
+        return DailyStats()
+
+    monkeypatch.setattr("app.jobs._run_sync", fake_run_sync)
+    resp = client.post("/api/sync")
+    assert resp.status_code == 202
+    assert resp.json() == {"started": True}
+    assert client.get("/api/sync/status").json()["running"] is True  # 锁已占用：前端据此置灰"同步中…"
+    resp = client.post("/api/sync")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "同步进行中，请稍后再试"
+
+
+def test_sync_status_default_shape(client, reset_sync_state):
+    """status 端点无任务史时的默认形态：全字段就位，running=False 且其余为 None（服务刚重启/从未跑过，
+    前端页面加载时据 running 判不接管）。"""
+    data = client.get("/api/sync/status").json()
+    assert data == {
+        "running": False,
+        "started_at": None,
+        "last_finished_at": None,
+        "last_stats": None,
+        "last_error": None,
+    }
+
+
+def test_sync_status_completed_with_stats(client, reset_sync_state):
+    """完成态带统计（可注入假任务的结果）：真实状态里放一个已完成运行（DailyStats），status 端点原样
+    序列化吐出——前端完成 toast"同步完成：快照 N 行、新发现 M 个、漂移 K 个"（§14.2）的数字来源。"""
+    from app.collector.discover import DailyStats
+    from app.jobs import _sync_state, _sync_state_lock
+
+    with _sync_state_lock:
+        _sync_state.update(
+            running=False,
+            started_at="2026-08-15T05:00:00Z",
+            last_finished_at="2026-08-15T05:00:11Z",
+            last_stats=DailyStats(snapshots_written=3, discovered=2, drift_updated=1),
+            last_error=None,
+        )
+    data = client.get("/api/sync/status").json()
+    assert data["running"] is False
+    assert data["last_error"] is None
+    assert data["last_finished_at"] == "2026-08-15T05:00:11Z"
+    assert data["last_stats"] == {"snapshots_written": 3, "discovered": 2, "dead_marked": 0, "drift_updated": 1}

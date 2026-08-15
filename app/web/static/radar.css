@@ -388,6 +388,10 @@ header.top .week-switch ~ .translate-all { margin-left: 0; }
    flex 下两个 auto 平分剩余空间把按钮组挤开（T-016 中-2 同类残留）——第一个按钮 auto 吸收全部剩余、
    第二个紧跟成组；有 switcher/窄屏场景与上方 .week-switch 规则同值（0），不冲突 */
 header.top .translate-all ~ .recommend-all { margin-left: 0; }
+/* T-029：立即同步按钮（class 含 translate-all）同补齐推荐语按钮——紧跟组内不 auto 贴右，
+   否则第三钮继承 margin-left:auto 被挤到最右与组分离（F2-2 同类；规则后置覆盖上方通用规则，
+   含窄屏 .week-switch ~ 场景，特异性同 (0,3,1) 靠后置取胜） */
+header.top .translate-all ~ .sync-all { margin-left: 0; }
 
 /* ===== T-023 追加（删除标签撤销：toast 动作按钮；复用 .toast 色系，不新造组件体系） ===== */
 
