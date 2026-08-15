@@ -109,23 +109,25 @@ async def _run_sync() -> DailyStats:
         init_db()  # schema 全量 IF NOT EXISTS：调度进程可能与 uvicorn 分开发育，各自保证库表存在
         conn = get_conn()
         log = get_job_logger()
+        # client 作用域必须覆盖 AI 段：曾只包住 run_daily，AI 段复用已关闭的 client 拉 README 全失败
+        # （生产每日任务空转约 26 分钟、README 变更重生永不触发——T-029 预演实测抓出，生产 jobs.log 有痕）
         async with GitHubClient(settings.github_token) as client:  # token 空/无效由客户端在使用点报清晰错误
             stats = await run_daily(client, conn, log=log)
-        try:
-            # T-027 榜单预计算：as_of 取 run_daily 完成时刻（>= 本轮快照 captured_at，同日不误判过期）
-            table = load_topics(BASE_DIR / "config" / "topics.yaml")
-            as_of = utc_now_iso()
-            summary = precompute_boards(conn, table, as_of=as_of)
-            log.info("榜单预计算完成：as_of=%s，各口径榜数/主榜行数/新区行数=%s", as_of, summary)
-        except Exception:
-            log.exception("榜单预计算异常：吞掉不抛出（页面缺缓存时降级实时算兜底），次日调度自然重试")
-        try:
-            async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
-                await ensure_daily_ai(
-                    conn, ai_client, now=datetime.now(timezone.utc), log=log, github_client=client
-                )
-        except Exception:
-            log.exception("AI 每日生成整轮异常：吞掉不抛出（AI 降级不阻断快照主流程），次日调度自然重试")
+            try:
+                # T-027 榜单预计算：as_of 取 run_daily 完成时刻（>= 本轮快照 captured_at，同日不误判过期）
+                table = load_topics(BASE_DIR / "config" / "topics.yaml")
+                as_of = utc_now_iso()
+                summary = precompute_boards(conn, table, as_of=as_of)
+                log.info("榜单预计算完成：as_of=%s，各口径榜数/主榜行数/新区行数=%s", as_of, summary)
+            except Exception:
+                log.exception("榜单预计算异常：吞掉不抛出（页面缺缓存时降级实时算兜底），次日调度自然重试")
+            try:
+                async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
+                    await ensure_daily_ai(
+                        conn, ai_client, now=datetime.now(timezone.utc), log=log, github_client=client
+                    )
+            except Exception:
+                log.exception("AI 每日生成整轮异常：吞掉不抛出（AI 降级不阻断快照主流程），次日调度自然重试")
         with _sync_state_lock:
             _sync_state["last_stats"] = stats
         return stats
