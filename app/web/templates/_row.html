@@ -6,7 +6,7 @@
    引号显式转义为 &#34;，浏览器 dataset 读出即合法 JSON）。 #}
 <div class="row expanded{% if r.dead %} dead{% endif %}" data-b="{{ anchor }}" data-i="{{ idx }}" data-tags="{{ r.tags | tojson | forceescape }}" tabindex="0" role="button" aria-expanded="true">
   <span class="rank">{{ r.rank }}</span>
-  <span class="repo-wrap"><span class="repo" title="{{ r.full_name }}">{{ r.full_name }}</span>{% if r.dead %}<span class="dead-tag">已失效</span>{% endif %}<svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></span>
+  <span class="repo-wrap"><span class="repo" title="{{ r.full_name }}">{{ r.full_name }}</span>{% if r.created_year %}<span class="year">· {{ r.created_year }}</span>{% endif %}{% if r.dead %}<span class="dead-tag">已失效</span>{% endif %}<svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></span>
   {% if r.language %}<span class="badge"><span class="dot" style="background:{{ r.lang_color }}"></span>{{ r.language }}</span>{% endif %}
   {% if r.up_na_text is not none %}<span class="up na">{{ r.up_na_text }}</span>{% elif r.delta_text is not none %}<span class="up{% if r.delta_neg %} neg{% endif %}">{{ r.delta_text }}</span>{% endif %}
   <span class="total"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>{{ r.stars_text or "——" }}</span>

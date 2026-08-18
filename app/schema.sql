@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS repos (
     topics TEXT NOT NULL DEFAULT '[]',     -- GitHub topics，JSON 数组字符串（S 档不建关系表）
     dead INTEGER NOT NULL DEFAULT 0,       -- 仓库删除/私有化标记：置 1 后停止采集，但保留历史快照
     source TEXT NOT NULL,                  -- 入池来源（trending / search 等），用于回溯数据质量
-    created_at TEXT NOT NULL               -- 入池时间，ISO 8601
+    created_at TEXT NOT NULL,              -- 入池时间，ISO 8601
+    github_created_at TEXT                 -- GitHub 上的仓库创建时间（T-033，ISO 8601 定长）；语义区别于 created_at（入池时间），
+                                           -- 每日 GraphQL 采集顺手回填；NULL = 未回填（新项目区准入按 NULL 一律排除）
 );
 -- 分语言榜单按 language 过滤仓库后再算增量
 CREATE INDEX IF NOT EXISTS idx_repos_language ON repos (language);

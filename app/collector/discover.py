@@ -42,7 +42,13 @@ from datetime import date, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from app.collector.github import MAX_NODES_PER_QUERY, GitHubAuthError, GitHubClient, utc_now_iso
+from app.collector.github import (
+    MAX_NODES_PER_QUERY,
+    GitHubAuthError,
+    GitHubClient,
+    normalize_github_created_at,
+    utc_now_iso,
+)
 from app.collector.snapshot import ID_LOOKUP_CHUNK
 from app.config import BASE_DIR, get_settings
 from app.db import get_conn, init_db
@@ -109,6 +115,9 @@ def _apply_snapshot_batch(
     T-025 追加 language/topics 漂移检测（与 description 检测并列独立）：任一漂移 → 只 UPDATE repos 归类字段
     （language/topics 一并写 nodes 侧新值，保持简单），不清 description_zh、不 DELETE recommendations——
     推荐语/译文输入是简介与 README，归类是读时实时算的，UPDATE 后次日榜单自然生效；漂移率低、重生成本高。
+    T-033 追加 GitHub 创建时间顺手回填（NODES_QUERY 本已返回 createdAt）：归一化为 schema 定长后写入
+    github_created_at；值有变才写（首次回填后恒等，不刷行）；createdAt 缺失/畸形 → 跳过更新保留既有值
+    （展示字段，不因它中断采集主链路）。
     topics 按集合比较（防 GitHub 返回顺序抖动造成伪漂移），集合相等不写库（避免顺序扰动刷行）、有差异才
     按 GitHub 返回原序 json.dumps(ensure_ascii=False) 写回；row['topics'] 脏数据 json.loads 抛错属 fail-loud
     不捕获（与 report.py 惯例一致）；node 结构缺键按 KeyError/TypeError 上抛（协议字段，缺了就是真异常）。
@@ -127,6 +136,11 @@ def _apply_snapshot_batch(
                     )
                     # T-017：简介变更 → 当日清该仓全部维度推荐语（可再生数据；当日 ensure 范围内重生自愈）
                     conn.execute("DELETE FROM recommendations WHERE repo_id = ?", (row["id"],))
+                # T-033：GitHub 创建时间顺手回填（与 T-016/T-025 检测并列独立）——createdAt 缺失/畸形
+                # 返回 None → 跳过更新（保留既有值，防把已回填值覆盖回 NULL）
+                created_at = normalize_github_created_at(node.get("createdAt"))
+                if created_at is not None and created_at != row["github_created_at"]:
+                    conn.execute("UPDATE repos SET github_created_at = ? WHERE id = ?", (created_at, row["id"]))
                 # T-025：language/topics 漂移检测——任一漂移只更新归类字段（不清译文不删推荐语，见 docstring）；
                 # topics 按集合比较防顺序抖动伪漂移，写入按 GitHub 返回原序
                 lang_node = node.get("primaryLanguage")  # GitHub 官方允许为空：None 与库内 None 相等视为无变更
@@ -150,9 +164,12 @@ async def _snapshot_all(
 ) -> None:
     """每日快照：全部 dead=0 仓库按 node_id 分批走 nodes(ids:)；单批失败记日志跳过，不拖垮整轮。
 
-    SELECT 带 description_en/language/topics 供 T-016/T-025 变更检测（_apply_snapshot_batch 内比对更新）。
+    SELECT 带 description_en/language/topics 供 T-016/T-025 变更检测（_apply_snapshot_batch 内比对更新），
+    github_created_at 供 T-033 顺手回填比对（值有变才写）。
     """
-    rows = conn.execute("SELECT id, node_id, description_en, language, topics FROM repos WHERE dead = 0").fetchall()
+    rows = conn.execute(
+        "SELECT id, node_id, description_en, language, topics, github_created_at FROM repos WHERE dead = 0"
+    ).fetchall()
     for offset in range(0, len(rows), MAX_NODES_PER_QUERY):
         chunk = rows[offset : offset + MAX_NODES_PER_QUERY]
         try:
@@ -165,7 +182,11 @@ async def _snapshot_all(
 
 
 def _ingest_discovered(conn: sqlite3.Connection, items: list[dict], *, now_iso: str, captured_at: str) -> int:
-    """新面孔入池（source='discover'）＋当行基线快照；映射口径与 snapshot.ingest_items 对齐，返回实插行数。"""
+    """新面孔入池（source='discover'）＋当行基线快照；映射口径与 snapshot.ingest_items 对齐，返回实插行数。
+
+    T-033：Search item 的 created_at 一并归一化存入 github_created_at（缺失/畸形 → NULL，次日 GraphQL
+    回填兜底，采集不因展示字段中断）。
+    """
     if not items:
         return 0
     repo_rows = [
@@ -176,14 +197,16 @@ def _ingest_discovered(conn: sqlite3.Connection, items: list[dict], *, now_iso: 
             item.get("language"),  # 同上
             json.dumps(item.get("topics") or [], ensure_ascii=False),  # schema 硬约定：topics 存 JSON 数组字符串
             now_iso,
+            normalize_github_created_at(item.get("created_at")),  # T-033：REST Search item 自带创建时间
         )
         for item in items
     ]
     with conn:  # 入池与基线快照同生共死：失败整体回滚，次日发现池重捞
         cur = conn.executemany(
             """
-            INSERT OR IGNORE INTO repos (full_name, node_id, description_en, language, topics, dead, source, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, 'discover', ?)
+            INSERT OR IGNORE INTO repos
+                (full_name, node_id, description_en, language, topics, dead, source, created_at, github_created_at)
+            VALUES (?, ?, ?, ?, ?, 0, 'discover', ?, ?)
             """,
             repo_rows,
         )

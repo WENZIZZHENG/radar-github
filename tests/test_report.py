@@ -32,11 +32,15 @@ def _iso(days_before: float) -> str:
     return (_AS_OF_DT - timedelta(days=days_before)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _add_repo(conn, name, *, language=None, topics=(), dead=0, snapshots=()):
-    """插一个仓库及其快照，返回 repo_id；snapshots 为 (captured_at, stars) 列表。"""
+def _add_repo(conn, name, *, language=None, topics=(), dead=0, snapshots=(), github_created_at=None):
+    """插一个仓库及其快照，返回 repo_id；snapshots 为 (captured_at, stars) 列表。
+
+    github_created_at（T-033）：GitHub 创建时间（定长 ISO），缺省 None（NULL 未回填）。
+    """
     cur = conn.execute(
-        "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (name, f"node-{name}", language, json.dumps(list(topics)), dead, "test", "2026-07-01T00:00:00Z"),
+        "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at, github_created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, f"node-{name}", language, json.dumps(list(topics)), dead, "test", "2026-07-01T00:00:00Z", github_created_at),
     )
     repo_id = cur.lastrowid
     for captured_at, stars in snapshots:
@@ -470,6 +474,184 @@ def test_rising_repeats_across_boards(conn, topic_table):
     boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
     assert [r.full_name for r in _board(boards, "topic", "ai").rising_rows] == ["a/ai-rise"]
     assert [r.full_name for r in _board(boards, "topic", "frontend").rising_rows] == ["a/ai-rise"]
+
+
+# ---------- T-033 新项目区（决策 4：出席 ∧ 创建 < 1 年 ∧ 不在主榜 Top50，Top 20） ----------
+
+
+def test_fresh_admission_and_null_exclusion(conn, topic_table):
+    """准入：出席仓且 github_created_at 非 NULL 且年龄 < 365 天进新项目区；NULL（未回填）一律不进；
+    缺席仓不进（归新崛起区，两区互斥）。"""
+    # 出席但被 51 个老仓挤出主榜 Top50 → 新项目区候选
+    _add_repo(conn, "a/fresh", language="Python", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 400)])  # delta 350
+    _add_repo(conn, "a/null", language="Python", snapshots=[(_iso(7), 50), (_iso(0), 300)])  # NULL 未回填
+    _add_repo(conn, "a/absent", language="Python", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(3), 100), (_iso(0), 300)])  # 缺席 → 新崛起区
+    for i in range(51):  # 老仓占满 python 主榜 Top50（delta 1000..1050 > 350）
+        _add_repo(conn, f"o/old-{i:02d}", language="Python", github_created_at="2020-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    py = _board(boards, "language", "python")
+    assert [r.full_name for r in py.fresh] == ["a/fresh"]  # NULL 仓不进
+    assert [r.full_name for r in py.rising_rows] == ["a/absent"]  # 缺席仓归新崛起区（互斥）
+    assert "a/fresh" not in {r.full_name for r in py.rows}
+    assert len(py.rows) == 50  # 主榜照常 Top50
+
+
+def test_fresh_total_period_admission(conn, topic_table):
+    """total 口径新项目区：无出席概念，准入 = 创建 < 1 年 ∧ alive ∧ 不在主榜，按总星降序。"""
+    _add_repo(conn, "a/t1", language="Python", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(1), 1000)])
+    _add_repo(conn, "a/t2", language="Python", github_created_at="2026-06-01T00:00:00Z",
+              snapshots=[(_iso(1), 900)])
+    _add_repo(conn, "a/old", language="Python", github_created_at="2020-01-01T00:00:00Z",
+              snapshots=[(_iso(1), 5000)])
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Python", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(1), 6000 + i * 10)])
+
+    py = _board(compute_boards(conn, topic_table, period="total", as_of=AS_OF), "language", "python")
+    assert [r.full_name for r in py.fresh] == ["a/t1", "a/t2"]  # 总星降序；a/old 满 1 年不进；主榜被老仓占满
+    assert [r.full_name for r in py.rows][0].startswith("o/old-")
+    assert all(r.delta is None for r in py.fresh)  # total 无增量概念（行形态同主榜）
+
+
+def test_fresh_365_day_boundary(conn, topic_table):
+    """365 天边界：as_of − github_created_at 差 364 天进、365 天整不进（.days 下取整，< 365 严格语义）。"""
+    _add_repo(conn, "a/b364", language="Go", github_created_at="2025-08-10T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 400)])  # 2026-08-09 − 2025-08-10 = 364 天
+    _add_repo(conn, "a/b365", language="Go", github_created_at="2025-08-09T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 300)])  # = 365 天整：不进
+    _add_repo(conn, "a/old", language="Go", github_created_at="2010-01-01T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 200)])  # 远老仓：不进
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Go", github_created_at="2010-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+
+    go = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "go")
+    assert [r.full_name for r in go.fresh] == ["a/b364"]  # 365 天整与远老仓都不进
+
+
+def test_fresh_excludes_main_board_and_no_double_count(conn, topic_table):
+    """与主榜去重不重影：进主榜 Top50 的仓不在新项目区；被挤出主榜的才进；同仓同榜只出现一次。"""
+    _add_repo(conn, "a/main", language="Rust", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(7), 100), (_iso(0), 2500)])  # delta 2400：凭增量进主榜
+    _add_repo(conn, "a/edge", language="Rust", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(7), 100), (_iso(0), 300)])  # delta 200：被 51 个老仓挤出主榜
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Rust", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    rust = _board(boards, "language", "rust")
+    main_names = {r.full_name for r in rust.rows}
+    fresh_names = {r.full_name for r in rust.fresh}
+    assert main_names & fresh_names == set()  # 不重影
+    assert "a/main" in main_names and "a/main" not in fresh_names  # 凭增量进主榜 → 不在新区
+    assert "a/edge" in fresh_names and "a/edge" not in main_names  # 挤出主榜 → 新区
+    assert len(main_names | fresh_names) == len(main_names) + len(fresh_names)  # 全集互斥
+
+
+def test_fresh_top_20_capped_and_no_padding(conn, topic_table):
+    """Top 20 截断与不补位：22 个候选截掉排序最后 2 个；不足按实际（无凑数行）。"""
+    for i in range(22):
+        _add_repo(conn, f"a/f-{i:02d}", language="Python", github_created_at="2026-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 1000 + i * 10)])  # delta 0..210
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Python", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    py = _board(boards, "language", "python")
+    assert len(py.fresh) == 20  # 22 个候选截 Top 20
+    assert py.fresh[0].full_name == "a/f-21"  # 增量最大者居首
+    assert {r.full_name for r in py.fresh} == {f"a/f-{i:02d}" for i in range(2, 22)}  # delta 0/10 的被截掉
+
+    # 不足 20 按实际：Java 榜 3 个候选（+51 占位挤出主榜）→ 只展示 3 行，无凑数
+    for i in range(3):
+        _add_repo(conn, f"j/f-{i}", language="Java", github_created_at="2026-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 2000), (_iso(0), 2000 + i * 10)])  # delta 0/10/20
+    for i in range(51):
+        _add_repo(conn, f"j/old-{i:02d}", language="Java", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+    java = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "java")
+    assert len(java.fresh) == 3
+    assert [r.full_name for r in java.fresh] == ["j/f-2", "j/f-1", "j/f-0"]  # delta 降序（0 也列）
+
+
+def test_three_zone_flow_mutual_exclusion(conn, topic_table):
+    """三区流转互斥（规格 Scenario）：新仓入池第 3 天（缺席）只在新崛起区；满窗口出席但增量进不了
+    主榜 Top50 → 只在新项目区；增量涨进主榜 Top50 → 只在主榜——同仓同榜三区不重影。"""
+    rid = _add_repo(conn, "a/fresh", language="Python", github_created_at="2026-07-01T00:00:00Z",
+                    snapshots=[(_iso(3), 100), (_iso(0), 400)])
+    py = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "python")
+    assert [r.full_name for r in py.rising_rows] == ["a/fresh"]  # 缺席 → 新崛起区
+    assert py.fresh == [] and py.rows == []
+
+    # 补 7 天前快照 → 满窗口出席（delta 350）；51 个老仓（delta 1000..1050）占满主榜 Top50
+    conn.execute("INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)", (rid, _iso(7), 50))
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Python", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+    py2 = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "python")
+    assert "a/fresh" not in {r.full_name for r in py2.rows}  # 挤不进主榜
+    assert [r.full_name for r in py2.fresh] == ["a/fresh"]  # 出席且未满 1 年 → 新项目区
+    assert py2.rising_rows == []  # 毕业离开新崛起区
+
+    # 端点星数拉满 → 增量 1050 并列前茅：进主榜 → 从新项目区消失
+    conn.execute("UPDATE star_snapshots SET stars = 1100 WHERE repo_id = ? AND captured_at = ?", (rid, _iso(0)))
+    py3 = _board(compute_boards(conn, topic_table, period="week", as_of=AS_OF), "language", "python")
+    assert "a/fresh" in {r.full_name for r in py3.rows}
+    assert "a/fresh" not in {r.full_name for r in py3.fresh}
+    assert py3.rising_rows == []
+
+
+def test_fresh_full_keys_single_board_only(conn, topic_table):
+    """T-033 决策 6：full_keys 单榜模式仅指定榜算 fresh——当前榜 fresh 正常、非当前榜 fresh 恒空列表
+    （不计数）；全量模式各榜 fresh 就位。"""
+    _add_repo(conn, "a/py-fresh", language="Python", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 400)])
+    _add_repo(conn, "a/go-fresh", language="Go", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 300)])
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Python", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+        _add_repo(conn, f"g/old-{i:02d}", language="Go", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+
+    single = compute_boards(conn, topic_table, period="week", as_of=AS_OF, full_keys={"language-python"})
+    py, go = _board(single, "language", "python"), _board(single, "language", "go")
+    assert [r.full_name for r in py.fresh] == ["a/py-fresh"]  # 指定榜 fresh 全量
+    assert go.fresh == []  # 非指定榜 fresh 恒空列表（不计数）
+    assert go.count == 50  # 非指定榜只归桶计数（Go 主榜行数）
+
+    full = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    assert [r.full_name for r in _board(full, "language", "python").fresh] == ["a/py-fresh"]
+    assert [r.full_name for r in _board(full, "language", "go").fresh] == ["a/go-fresh"]
+
+
+def test_rows_carry_created_year(conn, topic_table):
+    """T-033：主榜行/新项目区行/新崛起区行统一携带 created_year（github_created_at 前 4 位）；
+    NULL 未回填 → None（模板不渲染标注的数据基础）。"""
+    _add_repo(conn, "a/fresh", language="Python", github_created_at="2026-07-01T00:00:00Z",
+              snapshots=[(_iso(7), 50), (_iso(0), 400)])
+    _add_repo(conn, "a/rising", language="Rust", github_created_at="2026-06-01T00:00:00Z",
+              snapshots=[(_iso(3), 100), (_iso(0), 300)])
+    _add_repo(conn, "a/no-created", language="Go", snapshots=[(_iso(7), 100), (_iso(0), 200)])
+    for i in range(51):
+        _add_repo(conn, f"o/old-{i:02d}", language="Python", github_created_at="2019-01-01T00:00:00Z",
+                  snapshots=[(_iso(7), 1000), (_iso(0), 2000 + i)])
+
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    py = _board(boards, "language", "python")
+    assert py.fresh[0].created_year == 2026  # 新项目区行
+    assert {r.created_year for r in py.rows} == {2019}  # 主榜行
+    rust = _board(boards, "language", "rust")
+    assert rust.rising_rows[0].created_year == 2026  # 新崛起区行
+    go = _board(boards, "language", "go")
+    assert go.rows[0].created_year is None  # NULL 未回填 → None
 
 
 # ---------- T-020 端点快照日期标注：行结构透传 captured_at（纯展示数据源，一行计算逻辑不动） ----------

@@ -27,13 +27,15 @@ WEEK_LABEL = "2026-W32"
 PREV_WEEK_LABEL = "2026-W31"
 
 
-def _add_repo(conn, name, *, language=None, topics=(), description_en=None, description_zh=None, snapshots=()):
-    """插一个仓库及其快照，返回 repo_id；created_at 取最早快照日（与真实采集一致：先入池后有快照）。"""
+def _add_repo(conn, name, *, language=None, topics=(), description_en=None, description_zh=None, snapshots=(), github_created_at=None):
+    """插一个仓库及其快照，返回 repo_id；created_at 取最早快照日（与真实采集一致：先入池后有快照）。
+
+    github_created_at（T-033）：GitHub 创建时间，缺省 None（NULL 未回填）。"""
     created_at = min((ts for ts, _ in snapshots), default=SNAP_DAY)
     cur = conn.execute(
-        "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, 0, 'test', ?)",
-        (name, f"node-{name}", description_en, description_zh, language, json.dumps(list(topics)), created_at),
+        "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at, github_created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 0, 'test', ?, ?)",
+        (name, f"node-{name}", description_en, description_zh, language, json.dumps(list(topics)), created_at, github_created_at),
     )
     repo_id = cur.lastrowid
     for captured_at, stars in snapshots:
@@ -97,6 +99,26 @@ def _seed_first_day(conn):
         topics=["cli"],
         description_en="new hotness",
         snapshots=[(f"{SNAP_DAY}T05:51:43Z", 1234)],
+    )
+
+
+def _seed_fresh(conn):
+    """T-033 新项目区页面种子（历史周 as_of 固定，时间稳健）：51 个老 Python 仓占满主榜 Top50；
+    1 个创建未满 1 年的仓（a/fresh，创建 2026-01-01）出席但增量被挤出主榜 → 新项目区 1 行。"""
+    for i in range(51):
+        _add_repo(
+            conn,
+            f"o/old-{i:02d}",
+            language="Python",
+            github_created_at="2019-01-01T00:00:00Z",
+            snapshots=[("2026-08-02T00:00:00Z", 1000), (f"{SNAP_DAY}T00:00:00Z", 2000 + i)],
+        )
+    _add_repo(
+        conn,
+        "a/fresh",
+        language="Python",
+        github_created_at="2026-01-01T00:00:00Z",
+        snapshots=[("2026-08-02T00:00:00Z", 100), (f"{SNAP_DAY}T00:00:00Z", 400)],
     )
 
 
@@ -543,6 +565,60 @@ def test_no_summary_row_renders_no_summary_block(fresh_client):
     """降级：库内无任何 summary 行 → 页面无 .summary 元素（不留空框，AI 失败永不阻塞出榜）。"""
     text = fresh_client.get("/total").text
     assert "AI 概要" not in text and 'class="summary"' not in text
+
+
+# ---------- T-033：榜单三段结构页面（新项目区＋主榜区头＋年份小灰字；内容断言走历史期次页，时间稳健） ----------
+
+
+def test_fresh_zone_and_main_header_on_week_page(tmp_path, monkeypatch):
+    """新项目区渲染（历史周页 as_of 固定）：区头文案/计数徽标/年份小灰字；主榜区头"按本期增星排序"恒渲染；
+    空新区不渲染区头（对照 _seed_full 无 github_created_at）。"""
+    with _make_client(tmp_path, monkeypatch, _seed_fresh) as c:
+        text = c.get(f"/?week={WEEK_LABEL}&board=all").text
+        assert "新项目 · 创建未满 1 年" in text
+        assert "新项目 · 创建未满 1 年<span class=\"n\">Top 1</span>" in text  # 徽标 = 实际行数
+        assert "主榜 · 按本期增星排序" in text  # 主榜对仗区头（周/季口径）
+        assert "新崛起" not in text  # 无缺席仓 → 新崛起区不渲染（三段互斥语义的页面体现）
+        assert '<span class="year">· 2026</span>' in text  # 年份小灰字（全名旁）
+        assert "a/fresh" in text
+        assert text.count("新项目 · 创建未满 1 年") == 2  # python 语言榜＋"其他"主题榜各一区（跨榜重复与主榜同口径）
+        assert 'class="notice"' not in text  # 新项目区有行 → 三区不全空 → 不降级
+
+
+def test_no_fresh_zone_when_not_backfilled(tmp_path, monkeypatch):
+    """空新区不渲染：_seed_full 无 github_created_at（未回填）→ 全榜无"新项目"区头（区头/说明全不出现）；
+    主榜区头不受新区空满影响（恒渲染）。"""
+    with _make_client(tmp_path, monkeypatch, _seed_full) as c:
+        text = c.get(f"/?week={WEEK_LABEL}&board=all").text
+        assert "新项目" not in text
+        assert "主榜 · 按本期增星排序" in text  # 主榜区头恒渲染
+
+
+def test_fresh_zone_and_main_header_on_total_page(tmp_path, monkeypatch):
+    """total 页新项目区（按总星排序）＋主榜区头"按总星排序"；年份小灰字同步生效。"""
+    with _make_client(tmp_path, monkeypatch, _seed_fresh) as c:
+        text = c.get("/total?board=all").text
+        assert "新项目 · 创建未满 1 年" in text
+        assert "主榜 · 按总星排序" in text  # total 口径主榜区头（区别于周/季）
+        assert '<span class="year">· 2026</span>' in text
+        assert "a/fresh" in text
+
+
+def test_single_board_fresh_section(tmp_path, monkeypatch):
+    """单榜模式（§13.1 + T-033）：指定榜新项目区照常渲染（full_keys 仅指定榜算 fresh）。"""
+    with _make_client(tmp_path, monkeypatch, _seed_fresh) as c:
+        text = c.get(f"/?week={WEEK_LABEL}&board=language-python").text
+        assert text.count('class="board"') == 1
+        assert "新项目 · 创建未满 1 年" in text
+        assert "a/fresh" in text
+        assert "主榜 · 按本期增星排序" in text
+
+
+def test_year_badge_absent_when_created_year_none(client):
+    """年份小灰字：created_year=None（未回填）的行不渲染标注（不留空位）——_seed_full 无 github_created_at。"""
+    text = client.get("/total?board=all").text
+    assert '<span class="year">' not in text
+    assert "a/py" in text  # 行照常渲染（只是无年份标注）
 
 
 # ---------- T-018：新崛起区（决策 4 v2；内容断言走历史期次页/total，遵守本文件时间稳健约定） ----------

@@ -1,7 +1,8 @@
 """AI 服务（T-011→T-018）：范围内翻译＋三口径分维度推荐语生成＋全程降级（共识 §7 v4 / 决策 5 v2 / 决策 6 v2）。
 
 口径（任务书钉死，勿自由发挥）：
-- 范围集 S（T-017 收窄，v3 全池口径作废；T-018 起周/季榜集 = 主榜 Top50 ∪ 新区 Top10；T-028 主榜 30→50）：
+- 范围集 S（T-017 收窄，v3 全池口径作废；T-018 起周/季榜集 = 主榜 Top50 ∪ 新崛起区 Top10；T-028 主榜 30→50；
+  T-033 起三口径榜集再 ∪ 新项目区 Top20）：
   三口径榜去重 ∪ 关注集——
   S 之外的仓库永远不译不生成（已译译文保留不清除；新上榜/新关注仓由每日 job 自动补译，自愈）；
 - 翻译段：只译 S 内 description_zh IS NULL 的仓（英文非空、不含 CJK 逐条翻译回填 repos.description_zh）；
@@ -354,10 +355,12 @@ class DeepSeekClient:
 
 @dataclass(frozen=True)
 class _ListedItem:
-    """上榜集元素：主榜行或新区行 + 所属分类榜名列表（语言榜 label 与命中主题榜 label，可多榜重复）。
+    """上榜集元素：主榜行/新项目区行（row 携带 ReportRow）或新崛起区行（rising 携带 RisingRow）+ 所属分类榜名列表。
 
-    T-018：新区仓（周/季榜集内的 rising 行）row=None 而 rising 携带 RisingRow，主榜仓反之；
+    T-018：新崛起区仓（周/季榜集内的 rising 行）row=None 而 rising 携带 RisingRow，主榜仓反之；
     推荐语生成按 rising 是否为空选择增量语境（主榜窗口增量 vs 在池增量）。
+    T-033：新项目区行与主榜行同待遇（row 携带 ReportRow、窗口增量语境），仅"先上主榜还是先上新项目区"
+    决定谁占位——同仓同榜不重影，listed 按 full_name 合并。
     """
 
     row: ReportRow | None
@@ -385,11 +388,13 @@ def _load_repo_info(conn: sqlite3.Connection, full_names: list[str]) -> dict[str
 def _scope_sets(
     conn: sqlite3.Connection, *, now: datetime
 ) -> tuple[dict[str, dict[str, _ListedItem]], list[str]]:
-    """T-017/T-018 覆盖口径 S：三口径榜去重 ∪ 关注集（周/季 = 主榜 Top50 ∪ 新区 Top10；total = Top50，T-028 30→50）。
+    """T-017/T-018/T-033 覆盖口径 S：三口径榜去重 ∪ 关注集（周/季 = 主榜 Top50 ∪ 新崛起区 Top10 ∪
+    新项目区 Top20；total = 主榜 Top50 ∪ 新项目区 Top20，T-028 主榜 30→50）。
 
     返回 (listed_by_period, follow_names)：listed_by_period[period] = full_name → _ListedItem（榜单序保序）；
     follow_names 按 follows.created_at 序（页面关注序）。S 之外的仓库永远不译不生成（共识 §7 v4）。
-    新区行属上榜口径（决策 4 v2）：缺席仓进周/季榜集，总星榜集与关注集不受影响。
+    新崛起区行属上榜口径（决策 4 v2）：缺席仓进周/季榜集，总星榜集与关注集不受影响（total 无缺席概念恒空）；
+    新项目区行属上榜口径（T-033 决策 5）：出席仓三口径都进榜集，与主榜行同待遇（row 非 None、窗口增量语境）。
     """
     topic_table = load_topics(TOPICS_PATH)
     as_of_iso = now.strftime(_ISO_FMT)
@@ -404,11 +409,18 @@ def _scope_sets(
                     listed[row.full_name] = _ListedItem(row=row, categories=[board.label])
                 else:
                     item.categories.append(board.label)  # 同一项目多榜出现：分类榜名累加（跨榜复用一条推荐语）
-            # T-018：新区行同属上榜口径（total 榜新区恒空自然不触发）
+            # T-018：新崛起区行同属上榜口径（total 榜新区恒空自然不触发）
             for rising in board.rising_rows:
                 item = listed.get(rising.full_name)
                 if item is None:
                     listed[rising.full_name] = _ListedItem(row=None, categories=[board.label], rising=rising)
+                else:
+                    item.categories.append(board.label)
+            # T-033：新项目区行同属上榜口径（与主榜行同待遇——row 非 None、窗口增量语境；total 榜同样有本区）
+            for fresh in board.fresh:
+                item = listed.get(fresh.full_name)
+                if item is None:
+                    listed[fresh.full_name] = _ListedItem(row=fresh, categories=[board.label])
                 else:
                     item.categories.append(board.label)
         listed_by_period[period] = listed
@@ -469,7 +481,8 @@ async def recommend_missing(
     scope: tuple[dict[str, dict[str, _ListedItem]], list[str]] | None = None,
     on_progress: Callable[[dict[str, int]], None] | None = None,
 ) -> dict[str, int]:
-    """三维度推荐语补缺（T-017，T-018 扩 S）＋ AI 概要补缺（T-024）：S = 三口径榜去重 ∪ 关注集（周/季含新区 Top10）。
+    """三维度推荐语补缺（T-017，T-018 扩 S，T-033 再扩新项目区）＋ AI 概要补缺（T-024）：S = 三口径榜去重
+    ∪ 关注集（周/季含新崛起区 Top10；三口径含新项目区 Top20，与主榜行同待遇）。
 
     - week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
     - quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
@@ -709,7 +722,8 @@ async def ensure_daily_ai(
 ) -> dict[str, int]:
     """每日 AI 生成（T-017 重写，原名 ensure_weekly_ai）：范围集翻译收窄＋三维度推荐语补缺/刷新＋AI 概要（T-024）。
 
-    步骤：a) 计算范围集 S = 三口径榜去重 ∪ 关注集（周/季 = 主榜 Top50 ∪ 新区 Top10，T-018；T-028 主榜 30→50）；
+    步骤：a) 计算范围集 S = 三口径榜去重 ∪ 关注集（周/季 = 主榜 Top50 ∪ 新崛起区 Top10 ∪ 新项目区 Top20，
+    T-018；T-028 主榜 30→50；T-033 加入新项目区）；
     b) 翻译段收窄：只译 S 内 description_zh IS NULL 且英文非空无 CJK 的仓（原文变更采集层已清译文，
     当日本轮自然重译；译过的不重译；S 之外永不翻译——v3 全池口径作废）；
     c) 推荐语三维度＋概要（口径详见 recommend_missing docstring；refresh=True → 概要段随行执行）；

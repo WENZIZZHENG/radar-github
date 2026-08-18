@@ -27,11 +27,13 @@ def make_node(
     description: str | None = None,
     language: str | None = None,
     topics: tuple[str, ...] = (),
+    created_at: str | None = None,
 ) -> dict:
     """造一条 GraphQL Repository 节点（字段对齐每日任务用到的子集）。
 
     description/language 默认 None：既有用例库里对应字段也是 NULL，两值相等 → 不触发变更检测；
     topics 默认空：与 schema 默认 '[]' 相等（T-025 起比对 language/topics，默认值即"无漂移"，不误伤既有用例）。
+    created_at（T-033）：GitHub 创建时间（GraphQL 返回，含带毫秒变体），缺省 None（既有用例不涉及回填断言）。
     """
     return {
         "nameWithOwner": full_name,
@@ -41,6 +43,7 @@ def make_node(
         "description": description,
         "primaryLanguage": {"name": language} if language is not None else None,
         "repositoryTopics": {"nodes": [{"topic": {"name": t}} for t in topics]},
+        "createdAt": created_at,
     }
 
 
@@ -492,6 +495,30 @@ def test_snapshot_description_unchanged_keeps_translation(tmp_path):
 
     row = conn.execute("SELECT description_en, description_zh FROM repos WHERE full_name = 'a/live'").fetchone()
     assert row["description_en"] == "same desc" and row["description_zh"] == "已译"
+    conn.close()
+
+
+def test_snapshot_backfills_github_created_at(tmp_path):
+    """T-033 顺手回填（决策 2）：节点 createdAt（带毫秒变体）归一化为 schema 定长写入 github_created_at；
+    createdAt 缺失 → 跳过更新保留既有值（防把已回填值覆盖回 NULL，展示字段不中断采集主链路）。"""
+    conn = _open_db(tmp_path)
+    _seed_repo_with_desc(conn, description_en=None)  # a/live / nid-live，github_created_at 默认 NULL
+    conn.execute("UPDATE repos SET github_created_at = '2020-01-01T00:00:00Z' WHERE full_name = 'a/live'")
+    conn.commit()
+    client = FakeClient(
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000, created_at="2024-03-15T08:30:00.123Z")}
+    )
+    logger, _records = make_logger()
+    _run(client, conn, logger)
+
+    row = conn.execute("SELECT github_created_at FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row["github_created_at"] == "2024-03-15T08:30:00Z"  # 毫秒剥除归一化（与 _parse_iso 同口径定长）
+
+    # createdAt 缺失（节点不含该键）：跳过更新，既有值保留
+    client2 = FakeClient(nodes_by_id={"nid-live": make_node("a/live", stars=2100)})
+    _run(client2, conn, logger)
+    row2 = conn.execute("SELECT github_created_at FROM repos WHERE full_name = 'a/live'").fetchone()
+    assert row2["github_created_at"] == "2024-03-15T08:30:00Z"
     conn.close()
 
 

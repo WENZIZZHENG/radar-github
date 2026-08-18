@@ -11,6 +11,7 @@ _make_github_client，同 tests/test_follows.py 手法）；key 未配置用例�
 import asyncio
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,30 +22,34 @@ from app.db import get_conn, init_db
 from app.main import app
 from app.web.routes import _ai_client, _github_client
 
-TODAY = "2026-08-09T00:00:00Z"  # 2026-W32 周日（total 榜/快照构造用；周/季标签一律按真实今天动态推导，防时间漂移）
-
 
 def _current_week_label() -> str:
     """真实今天所在 ISO 周标签（与 routes 的 _week_label 同口径）：批量/单个周维度断言用它。"""
-    iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).date().isocalendar()
+    iso = datetime.now(timezone.utc).date().isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
 
 
 def _add_repo(conn, name, *, description_en, description_zh=None, stars=1000):
-    """插一个池内仓库＋两端快照（周榜出席；total 榜出席），返回 repo_id。"""
+    """插一个池内仓库＋两端快照（周榜出席；total 榜出席），返回 repo_id。
+
+    快照相对"今天"构造（两端跨 7 天，与 test_api_recommend_week_dimension_writes_current_week 同手法）：
+    周维度恒出席（delta=100）、季维度恒缺席进新区——断言不随真实日期漂移（固定日期快照在运行日
+    距其超过 9 天后会滑出周窗口，2026-08-18 实测变红后改为相对造法）。
+    """
+    now = datetime.now(timezone.utc)
     cur = conn.execute(
         "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at)"
-        " VALUES (?, ?, ?, ?, 'Python', '[]', 0, 'test', '2026-07-01T00:00:00Z')",
-        (name, f"node-{name}", description_en, description_zh),
+        " VALUES (?, ?, ?, ?, 'Python', '[]', 0, 'test', ?)",
+        (name, f"node-{name}", description_en, description_zh, (now - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")),
     )
     repo_id = cur.lastrowid
     conn.execute(
         "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
-        (repo_id, "2026-08-02T00:00:00Z", stars - 100),
+        (repo_id, (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"), stars - 100),
     )
     conn.execute(
         "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
-        (repo_id, TODAY, stars),
+        (repo_id, now.strftime("%Y-%m-%dT%H:%M:%SZ"), stars),
     )
     conn.commit()
     return repo_id

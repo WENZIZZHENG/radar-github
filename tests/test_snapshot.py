@@ -48,9 +48,11 @@ class FakeSearchClient:
         return [c for c in self.calls if c[0] == query and c[1] > 1]
 
 
-def make_item(full_name: str, *, stars: int = 1234, description="demo", language="Python", topics=("ai", "cli")) -> dict:
-    """造一条 REST search item（字段对齐真实响应中入库要用的子集）。"""
-    return {
+def make_item(full_name: str, *, stars: int = 1234, description="demo", language="Python", topics=("ai", "cli"), created_at=None) -> dict:
+    """造一条 REST search item（字段对齐真实响应中入库要用的子集）。
+
+    created_at（T-033）：GitHub 创建时间，缺省 None（真实响应必有，测试默认不给以锁定"缺失不中断"）。"""
+    item = {
         "full_name": full_name,
         "description": description,
         "language": language,
@@ -58,6 +60,9 @@ def make_item(full_name: str, *, stars: int = 1234, description="demo", language
         "stargazers_count": stars,
         "node_id": f"node-{full_name}",
     }
+    if created_at is not None:
+        item["created_at"] = created_at
+    return item
 
 
 def collect_leaves(client: FakeSearchClient, shard: Shard) -> list:
@@ -187,6 +192,27 @@ def test_ingest_failure_rolls_back_whole_shard(tmp_path):
         ingest_items(conn, [bad_item], captured_at="2026-08-09T00:00:00Z", now_iso="2026-08-09T00:00:00Z")
     assert conn.execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM star_snapshots").fetchone()[0] == 0
+    conn.close()
+
+
+def test_ingest_stores_github_created_at_normalized(tmp_path):
+    """T-033：Search item 的 created_at 归一化入 repos.github_created_at（带毫秒变体剥毫秒为定长）；
+    缺失 → NULL 且不中断（采集主链路不因展示字段断）。"""
+    conn = _open_db(tmp_path)
+    items = [
+        make_item("octocat/hello", stars=2000, created_at="2024-01-15T08:30:00.123Z"),
+        make_item("octocat/plain", stars=1000),  # 无 created_at
+        make_item("octocat/weird", stars=1500, created_at="not-a-date"),  # 畸形 → NULL 不中断
+    ]
+    result = ingest_items(conn, items, captured_at="2026-08-09T00:00:00Z", now_iso="2026-08-09T00:00:00Z")
+    assert result.repos_inserted == 3
+    rows = {
+        r["full_name"]: r["github_created_at"]
+        for r in conn.execute("SELECT full_name, github_created_at FROM repos")
+    }
+    assert rows["octocat/hello"] == "2024-01-15T08:30:00Z"  # 毫秒剥除归一化（schema 定长硬约定）
+    assert rows["octocat/plain"] is None  # 缺失存 NULL
+    assert rows["octocat/weird"] is None  # 畸形存 NULL
     conn.close()
 
 

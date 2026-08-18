@@ -23,6 +23,11 @@ from app.jobs import daily_job
 from app.main import app
 from app.report import (
     PERIODS,
+    Board,
+    ReportRow,
+    RisingRow,
+    _board_from_payload,
+    _board_to_payload,
     compute_boards,
     load_board_cache,
     precompute_boards,
@@ -160,6 +165,55 @@ def test_round_trip_is_idempotent(conn, topic_table):
     conn.commit()
     assert conn.execute("SELECT COUNT(*) FROM board_cache WHERE period = 'week'").fetchone()[0] == 1
     assert load_board_cache(conn, period="week", label="2026-W32") is not None
+
+
+def test_payload_roundtrip_fresh_and_created_year(conn):
+    """T-033：payload 白名单显式含 fresh/created_year——手工构造三区行（含 None 字段）round-trip 逐字段还原，
+    与 _assert_boards_equal 的 vars() 全等口径一致。"""
+    boards = [
+        Board(
+            kind="language",
+            key="python",
+            label="Python",
+            rows=[ReportRow("a/main", None, "Python", 100, 10, 7.0, "2026-08-09T00:00:00Z", 2024)],
+            rising_rows=[RisingRow("a/rise", None, "Python", 50, 5, 3.0, "2026-08-09T00:00:00Z", 2026)],
+            fresh=[ReportRow("a/fresh", None, "Python", 30, 3, 7.0, "2026-08-09T00:00:00Z", 2026)],
+        ),
+        Board(
+            kind="language",
+            key="go",
+            label="Go",
+            rows=[ReportRow("a/no-year", None, "Go", 10, None, None, None, None)],  # created_year None 形态
+        ),
+    ]
+    loaded = _board_from_payload(_board_to_payload(boards))
+    _assert_boards_equal(loaded, boards)
+    assert loaded[0].fresh[0].created_year == 2026  # 白名单缺键即 KeyError（下方 fail-loud 用例锁）
+    assert loaded[1].rows[0].created_year is None
+
+
+def test_payload_missing_fresh_key_fails_loud(conn, topic_table):
+    """T-033：旧缓存 payload 缺 fresh 键 → 反序列化 KeyError fail-loud（不静默降级为空列表）——
+    部署后必须重跑预计算刷新缓存的机制保障（design.md 决策 5/风险段）。"""
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    payload = json.loads(_board_to_payload(boards))
+    for item in payload:
+        del item["fresh"]
+    with pytest.raises(KeyError):
+        _board_from_payload(json.dumps(payload, ensure_ascii=False))
+
+
+def test_payload_missing_created_year_key_fails_loud(conn, topic_table):
+    """T-033：行 payload 缺 created_year 键 → 反序列化 KeyError fail-loud（白名单互为镜像，缺键即报错）。"""
+    _seed_roundtrip(conn)
+    conn.commit()
+    boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
+    payload = json.loads(_board_to_payload(boards))
+    for item in payload:
+        for row in item["rows"]:
+            del row["created_year"]
+    with pytest.raises(KeyError):
+        _board_from_payload(json.dumps(payload, ensure_ascii=False))
 
 
 # ===== load 三条降级判定：任一不过返回 None（调用方走实时算路径） =====

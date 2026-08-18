@@ -50,13 +50,14 @@ def _add_repo(
     base=1000,
     delta=100,
     quarter=False,
+    github_created_at=None,
 ):
     """插仓库＋周窗口两端快照（listed=False 只插端点一张 → 首周缺席不上榜）；quarter=True 再加 90 天前
-    一张（86~94 天滑动窗口 → 季榜出席）；返回 repo_id。"""
+    一张（86~94 天滑动窗口 → 季榜出席）；github_created_at（T-033）缺省 None（未回填）；返回 repo_id。"""
     cur = conn.execute(
-        "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, 0, 'test', '2026-07-01T00:00:00Z')",
-        (name, f"node-{name}", description_en, description_zh, language, json.dumps(list(topics))),
+        "INSERT INTO repos (full_name, node_id, description_en, description_zh, language, topics, dead, source, created_at, github_created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 0, 'test', '2026-07-01T00:00:00Z', ?)",
+        (name, f"node-{name}", description_en, description_zh, language, json.dumps(list(topics)), github_created_at),
     )
     repo_id = cur.lastrowid
     conn.execute(
@@ -997,6 +998,36 @@ def test_scope_sets_include_rising_rows(conn):
     assert "a/rising" in listed_by_period["quarter"]
     total_item = listed_by_period["total"]["a/rising"]
     assert total_item.row is not None and total_item.rising is None  # 总星榜集不动：新区概念不存在
+
+
+def test_fresh_zone_repo_in_scope_with_main_row_treatment(conn):
+    """T-033 覆盖集 S 扩展：仅因新项目区上榜的仓（出席、创建 < 1 年、不在主榜 Top50）进三口径榜集——
+    与主榜行同待遇（row 非 None、窗口增量语境 pool_days=None）；翻译/推荐语/概要补齐（规格 Scenario）。"""
+    # 51 个星数更高者占满周/总星两口径主榜 Top50：a/fresh 仅凭新项目区上榜
+    for i in range(51):
+        _add_repo(conn, f"f/fill{i:02d}", description_en=f"filler {i}", base=2000 + i * 10, delta=10)
+    _add_repo(conn, "a/fresh", description_en="fresh project", base=100, delta=10, github_created_at="2026-01-01T00:00:00Z")
+
+    from app.ai import _scope_sets
+
+    listed_by_period, _ = _scope_sets(conn, now=AS_OF_DT)
+    fresh_item = listed_by_period["week"]["a/fresh"]
+    assert fresh_item.row is not None and fresh_item.rising is None  # 与主榜行同待遇（row 非 None）
+    assert "a/fresh" in listed_by_period["total"]  # total 口径新项目区上榜入集
+    # quarter：a/fresh 缺席（无 90 天快照）且被 51 个并列在池增量仓挤出 rising Top10 → 不在季集
+    # （上榜资格由榜单计算决定，S 集只是榜单的投影）
+    assert "a/fresh" not in listed_by_period["quarter"]
+
+    fake = FakeDeepSeekClient()
+    stats = _run_ensure(conn, fake)
+    assert stats["listed"] == 51  # 50 filler（周/总星主榜 Top50）＋ a/fresh（新项目区）；星最低的 filler 未上榜不在 S
+    week_call = next(c for c in _calls_by_dim(fake, "week") if c["full_name"] == "a/fresh")
+    assert week_call["pool_days"] is None  # 新项目区行不带入池语境（与主榜行同待遇，§16.1）
+    assert week_call["delta"] == 10 and week_call["stars"] == 110  # 窗口增量语境
+    assert "fresh project" in fake.translate_calls  # 翻译覆盖（S 内）
+    rows = _recommend_rows(conn)
+    assert ("a/fresh", "total", "all", "推荐语-a/fresh-total") in rows  # 推荐语覆盖（总星维度）
+    assert any(c["full_name"] == "a/fresh" for c in fake.summarize_calls)  # 概要覆盖
 
 
 def test_client_recommend_rising_pool_context():

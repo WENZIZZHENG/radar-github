@@ -128,7 +128,7 @@ async def _run_sync() -> DailyStats:
                 table = load_topics(BASE_DIR / "config" / "topics.yaml")
                 as_of = utc_now_iso()
                 summary = precompute_boards(conn, table, as_of=as_of)
-                log.info("榜单预计算完成：as_of=%s，各口径榜数/主榜行数/新区行数=%s", as_of, summary)
+                log.info("榜单预计算完成：as_of=%s，各口径榜数/主榜行数/新崛起区行数=%s", as_of, summary)
             except Exception:
                 log.exception("榜单预计算异常：吞掉不抛出（页面缺缓存时降级实时算兜底），次日调度自然重试")
             try:

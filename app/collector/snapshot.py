@@ -30,7 +30,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.collector.github import GitHubClient, utc_now_iso
+from app.collector.github import GitHubClient, normalize_github_created_at, utc_now_iso
 from app.config import BASE_DIR, get_settings
 from app.db import get_conn, init_db
 
@@ -128,7 +128,11 @@ async def fetch_shard_items(client: GitHubClient, leaf: LeafShard) -> list[dict]
 
 
 def ingest_items(conn: sqlite3.Connection, items: list[dict], *, captured_at: str, now_iso: str) -> IngestResult:
-    """search items → repos + star_snapshots，一个事务同生共死；full_name 冲突 INSERT OR IGNORE 跳过（幂等）。"""
+    """search items → repos + star_snapshots，一个事务同生共死；full_name 冲突 INSERT OR IGNORE 跳过（幂等）。
+
+    T-033：Search item 的 created_at 一并归一化存入 github_created_at（REST 响应契约必有，但按
+    item.get 容错缺失/畸形 → NULL 不中断——采集主链路不因展示字段断）。
+    """
     if not items:
         return IngestResult(0, 0)
     repo_rows = [
@@ -139,14 +143,16 @@ def ingest_items(conn: sqlite3.Connection, items: list[dict], *, captured_at: st
             item.get("language"),  # 同上：部分仓库无语言
             json.dumps(item.get("topics") or [], ensure_ascii=False),  # schema 硬约定：topics 存 JSON 数组字符串
             now_iso,
+            normalize_github_created_at(item.get("created_at")),  # T-033：REST Search item 自带创建时间
         )
         for item in items
     ]
     with conn:  # 一个分片一个事务：异常整体回滚，断点不落盘，重跑整片幂等
         cur = conn.executemany(
             """
-            INSERT OR IGNORE INTO repos (full_name, node_id, description_en, language, topics, dead, source, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, 'initial', ?)
+            INSERT OR IGNORE INTO repos
+                (full_name, node_id, description_en, language, topics, dead, source, created_at, github_created_at)
+            VALUES (?, ?, ?, ?, ?, 0, 'initial', ?, ?)
             """,
             repo_rows,
         )
@@ -172,7 +178,8 @@ def ingest_items(conn: sqlite3.Connection, items: list[dict], *, captured_at: st
 def ingest_followed_repo(conn: sqlite3.Connection, item: dict, *, captured_at: str, now_iso: str) -> int:
     """单仓库关注入池/复活（《架构决策记录》决策 9 动态入池）：repos(source='follow')＋基线快照一个事务同生共死。
 
-    - 未入池：插入 repos 行（source='follow'，字段映射与 ingest_items 同口径）＋当行基线快照；
+    - 未入池：插入 repos 行（source='follow'，字段映射与 ingest_items 同口径，含 T-033 github_created_at：
+      REST `/repos/{owner}/{repo}` 返回的 created_at 归一化存入，缺失/畸形 → NULL 不中断）＋当行基线快照；
     - 已入池 dead（复活）：repos 行 INSERT OR IGNORE 跳过（元数据不动），仅置 dead=0 回到每日
       _snapshot_all 的 dead=0 选池，并补一张最新基线快照（死库期间星数无采集，增量两端从这里起算）；
     - 幂等：full_name/node_id 撞已有行 INSERT OR IGNORE 跳过，基线快照主键 (repo_id, captured_at) 冲突跳过；
@@ -185,8 +192,9 @@ def ingest_followed_repo(conn: sqlite3.Connection, item: dict, *, captured_at: s
     with conn:  # repos＋快照要么都成要么都败：异常整体回滚，重试幂等
         conn.execute(
             """
-            INSERT OR IGNORE INTO repos (full_name, node_id, description_en, language, topics, dead, source, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, 'follow', ?)
+            INSERT OR IGNORE INTO repos
+                (full_name, node_id, description_en, language, topics, dead, source, created_at, github_created_at)
+            VALUES (?, ?, ?, ?, ?, 0, 'follow', ?, ?)
             """,
             (
                 item["full_name"],
@@ -195,6 +203,7 @@ def ingest_followed_repo(conn: sqlite3.Connection, item: dict, *, captured_at: s
                 item.get("language"),  # 同上
                 json.dumps(item.get("topics") or [], ensure_ascii=False),  # schema 硬约定：JSON 数组字符串
                 now_iso,
+                normalize_github_created_at(item.get("created_at")),  # T-033：REST 单仓响应自带创建时间
             ),
         )
         row = conn.execute("SELECT id, dead, node_id FROM repos WHERE full_name = ?", (item["full_name"],)).fetchone()

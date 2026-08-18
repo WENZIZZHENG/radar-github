@@ -19,9 +19,11 @@ from app.web.routes import _github_client
 NOW = "2026-08-09T08:00:00Z"  # 关注/基线共享的固定时间戳（UTC 定长硬约定）
 
 
-def make_repo_item(full_name, *, stars=42, description="demo", language="Go", topics=("cli",), node_id=None):
-    """造一条 REST /repos/{full_name} 响应（字段对齐入库子集，与 Search item 同构）。"""
-    return {
+def make_repo_item(full_name, *, stars=42, description="demo", language="Go", topics=("cli",), node_id=None, created_at=None):
+    """造一条 REST /repos/{full_name} 响应（字段对齐入库子集，与 Search item 同构）。
+
+    created_at（T-033）：GitHub 创建时间，缺省 None（真实响应必有，测试默认不给以锁定"缺失不中断"）。"""
+    item = {
         "full_name": full_name,
         "node_id": node_id or f"node-{full_name}",
         "description": description,
@@ -29,6 +31,9 @@ def make_repo_item(full_name, *, stars=42, description="demo", language="Go", to
         "topics": list(topics),
         "stargazers_count": stars,
     }
+    if created_at is not None:
+        item["created_at"] = created_at
+    return item
 
 
 class FakeRepoClient:
@@ -145,6 +150,33 @@ def test_follow_new_repo_joins_pool(tmp_path):
     assert (snap["captured_at"], snap["stars"]) == (NOW, 66)  # 基线快照：增量两端从这里起算
     assert conn.execute("SELECT created_at FROM follows WHERE repo_id = ?", (row["id"],)).fetchone()[0] == NOW
     conn.close()
+
+
+def test_follow_join_stores_github_created_at(tmp_path):
+    """T-033：关注动态入池 → REST created_at 归一化入 repos.github_created_at（带毫秒变体剥毫秒为定长）；
+    缺失/畸形 → NULL 且不中断（采集主链路不因展示字段断）。"""
+    conn = _open_db(tmp_path)
+    client = FakeRepoClient(items={"a/join": make_repo_item("a/join", created_at="2024-05-01T10:00:00.123Z")})
+    _follow(conn, client, "a/join")
+    row = conn.execute("SELECT github_created_at FROM repos WHERE full_name = 'a/join'").fetchone()
+    assert row["github_created_at"] == "2024-05-01T10:00:00Z"  # 毫秒剥除归一化（schema 定长硬约定）
+    conn.close()
+
+    conn2 = _open_db(tmp_path / "t2.db")
+    client2 = FakeRepoClient(
+        items={
+            "b/join": make_repo_item("b/join"),  # 缺失
+            "c/join": make_repo_item("c/join", created_at="not-a-date"),  # 畸形
+        }
+    )
+    _follow(conn2, client2, "b/join")
+    _follow(conn2, client2, "c/join")
+    rows2 = {
+        r["full_name"]: r["github_created_at"]
+        for r in conn2.execute("SELECT full_name, github_created_at FROM repos")
+    }
+    assert rows2["b/join"] is None and rows2["c/join"] is None  # 缺失/畸形存 NULL 不中断
+    conn2.close()
 
 
 def test_repeat_follow_is_idempotent(tmp_path):

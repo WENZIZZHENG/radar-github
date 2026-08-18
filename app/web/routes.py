@@ -62,6 +62,7 @@ from app.report import (
     Board,
     ReportRow,
     RisingRow,
+    _created_year,
     compute_boards,
     compute_repo_deltas,
     load_board_cache,
@@ -352,6 +353,7 @@ def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_o
                 "stars_text": None if stars is None else _fmt_stars(stars),
                 "endpoint_note": _endpoint_note(captured_at),
                 "window_note": window_note,
+                "created_year": _created_year(r["github_created_at"]),  # T-033：创建年份小灰字数据源
             }
         )
     return cards
@@ -397,6 +399,7 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict, summa
                     "tags": tags.get(r["full_name"], []),
                     "endpoint_note": r["endpoint_note"],
                     "window_note": r["window_note"],
+                    "created_year": r["created_year"],  # T-033：创建年份小灰字数据源（None → 不渲染）
                     # T-017（§8.1/§8.2）：关注页长期盯梢语境 → 总星维度文本；行内按钮按 total 操作
                     "reason_dim": "total",
                     "reason_period_label": "all",
@@ -533,6 +536,7 @@ def _row_view(
         "tags": tags.get(row.full_name, []),
         "endpoint_note": _endpoint_note(row.captured_at),
         "window_note": window_note,
+        "created_year": row.created_year,  # T-033：创建年份小灰字数据源（None → 模板不渲染标注）
         "reason_dim": reason_dim,
         "reason_period_label": reason_period_label,
         "reason_label": reason_label,
@@ -564,6 +568,7 @@ def _rising_row_view(rank: int, row: RisingRow, **row_ctx) -> dict:
         "tags": row_ctx["tags"].get(row.full_name, []),
         "endpoint_note": _endpoint_note(row.captured_at),
         "window_note": None,
+        "created_year": row.created_year,  # T-033：创建年份小灰字数据源（None → 模板不渲染标注）
         "reason_dim": row_ctx["reason_dim"],
         "reason_period_label": row_ctx["reason_period_label"],
         "reason_label": row_ctx["reason_label"],
@@ -584,6 +589,10 @@ def _board_view(board: Board, **row_ctx) -> dict:
         # T-018 新区：小字说明按页面期次取名义窗口天数（周 7/季 90）；total 口径新区恒空不渲染
         "rising_days": _NOMINAL_DAYS.get(row_ctx["period"]),
         "rising_rows": [_rising_row_view(i + 1, r, **row_ctx) for i, r in enumerate(board.rising_rows)],
+        # T-033 新项目区（决策 5）：行复用 _row_view（与主榜行同形态，增量列 = 窗口增量）；
+        # main_note 为主榜区头文案（周/季"按本期增星排序"、total"按总星排序"，§16.1 对仗区头）
+        "fresh_rows": [_row_view(i + 1, r, **row_ctx) for i, r in enumerate(board.fresh)],
+        "main_note": "按本期增星排序" if row_ctx["period"] != "total" else "按总星排序",
     }
 
 
@@ -717,14 +726,16 @@ def _boards_context(
         notice = None
         effective_period = period
         if period in _NOMINAL_DAYS and all(
-            not b.rows and not (b.count or 0) and not b.rising_rows for b in boards
+            not b.rows and not (b.count or 0) and not b.rising_rows and not b.fresh for b in boards
         ):
-            # 首期空态降级（流程说明 §4，T-018 起主榜＋新区全空才降级）：增量榜全缺席 → 显示总星榜 + 顶部提示条
+            # 首期空态降级（流程说明 §4，T-018 起主榜＋新区全空才降级；T-033 起含新项目区：三区全空才降级）：
+            # 增量榜全缺席 → 显示总星榜 + 顶部提示条
             # （判定原样跑在缓存 boards 上：缓存 count 恒 None，本式退化为全量模式原判定；单榜模式
             #   count 参与判定恢复两模式恒等（k3 初审 F2-1）：全量模式 count 恒 None，not (b.count or 0)
             #   恒真，本式退化为原判定；单榜模式非当前榜 count=min(归桶出席数, top_n)，count>0 ⟺ 归桶非空
             #   ⟺ 全量模式该榜 rows 非空（bucket 非空则 _top 至少 1 行）——两模式"主榜＋新区全空"逐榜等价，
-            #   单榜空榜 URL 不再误触发降级）
+            #   单榜空榜 URL 不再误触发降级。单榜模式非当前榜 fresh 恒空列表（T-033 决策 6）、当前榜 fresh
+            #   全量——全库无出席仓时新项目区必然全空，not b.fresh 恒真，判定等价性不受 fresh 影响）
             # T-027 降级：先试 total 缓存（仅当前期次——其 as_of≈now、同库状态等价）；None 或历史期次
             # 才实时算（历史期次降级须按请求 as_of 口径，不能用采集时刻缓存）
             cached_total = load_board_cache(conn, period="total", label="all") if use_cache else None
@@ -893,7 +904,7 @@ def follows_page(request: Request) -> HTMLResponse:
     conn = get_conn()
     try:
         follow_rows = conn.execute(
-            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead"
+            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead, r.github_created_at"
             " FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
         ).fetchall()
         cards = _follow_cards(conn, follow_rows, now.strftime(_ISO_FMT))
@@ -1185,6 +1196,7 @@ def _tag_row_view(
         "tags": tags.get(row["full_name"], []),
         "endpoint_note": _endpoint_note(captured_at),
         "window_note": None,
+        "created_year": _created_year(row["github_created_at"]),  # T-033：创建年份小灰字数据源
         "reason_dim": "total",
         "reason_period_label": "all",
         "reason_label": _reason_label("total", "all"),
@@ -1232,7 +1244,7 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
     conn = get_conn()
     try:
         rows = conn.execute(
-            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead"
+            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead, r.github_created_at"
             " FROM tags t JOIN repos r ON r.id = t.repo_id WHERE t.tag = ?",
             (tag,),
         ).fetchall()
@@ -1376,8 +1388,9 @@ async def api_translate_missing() -> dict:
 def _pending_translate_in_scope(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """批量补译候选：范围集 S 内 description_zh IS NULL 且英文非空无 CJK 的仓库（评审 F1-1 收窄）。
 
-    与每日 ensure 翻译段同一范围口径（_scope_sets：三口径榜 Top50 去重 ∪ 关注集）；空描述/CJK 跳过
-    口径照旧（SQL 预过滤 NULL/空串，Python 过 has_cjk）；分块防旧 SQLite 变量上限。
+    与每日 ensure 翻译段同一范围口径（_scope_sets：三口径榜（主榜 Top50 ∪ 新崛起区 Top10 ∪ 新项目区
+    Top20）去重 ∪ 关注集）；空描述/CJK 跳过口径照旧（SQL 预过滤 NULL/空串，Python 过 has_cjk）；
+    分块防旧 SQLite 变量上限。
     """
     listed_by_period, follow_names = _scope_sets(conn, now=datetime.now(timezone.utc))
     scope_names = list(follow_names)
@@ -1630,6 +1643,7 @@ async def api_recommend(
 def _recommend_missing_count(conn: sqlite3.Connection) -> int:
     """批量补缺 total：S × 适用维度中 (repo_id, dimension, period_label) 行缺失数。
 
+    S = 三口径榜（主榜 Top50 ∪ 新崛起区 Top10 ∪ 新项目区 Top20）去重 ∪ 关注集（_scope_sets 同源）；
     纯 DB 判定（不含 README sha 变更重生——那是每日 ensure 自动口径；批量 refresh=False 只补缺失），
     与 worker 实际补缺判定一致，保证进度 X ≤ T 恒成立。
     """

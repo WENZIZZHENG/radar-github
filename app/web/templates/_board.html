@@ -1,10 +1,11 @@
-{# 单张榜：榜头（分类名 + 实际数量）+ 项目行（紧凑单行，_row.html 与 P6 共用）+ 详情面板（默认全部展开，D1/D3 v1.1）。
+{# 单张榜：榜头（分类名 + 实际数量）+ 三段（新崛起区 → 新项目区 → 主榜，T-033 §16）+ 详情面板（默认全部展开，D1/D3 v1.1）。
    榜头回顶部链接 T-021 §12.1 引入、v2.1（P4 纳入边栏）起全移除：榜单四页均有左侧边栏，P5/P6 不用本模板——
-   show_sidebar 恒 True，无死分支。 #}
+   show_sidebar 恒 True，无死分支。
+   三段区头对仗 h4（§16.1）：新崛起（绿，既有）／新项目（蓝，T-033）／主榜（灰，T-033 补对仗区头）；
+   新崛起/新项目空区不渲染（区头/说明全不出现，榜块本体照常），主榜区头恒渲染（§16.2）。
+   idx 偏移（面板 data-b/data-i 定位不撞行）：新崛起区接主榜行数后、新项目区再接新崛起行数后。 #}
 <div class="board" id="{{ b.anchor }}">
   <h3>{{ b.label }}<span class="n">Top {{ b.rows | length }}</span></h3>
-  {# T-030 新崛起区（决策 4 v2）：榜头之后、主榜行之前分区展示（T-030 换序，§9.1 v2.5）；空区不渲染（区头/说明全不出现，榜块本体照常）。
-     行复用 _row.html；idx 接主榜行数后偏移（面板 data-b/data-i 定位不撞主榜行）。 #}
   {% if b.rising_rows %}
   <div class="rising">
     <h4 class="rising-h">新崛起 · 入池未满一个统计窗口<span class="n">Top {{ b.rising_rows | length }}</span></h4>
@@ -12,8 +13,17 @@
     {% for r in b.rising_rows %}{% set anchor = b.anchor %}{% set idx = b.rows | length + loop.index0 %}{% include "_row.html" %}{% endfor %}
   </div>
   {% endif %}
-  {% for r in b.rows %}{% set anchor = b.anchor %}{% set idx = loop.index0 %}{% include "_row.html" %}{% else %}
-  {# 空榜也渲染板块（示意图口径：0 也列出板块） #}
-  <p class="board-empty">本期暂无数据</p>
-  {% endfor %}
+  {% if b.fresh_rows %}
+  <div class="newzone">
+    <h4 class="zone-h fresh">新项目 · 创建未满 1 年<span class="n">Top {{ b.fresh_rows | length }}</span></h4>
+    {% for r in b.fresh_rows %}{% set anchor = b.anchor %}{% set idx = b.rows | length + b.rising_rows | length + loop.index0 %}{% include "_row.html" %}{% endfor %}
+  </div>
+  {% endif %}
+  <div class="mainzone">
+    <h4 class="zone-h main">主榜 · {{ b.main_note }}<span class="n">Top {{ b.rows | length }}</span></h4>
+    {% for r in b.rows %}{% set anchor = b.anchor %}{% set idx = loop.index0 %}{% include "_row.html" %}{% else %}
+    {# 空榜也渲染板块（示意图口径：0 也列出板块） #}
+    <p class="board-empty">本期暂无数据</p>
+    {% endfor %}
+  </div>
 </div>

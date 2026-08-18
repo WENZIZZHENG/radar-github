@@ -146,14 +146,18 @@ h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 }
 .board > h3 .top:hover { color: var(--blue); background: rgba(88,166,255,.08); }
 
-/* ===== T-018 新崛起区（决策 4 v2）：榜头之后、主榜行前分区展示（T-030 换序，§9.1 v2.5） ===== */
-.rising { border-top: 1px dashed var(--line); }
-.rising-h {
+/* ===== T-018 新崛起区（决策 4 v2）＋T-033 三段结构（§16：新崛起区 → 新项目区 → 主榜，对仗 h4 区头） =====
+   三区容器同为虚线上边分隔；区头颜色层次参照示意图：新崛起绿（--accent）/新项目蓝（--blue）/主榜灰（--text-2），
+   复用 :root token 不引入新色系 */
+.rising, .newzone, .mainzone { border-top: 1px dashed var(--line); }
+.rising-h, .zone-h {
   display: flex; align-items: center; gap: var(--s2);
-  font-size: 12.5px; font-weight: 600; color: var(--accent);
-  padding: 8px var(--s4) 0;
+  font-size: 12.5px; font-weight: 600; padding: 8px var(--s4) 0;
 }
-.rising-h .n { font-family: var(--font-mono); color: var(--text-3); font-weight: 400; font-size: 11.5px; }
+.rising-h { color: var(--accent); }
+.zone-h.fresh { color: var(--blue); }  /* 新项目区（T-033） */
+.zone-h.main { color: var(--text-2); }  /* 主榜区头（T-033 补对仗，与新区/新崛起语法统一） */
+.rising-h .n, .zone-h .n { font-family: var(--font-mono); color: var(--text-3); font-weight: 400; font-size: 11.5px; }
 .rising-note { padding: 3px var(--s4) 0; font-size: 12px; color: var(--text-3); }
 /* 新区增量列"+X（入池 N 天）"比主榜 74px 定宽长：自适应宽＋禁折行（k3 视觉抽验：375px 下词中断三行修复） */
 .rising .row .up { width: auto; white-space: nowrap; }
@@ -177,6 +181,11 @@ h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 .row .chev { flex: none; color: var(--text-3); transition: transform var(--t-mid) ease, color var(--t-fast) ease; }
 .row:hover .chev { color: var(--text-2); }
 .row.expanded .chev { transform: rotate(90deg); color: var(--accent-hi); }
+/* 创建年份小灰字（T-033 §16：全名旁，未回填不渲染该 span；示意图口径） */
+.row .year {
+  flex: none; font-family: var(--font-mono); font-size: 11px; color: var(--text-3);
+  white-space: nowrap;
+}
 .badge {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   font-size: 11px; color: var(--text-2); border: 1px solid var(--line); border-radius: var(--r-pill);
@@ -268,6 +277,7 @@ footer.note { margin-top: var(--s6); font-size: 12px; line-height: 1.7; color: v
   .row .rank { width: 14px; font-size: 10px; }
   .row .chev { display: none; }  /* 窄屏省 19px 给仓库名；整行可点不变 */
   .row .repo { font-size: 12px; }
+  .row .year { font-size: 10px; }  /* T-033：年份小灰字窄屏同步缩小（示意图口径） */
   .badge { font-size: 10px; padding: 1px 6px; gap: 4px; }
   .badge .dot { width: 7px; height: 7px; }
   .row .up { width: 52px; font-size: 12px; }

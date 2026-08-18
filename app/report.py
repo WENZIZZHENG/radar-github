@@ -14,6 +14,10 @@
 - 新崛起区（决策 4 v2）：在池跨度不足最小窗口的缺席仓（真·新入池）进新区——在池增量 = 端点星数 −
   最旧基线快照星数，在池天数 = 两端间隔，按在池增量降序 Top 10 分区展示（与主榜不混排）；
   采集停机致跨窗空洞（在池天数 > 窗口上限）的缺席老仓不进新区，回 v1 两不见（F2-1 收窄）；
+- 新项目区（T-033 决策 4）：出席仓中 GitHub 创建未满 1 年（as_of − github_created_at < 365 天）且未进
+  本榜主榜 Top 50 的仓，周/季按窗口增量、total 按总星降序 Top 20 分区展示（与主榜不混排）；
+  github_created_at 未回填（NULL）一律不进；缺席仓归新崛起区、出席仓才有机会进本区，两区天然互斥；
+  同一仓库在同一张榜内三区只出现一次（与主榜按 full_name 去重）；
 - 负增量正常参与排序（降序下自然沉底）；dead=1 仓库全部剔除；
 - 总星榜 = as_of 之前最新快照星数降序，无增量、无窗口概念。
 
@@ -50,6 +54,8 @@ PERIODS: tuple[str, ...] = ("week", "quarter", "total")
 ABSENT_FIRST_WEEK = "first_week"  # 缺席原因：不满最小窗口跨度（含只有一个快照），口径上统称"首周缺席"
 
 _RISING_TOP_N = 10  # 新崛起区每分类榜行数上限（决策 4 v2 钉死：Top 10，不足按实际）
+_FRESH_MAX_AGE_DAYS = 365  # 新项目区准入：GitHub 创建满 1 年即出区（T-033 决策 3，天数差口径同窗口）
+_FRESH_ZONE_TOP_N = 20  # 新项目区每分类榜行数上限（T-033 决策 4：Top 20，不足按实际）
 
 _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长，字典序即时间序
 
@@ -108,7 +114,10 @@ class RepoDelta:
 
 @dataclass(frozen=True)
 class ReportRow:
-    """榜单行：T-008 页面层每行需要的最小字段集（frozen，可安全跨榜共享同一实例）。"""
+    """榜单行：T-008 页面层每行需要的最小字段集（frozen，可安全跨榜共享同一实例）。
+
+    created_year（T-033）：GitHub 创建年份（github_created_at 前 4 位），NULL 未回填 → None（模板不渲染标注）。
+    """
 
     full_name: str
     description_en: str | None
@@ -117,11 +126,15 @@ class ReportRow:
     delta: int | None  # 增量；总星榜恒 None
     window_days: float | None  # 实际窗口跨度天数；总星榜恒 None；首周缺席项目不出现在榜行中
     captured_at: str | None = None  # 端点（最近）快照时间（UTC 定长 ISO）；T-020 页面端点日期标注用，透传不计算
+    created_year: int | None = None  # T-033：GitHub 创建年份标注数据源，透传不计算
 
 
 @dataclass(frozen=True)
 class RisingRow:
-    """新崛起区行（决策 4 v2）：主榜出席校验失败且在池天数 < 最小窗口（真·新入池）的缺席仓，按在池增量排序分区展示。"""
+    """新崛起区行（决策 4 v2）：主榜出席校验失败且在池天数 < 最小窗口（真·新入池）的缺席仓，按在池增量排序分区展示。
+
+    created_year（T-033）：GitHub 创建年份，NULL 未回填 → None（模板不渲染标注）。
+    """
 
     full_name: str
     description_en: str | None
@@ -130,6 +143,7 @@ class RisingRow:
     pool_delta: int  # 在池增量 = 端点星数 − 入池基线（最旧一张快照）星数；允许为负
     pool_days: float  # 在池天数 = 端点与基线两端间隔（天，保留 1 位小数同 window_days 精度）
     captured_at: str | None = None  # 端点（最近）快照时间（UTC 定长 ISO）；T-020 页面端点日期标注用，透传不计算
+    created_year: int | None = None  # T-033：GitHub 创建年份标注数据源，透传不计算
 
 
 @dataclass(frozen=True)
@@ -138,6 +152,8 @@ class Board:
 
     rising_rows（T-018 决策 4 v2）：新崛起区行——在池跨度不足最小窗口的缺席仓按在池增量降序 Top 10，
     分区展示不与主榜混排；跨窗空洞缺席老仓不收（准入判定见 compute_boards）；total 口径恒空（无缺席概念）。
+    fresh（T-033 决策 5）：新项目区行——出席且创建 < 365 天且不在本榜主榜 Top 50 的仓，周/季按窗口增量、
+    total 按总星降序 Top 20；未回填（NULL）不进；total 口径有本区（无缺席概念，准入仅年龄）；缺省空列表。
     count（T-026 单榜整页 §13.1）：full_keys 模式下非当前榜只归桶计数不建行对象——rows 空、count=主榜行数，
     供边栏徽标；全量模式恒 None（徽标直接用 len(rows)）。
     """
@@ -147,12 +163,24 @@ class Board:
     label: str  # 展示名：语言用 GitHub 精确名（"Java"…），主题用词表 label，两个兜底榜为"其它语言"/"其他"
     rows: list[ReportRow]
     rising_rows: list[RisingRow] = field(default_factory=list)
+    fresh: list[ReportRow] = field(default_factory=list)  # T-033：新项目区行（放 rising 后）
     count: int | None = None  # T-026：单榜整页模式下非当前榜的主榜行数；None = 全量模式
 
 
 def _parse_iso(ts: str) -> datetime:
     """按 schema 定长硬约定解析；带偏移或缺秒的变体直接报错，不静默容错（比较语义全靠定长）。"""
     return datetime.strptime(ts, _ISO_FORMAT).replace(tzinfo=timezone.utc)
+
+
+def _created_year(ts: str | None) -> int | None:
+    """github_created_at（定长 ISO，schema 硬约定）→ 年份；NULL → None（模板不渲染标注）。
+
+    前 4 位即年份（定长硬约定，字典序即时间序）；畸形值 int() 抛 ValueError fail-loud
+    （写入方归一化保证，与 _parse_iso 同姿态）。
+    """
+    if ts is None:
+        return None
+    return int(ts[:4])
 
 
 def _endpoint_snapshot(conn: sqlite3.Connection, repo_id: int, before: str) -> sqlite3.Row | None:
@@ -273,6 +301,36 @@ def _rising_top(rows: list[RisingRow], top_n: int) -> list[RisingRow]:
     return ordered[:top_n]
 
 
+def _fresh_zone(
+    bucket: list[ReportRow],
+    main_names: set[str],
+    created_by_name: dict[str, str | None],
+    as_of_dt: datetime,
+    period: str,
+) -> list[ReportRow]:
+    """新项目区（T-033 决策 4）：出席（bucket 恒出席）∧ 创建 < 365 天 ∧ 不在本榜主榜 Top 50，按口径 Top 20。
+
+    - 主榜截断先做（main_names 由调用方传主榜 Top50 的 full_name），排除后剩余候选再排序——兑现
+      "凭实力进主榜则不在新区重影"的三段流水线语义；
+    - github_created_at 为 NULL（未回填）的仓一律不进：NULL 语义是"未知"，未知不冒充新项目；
+    - 年龄 = as_of − github_created_at 天数差（.days 下取整），满 365 天即出区（边界：差 364.999 天进、365 天不进）；
+    - 排序与截断复用 _top（周/季按增量、total 按总星，次序键同主榜），不足按实际不补位。
+    """
+    fresh = []
+    for r in bucket:
+        if r.full_name in main_names:
+            continue
+        created = created_by_name.get(r.full_name)
+        if created is None:
+            continue
+        # _parse_iso 同款 fail-loud：库内 github_created_at 由采集层归一化写入，畸形即数据事故
+        created_dt = _parse_iso(created)
+        if (as_of_dt - created_dt).days >= _FRESH_MAX_AGE_DAYS:
+            continue
+        fresh.append(r)
+    return _top(fresh, period, _FRESH_ZONE_TOP_N)
+
+
 def compute_boards(
     conn: sqlite3.Connection,
     topic_table: dict[str, TopicSpec],
@@ -294,19 +352,28 @@ def compute_boards(
     - 新崛起区（决策 4 v2）：准入＝在池跨度不足最小窗口的缺席仓（ABSENT_FIRST_WEEK 且 pool_days < win_min），
       按语言/主题同主榜归组、在池增量降序 Top 10（_RISING_TOP_N）；跨窗空洞缺席老仓（pool_days > win_max）
       不进新区（回 v1 两不见）；total 口径无缺席概念恒空；
+    - 新项目区（T-033 决策 4）：出席仓中 github_created_at 非 NULL 且 as_of − 创建时间 < 365 天
+      （_FRESH_MAX_AGE_DAYS）且不在本榜主榜 Top 50（先 _top 出主榜再按 full_name 排除），按语言/主题
+      同主榜归组、周/季按窗口增量、total 按总星降序 Top 20（_FRESH_ZONE_TOP_N）；跨榜重复与主榜同口径；
+      三区互斥：缺席仓归新崛起区、出席仓才有机会进新项目区、进主榜即从新区剔除——同仓同榜只出现一次；
     - full_keys（T-026 单榜整页 §13.1）：非 None 时仅指定榜 key（"kind-key" 形态，如 "language-java"）的榜
       构建主榜行对象（rows），其余榜只归桶计数（rows 空、count=min(出席数, top_n)——与全量模式徽标
       len(rows) 截断语义一致，两模式徽标不因 >top_n 漂移）——单榜模式的边栏徽标数据源；省的是 _top 排序＋
       行视图装配＋模板渲染（传输体积），归桶与 compute_repo_deltas 仍全量（徽标计数/降级判定需要）；
-      新区行保持全量计算（缺席仓量级小，且降级判定"主榜＋新区全空才降级"需要全库新区信息）；
+      新崛起区行保持全量计算（缺席仓量级小，且降级判定"主榜＋新崛起区＋新项目区全空才降级"需要全库
+      新区信息）；新项目区按全量计算、装配时仅指定榜取用（其余榜 fresh 恒空列表、不计数——T-033 决策 6）；
       None = 既有全量行为（count 恒 None）。
     """
     as_of = as_of or utc_now_iso()
+    as_of_dt = _parse_iso(as_of)
     deltas = compute_repo_deltas(conn, period=period, as_of=as_of)
-    # 榜单行字段一次取全；dead 剔除下推 SQL，与 compute_repo_deltas 同一过滤口径
+    # 榜单行字段一次取全；dead 剔除下推 SQL，与 compute_repo_deltas 同一过滤口径。
+    # github_created_at（T-033）供 created_year 标注与新项目区年龄准入；repos 小表全列取无 SQL 红线问题
     repos = conn.execute(
-        "SELECT id, full_name, description_en, language, topics FROM repos WHERE dead = 0"
+        "SELECT id, full_name, description_en, language, topics, github_created_at FROM repos WHERE dead = 0"
     ).fetchall()
+    # 新项目区按 full_name 反查创建时间：同库 full_name 唯一（repos UNIQUE 索引），去重安全（决策 4）
+    created_by_name = {repo["full_name"]: repo["github_created_at"] for repo in repos}
 
     lang_buckets: dict[str, list[ReportRow]] = {key: [] for key in (*LANGUAGES.values(), OTHER_LANGUAGE_KEY)}
     topic_buckets: dict[str, list[ReportRow]] = {key: [] for key in (*topic_table, OTHER_TOPIC_KEY)}
@@ -322,6 +389,7 @@ def compute_boards(
             delta=info.delta,
             window_days=info.window_days,
             captured_at=info.captured_at,  # T-020：端点日期标注数据源，透传不计算
+            created_year=_created_year(repo["github_created_at"]),  # T-033：创建年份标注数据源，透传不计算
         )
         lang_buckets[classify_language(repo["language"])].append(row)
         # topics 由写入方 json.dumps 落库（schema 默认 '[]'）；单行脏数据直接抛错属 fail-loud
@@ -358,6 +426,7 @@ def compute_boards(
                 pool_delta=info.stars - base["stars"],
                 pool_days=pool_days,
                 captured_at=info.captured_at,  # T-020：端点日期标注数据源，透传不计算
+                created_year=_created_year(repo["github_created_at"]),  # T-033：创建年份标注数据源，透传不计算
             )
             rising_lang[classify_language(repo["language"])].append(row)
             hit_keys = classify_topics(json.loads(repo["topics"]), topic_table)
@@ -366,19 +435,32 @@ def compute_boards(
 
     rising_lang_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_lang.items()}
     rising_topic_top = {key: _rising_top(rows, _RISING_TOP_N) for key, rows in rising_topic.items()}
+    # T-033 新项目区（决策 4）：每桶先 _top 出主榜 Top top_n，再从剩余出席且创建 < 365 天的仓里
+    # 按同排序键取 Top 20（_fresh_zone 内部完成排除＋截断）；三口径都有本区（total 无缺席概念，
+    # 准入仅年龄∧不在主榜）；跨榜重复与主榜同口径（每命中榜各出现一次）。
+    fresh_lang_top = {
+        key: _fresh_zone(rows, {r.full_name for r in _top(rows, period, top_n)}, created_by_name, as_of_dt, period)
+        for key, rows in lang_buckets.items()
+    }
+    fresh_topic_top = {
+        key: _fresh_zone(rows, {r.full_name for r in _top(rows, period, top_n)}, created_by_name, as_of_dt, period)
+        for key, rows in topic_buckets.items()
+    }
     # T-026 单榜整页（§13.1）：full_keys 非 None 时仅指定榜构建主榜行对象，其余榜只归桶计数
     # （rows 空、count=主榜行数，min(len, top_n) 与全量模式徽标 len(rows) 同语义——_top 截断后长度
     # 恰为 min(出席数, top_n)，两模式徽标不因 >50 仓/榜漂移）；新区行全量（缺席仓量级小，
-    # 且降级判定"主榜＋新区全空才降级"需要全库新区信息，不能按 full_keys 收窄）
+    # 且降级判定"主榜＋新崛起区＋新项目区全空才降级"需要全库新区信息，不能按 full_keys 收窄）；
+    # 新项目区按全量算、装配时仅指定榜取用（其余榜 fresh 恒空列表——T-033 决策 6）
     def _full(kind: str, key: str) -> bool:
         return full_keys is None or f"{kind}-{key}" in full_keys
 
     def _board(kind: str, key: str, label: str, lang: bool) -> Board:
         bucket = lang_buckets[key] if lang else topic_buckets[key]
         rising = rising_lang_top[key] if lang else rising_topic_top[key]
+        fresh = fresh_lang_top[key] if lang else fresh_topic_top[key]
         if _full(kind, key):
-            return Board(kind, key, label, _top(bucket, period, top_n), rising)
-        return Board(kind, key, label, [], rising, count=min(len(bucket), top_n))
+            return Board(kind, key, label, _top(bucket, period, top_n), rising, fresh)
+        return Board(kind, key, label, [], rising, [], count=min(len(bucket), top_n))
 
     boards: list[Board] = [_board("language", key, name, True) for name, key in LANGUAGES.items()]
     boards.append(_board("language", OTHER_LANGUAGE_KEY, "其它语言", True))
@@ -393,7 +475,11 @@ def compute_boards(
 
 
 def _board_to_payload(boards: list[Board]) -> str:
-    """list[Board] → JSON 字符串。Board.count 不存（全量模式恒 None，还原时置 None）。"""
+    """list[Board] → JSON 字符串。Board.count 不存（全量模式恒 None，还原时置 None）。
+
+    T-033：白名单显式展开 fresh 与 created_year（手工白名单风格不变——新增字段未写进白名单时
+    反序列化缺键直接报错 fail-loud）。
+    """
     return json.dumps(
         [
             {
@@ -409,6 +495,7 @@ def _board_to_payload(boards: list[Board]) -> str:
                         "delta": r.delta,
                         "window_days": r.window_days,
                         "captured_at": r.captured_at,
+                        "created_year": r.created_year,
                     }
                     for r in b.rows
                 ],
@@ -421,8 +508,22 @@ def _board_to_payload(boards: list[Board]) -> str:
                         "pool_delta": r.pool_delta,
                         "pool_days": r.pool_days,
                         "captured_at": r.captured_at,
+                        "created_year": r.created_year,
                     }
                     for r in b.rising_rows
+                ],
+                "fresh": [
+                    {
+                        "full_name": r.full_name,
+                        "description_en": r.description_en,
+                        "language": r.language,
+                        "stars": r.stars,
+                        "delta": r.delta,
+                        "window_days": r.window_days,
+                        "captured_at": r.captured_at,
+                        "created_year": r.created_year,
+                    }
+                    for r in b.fresh
                 ],
             }
             for b in boards
@@ -435,6 +536,7 @@ def _board_from_payload(raw: str) -> list[Board]:
     """JSON 字符串 → list[Board]（frozen dataclass，与 compute_boards 返回同型，count 恒 None）。
 
     字段显式展开不撒 **row：白名单缺字段时 KeyError fail-loud，与序列化白名单互为镜像。
+    T-033：旧缓存缺 fresh/created_year 键按此口径报错（部署后重跑预计算刷新）。
     """
     boards = []
     for item in json.loads(raw):
@@ -452,6 +554,7 @@ def _board_from_payload(raw: str) -> list[Board]:
                         delta=row["delta"],
                         window_days=row["window_days"],
                         captured_at=row["captured_at"],
+                        created_year=row["created_year"],
                     )
                     for row in item["rows"]
                 ],
@@ -464,8 +567,22 @@ def _board_from_payload(raw: str) -> list[Board]:
                         pool_delta=row["pool_delta"],
                         pool_days=row["pool_days"],
                         captured_at=row["captured_at"],
+                        created_year=row["created_year"],
                     )
                     for row in item["rising_rows"]
+                ],
+                fresh=[
+                    ReportRow(
+                        full_name=row["full_name"],
+                        description_en=row["description_en"],
+                        language=row["language"],
+                        stars=row["stars"],
+                        delta=row["delta"],
+                        window_days=row["window_days"],
+                        captured_at=row["captured_at"],
+                        created_year=row["created_year"],
+                    )
+                    for row in item["fresh"]
                 ],
             )
         )
@@ -516,7 +633,7 @@ def precompute_boards(
     - label 按 as_of 日期换算（week_label/quarter_label；total 固定 'all'），与页面期次换算同一事实源；
     - 每口径落一行即 commit（save_board_cache 不提交事务）：部分口径失败不丢已算好的行，
       页面按 period 独立降级（缺哪口径实时算哪口径）；
-    - 返回摘要 dict {period: {"boards": 榜数, "rows": 主榜总行数, "rising": 新区总行数}} 供调用方记日志。
+    - 返回摘要 dict {period: {"boards": 榜数, "rows": 主榜总行数, "rising": 新崛起区总行数}} 供调用方记日志。
     """
     as_of = as_of or utc_now_iso()
     as_of_date = date.fromisoformat(as_of[:10])
@@ -564,12 +681,15 @@ if __name__ == "__main__":
             absent = sum(1 for d in deltas.values() if d.absent_reason is not None)
             print(f"\n=== {period}：有快照仓库 {len(deltas)}，缺席 {absent}，出席 {len(deltas) - absent} ===")
             for board in compute_boards(conn, table, period=period, as_of=as_of):
-                print(f"[{board.kind}:{board.key}] {board.label} Top{len(board.rows)} 新区{len(board.rising_rows)}")
+                print(f"[{board.kind}:{board.key}] {board.label} Top{len(board.rows)} 新区{len(board.rising_rows)} 新项目{len(board.fresh)}")
                 for r in board.rows[:3]:
                     delta_text = "——" if r.delta is None else f"{r.delta:+d}"
                     window_text = "" if r.window_days is None else f" 窗口{r.window_days}天"
-                    print(f"    {r.full_name} 星{r.stars} 增量{delta_text}{window_text}")
+                    year_text = "" if r.created_year is None else f" 创建{r.created_year}"
+                    print(f"    {r.full_name} 星{r.stars} 增量{delta_text}{window_text}{year_text}")
                 for r in board.rising_rows[:3]:
                     print(f"    新区 {r.full_name} 星{r.stars} 在池{r.pool_delta:+d}（{r.pool_days:g}天）")
+                for r in board.fresh[:3]:
+                    print(f"    新项目 {r.full_name} 星{r.stars} 创建{r.created_year}")
     finally:
         conn.close()

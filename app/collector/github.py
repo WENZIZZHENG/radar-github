@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -80,6 +81,25 @@ class GitHubNotFoundError(GitHubError):
 def utc_now_iso() -> str:
     """UTC 定长时间戳（schema 硬约定 YYYY-MM-DDTHH:MM:SSZ）：字典序即时间序，入库与留痕统一用它。"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# GitHub 创建时间归一化：GraphQL createdAt 返回带毫秒变体（2024-01-15T08:30:00.123Z），
+# REST created_at 返回定长（2015-07-13T16:40:38Z）；schema 硬约定统一存定长，字典序比较全靠它
+_CREATED_AT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z$")
+
+
+def normalize_github_created_at(raw: str | None) -> str | None:
+    """GitHub 返回的仓库创建时间 → schema 定长 ISO 8601 UTC（`%Y-%m-%dT%H:%M:%SZ`，与 _parse_iso 同口径）。
+
+    带毫秒的 GraphQL 变体剥毫秒归一；缺失/畸形返回 None——采集主链路不因一个展示字段中断
+    （新项目区准入把 NULL 一律排除，属既定降级而非静默吞数据）。
+    """
+    if not raw:
+        return None
+    m = _CREATED_AT_RE.match(raw)
+    if m is None:
+        return None
+    return f"{m.group(1)}Z"
 
 
 def search_wait_seconds(last_call_at: float | None, now: float, min_interval: float) -> float:
