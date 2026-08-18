@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+{# P8 智能搜索（T-034 §17，示意图 v5 形态）：元信息行 → 大输入框 → 意图透明行 → 结果列表（行复用 _row.html） #}
+<p class="meta">基于池内 <b class="mono">{{ tracked }}</b> 个仓库（≥1000 星）本地检索 · 池内不足 10 条时 GitHub Search 实时补搜（池内在前、池外在后） · 检索走本地 SQL / GitHub API，AI 只做意图理解与精选 · 不建搜索缓存</p>
+
+<section>
+  <h2 class="sec">搜索</h2>
+  {# 表单 POST 服务端同步执行（§17.2 主路径）；提交瞬间按钮置灰"搜索中…"由 radar.js 处理（加载态） #}
+  <form class="search-box" id="search-form" method="post" action="/search">
+    <input id="search-input" name="q" type="text" value="{{ q }}" placeholder="说说你想做什么，如：我要做爬虫" aria-label="搜索输入" maxlength="200" required{% if unavailable %} disabled{% endif %}>
+    <button type="submit" id="search-btn"{% if unavailable %} disabled title="DeepSeek API key 未配置"{% endif %}>搜索</button>
+  </form>
+
+  {# DeepSeek key 未配置（GET 页面直接判定，spec AI 降级姿态 fail-loud；榜单等主链路不受影响） #}
+  {% if unavailable %}
+  <p class="notice" role="status">搜索暂不可用（AI 未配置）：请在项目根 .env 配置 DEEPSEEK_API_KEY 后重启服务。榜单浏览等主功能不受影响。</p>
+  {% endif %}
+
+  {% if search %}
+    {% if search.unavailable %}
+    {# 执行期 AI 不可用（key 失效/余额/调用失败，§17.3）：fail-loud 提示，主链路不受影响 #}
+    <p class="notice" role="status">搜索暂不可用：{{ search.unavailable_reason }}（榜单浏览等主功能不受影响）</p>
+    {% else %}
+    {# 意图透明行（§17.1）：LLM 解析结果如实展示（含退化单关键词），可纠错可预期；语言空不渲染语言段 #}
+    <div class="intent-line">
+      <span><b>理解为：</b>{% for kw in search.intent.keywords %}{% if not loop.first %}、{% endif %}<span class="kw">{{ kw }}</span>{% endfor %}</span>
+      {% if search.intent.languages %}<span class="sep">／</span><span><b>语言：</b>{% for l in search.intent.languages %}{% if not loop.first %}、{% endif %}<span class="kw">{{ l }}</span>{% endfor %}</span>{% endif %}
+    </div>
+
+    {% if search.rows %}
+    <div class="boards">
+      <div class="board">
+        <h3>搜索结果<span class="n">{{ search.pool_count + search.external_count }} 条（池内 {{ search.pool_count }} · 池外 {{ search.external_count }}）</span></h3>
+        {# 行复用榜单行组件（_row.html，含详情面板体系）；池内在前、池外在后（排序钉死） #}
+        {% for r in search.rows %}{% set anchor = "s" %}{% set idx = loop.index0 %}{% include "_row.html" %}{% endfor %}
+      </div>
+    </div>
+    {% if search.external_failed %}
+    <p class="empty-follows">GitHub 实时补搜失败（限速或网络异常），仅展示池内 {{ search.pool_count }} 条结果。</p>
+    {% endif %}
+    {% else %}
+    {# 空结果如实说明（§17.1）：不硬编任何条目，带已理解的关键词/语言便于修正输入 #}
+    <p class="empty-follows">没有找到匹配「{{ search.intent.display_text }}」的项目，换个说法试试？</p>
+    {% if search.external_failed %}
+    <p class="empty-follows">GitHub 实时补搜失败（限速或网络异常），仅展示池内结果。</p>
+    {% endif %}
+    {% endif %}
+    {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

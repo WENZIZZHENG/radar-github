@@ -247,7 +247,7 @@ def test_candidates_page_rows_link_and_two_empty_states(tmp_path, monkeypatch):
     home = client.get("/").text
     assert 'href="/topic-candidates"' in home and "候选词" in home  # P1 元信息行入口（§15.1 小字链接）
     tabs = home[home.index('<nav class="tabs"') : home.index("</nav>")]
-    assert tabs.count("<a ") == 5  # 顶栏导航原样 5 项（§15.1：候选词不占顶栏，5 项上限不破）
+    assert tabs.count("<a ") == 6  # T-034：顶栏 5 → 6（新增"搜索"，§17.1 拍板；候选词仍不占顶栏）
 
     # 空态 A：扫描过但无候选（有 scan 记录，无候选行）
     conn = get_conn(db)

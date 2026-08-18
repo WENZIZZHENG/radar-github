@@ -919,3 +919,17 @@ document.addEventListener("click", (e) => {
     .forEach((c) => c.classList.toggle("on", (c.dataset.tag || "") === activeFollowTag));
   applyFollowTagFilter();
 });
+
+// ---- T-034 P8 搜索提交（§17.2 加载态）：表单同步提交（服务端 SSR 结果页），提交瞬间按钮置灰
+// "搜索中…"防连点——页面导航后无需恢复；输入为空由浏览器 required 拦截（此处防御不置灰） ----
+(() => {
+  const form = document.getElementById("search-form");
+  if (!form) return;
+  form.addEventListener("submit", () => {
+    const input = form.querySelector('input[name="q"]');
+    const btn = form.querySelector("#search-btn");
+    if (!btn || !input || !input.value.trim()) return; // 空输入（required 兜底）或不可用态：不置灰
+    btn.disabled = true;
+    btn.textContent = "搜索中…";
+  });
+})();

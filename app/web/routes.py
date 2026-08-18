@@ -28,6 +28,7 @@ import logging
 import re
 import sqlite3
 import threading
+import urllib.parse
 from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -70,6 +71,7 @@ from app.report import (
     quarter_label,
     week_label,
 )
+from app.search import run_search
 
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"  # 供 app.main 挂载 StaticFiles（/static）
@@ -1310,6 +1312,186 @@ async def _ai_client() -> AsyncIterator[DeepSeekClient]:
         yield client
     finally:
         await client.aclose()
+
+
+# ===== P8 智能搜索（T-034，§17；检索链路在 app.search，本层只做表单校验与行视图装配） =====
+
+# 搜索输入长度上限（服务端兜底，与 search.html input maxlength 同值）
+_SEARCH_QUERY_MAX_LEN = 200
+
+
+def _search_view(conn: sqlite3.Connection, result) -> dict:
+    """搜索结果模板视图：意图透明 + 行视图（_row.html 同字段契约，复用榜单行组件）。
+
+    池内行：无增量列（同总星榜行形态）、推荐理由 = LLM 精选理由（None = 精选退化粗排直出，如实无理由块）、
+    端点日期标注 = 最新快照日期、tags/概要走既有展示映射（复用详情面板体系）；
+    池外行：external=True（池外徽标、up 列"——"、无译文/概要、acts 区只留 GitHub 链接）、
+    行尾关注星走既有 /api/follows 三态接线（未入池动态入池）；followed 按库判定——补搜已排除在池仓、
+    关注必在池，池外行恒未关注，模板分支按 spec 场景防御（已在池/已关注不显示关注入口）。
+    """
+    if result.unavailable:
+        return {
+            "unavailable": True,
+            "unavailable_reason": result.unavailable_reason,
+            "intent": None,
+            "rows": [],
+            "pool_count": 0,
+            "external_count": 0,
+            "external_failed": False,
+        }
+    zh = dict(conn.execute("SELECT full_name, description_zh FROM repos WHERE description_zh IS NOT NULL").fetchall())
+    tags: dict[str, list[str]] = {}
+    for row in conn.execute("SELECT r.full_name, t.tag FROM tags t JOIN repos r ON r.id = t.repo_id ORDER BY t.tag"):
+        tags.setdefault(row["full_name"], []).append(row["tag"])
+    summaries = dict(
+        conn.execute(
+            "SELECT r.full_name, c.text FROM recommendations c JOIN repos r ON r.id = c.repo_id"
+            " WHERE c.dimension = 'summary' AND c.period_label = 'all'"
+        ).fetchall()
+    )
+    followed = {r["full_name"] for r in conn.execute("SELECT r.full_name FROM follows f JOIN repos r ON r.id = f.repo_id")}
+    rows = []
+    for i, hit in enumerate(result.pool_hits):
+        c = hit.candidate
+        rows.append(
+            {
+                "rank": i + 1,
+                "full_name": c.full_name,
+                "language": c.language,
+                "lang_color": LANG_COLORS.get(c.language or "", _DEFAULT_LANG_COLOR),
+                "dead": False,
+                "external": False,
+                "up_na_text": None,
+                "delta_text": None,  # 搜索无增量列概念（同总星榜行形态）
+                "delta_neg": False,
+                "stars_text": _fmt_stars(c.stars),
+                "followed": c.full_name in followed,
+                "description_en": c.description_en,
+                "description_zh": zh.get(c.full_name),
+                "reason": hit.reason,  # None → 无推荐理由块（精选退化，如实）
+                "summary": summaries.get(c.full_name),
+                "tags": tags.get(c.full_name, []),
+                "endpoint_note": _endpoint_note(c.captured_at),
+                "window_note": None,
+                "created_year": c.created_year,  # T-033：创建年份小灰字数据源
+                "reason_dim": "total",
+                "reason_period_label": "all",
+                "reason_label": "推荐理由",  # 搜索语境推荐理由块标题（LLM 精选理由，非榜单维度文本）
+                "show_recommend": False,  # 搜索页无行内生成按钮（§8.2 只在榜单四页出现）
+            }
+        )
+    for j, h in enumerate(result.external_hits):
+        rows.append(
+            {
+                "rank": len(result.pool_hits) + j + 1,  # 池外在池内之后（排序钉死，spec 决策 4）
+                "full_name": h.full_name,
+                "language": h.language,
+                "lang_color": LANG_COLORS.get(h.language or "", _DEFAULT_LANG_COLOR),
+                "dead": False,
+                "external": True,
+                "up_na_text": "——",  # 池外无增星数据，如实标注
+                "delta_text": None,
+                "delta_neg": False,
+                "stars_text": None if h.stars is None else _fmt_stars(h.stars),
+                "followed": h.full_name in followed,  # 防御：补搜已排除在池仓，池外行恒 False
+                "description_en": h.description_en,  # GitHub 原始描述（spec 决策 4）
+                "description_zh": None,  # 池外无译文
+                "reason": None,  # 池外行无 LLM 理由（LLM 未见过池外仓，写了即幻觉）
+                "summary": None,
+                "tags": [],
+                "endpoint_note": None,
+                "window_note": None,
+                "created_year": h.created_year,
+                "reason_dim": "total",
+                "reason_period_label": "all",
+                "reason_label": "推荐理由",
+                "show_recommend": False,
+            }
+        )
+    return {
+        "unavailable": False,
+        "unavailable_reason": None,
+        "intent": result.intent,
+        "rows": rows,
+        "pool_count": len(result.pool_hits),
+        "external_count": len(result.external_hits),
+        "external_failed": result.external_failed,
+    }
+
+
+@router.get("/search", response_class=HTMLResponse)
+def search_page(request: Request) -> HTMLResponse:
+    """P8 智能搜索页（§17.1）：大输入框＋提交按钮，未搜索时无结果区。
+
+    DeepSeek key 未配置 → 页面直接展示"搜索暂不可用（AI 未配置）"并禁用表单（spec AI 降级姿态
+    fail-loud，榜单等主链路不受影响；key 配置后重启服务生效）。
+    """
+    conn = get_conn()
+    try:
+        return templates.TemplateResponse(
+            request=request,
+            name="search.html",
+            context={
+                "request": request,
+                "page": "search",  # 顶栏 active 态
+                "title": "搜索",
+                "q": "",
+                "search": None,  # None = 未搜索（模板不渲染结果区）
+                "unavailable": not get_settings().deepseek_api_key,
+                "tracked": conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0],
+                "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
+                "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
+            },
+        )
+    finally:
+        conn.close()
+
+
+@router.post("/search", response_class=HTMLResponse)
+async def search_submit(
+    request: Request,
+    ai: DeepSeekClient = Depends(_ai_client),
+    github: GitHubClient = Depends(_github_client),
+) -> HTMLResponse:
+    """P8 搜索执行（§17.2，表单 POST 服务端同步跑完整链路后 SSR）：意图理解 → 池内召回粗排 →
+    LLM 精选 →（池内不足 10 条）GitHub Search 补搜；加载态由 radar.js 提交瞬间置灰"搜索中…"。
+
+    form 体手动解析（urlencoded：不引 python-multipart——新版本 starlette 的 request.form() 也强制要求该包，
+    项目零依赖惯例照 config.py 自解析 dotenv 先例）；降级（spec 决策 6）：DeepSeek 账户类/调用失败 →
+    页面"搜索暂不可用"（fail-loud，主链路不受影响）；精选失败 → 粗排直出（行无推荐理由，如实）；
+    补搜失败/限速/token 缺失 → 池外区标注，池内照常。
+    """
+    body = await request.body()
+    try:
+        params = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        params = {}
+    raw_q = params.get("q")
+    q = raw_q[0].strip() if raw_q else ""
+    if not q:
+        raise HTTPException(status_code=400, detail="搜索词不能为空")
+    if len(q) > _SEARCH_QUERY_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"搜索词长度不能超过 {_SEARCH_QUERY_MAX_LEN} 字符")
+    conn = get_conn()
+    try:
+        result = await run_search(conn, ai, github, q, log=logger)
+        return templates.TemplateResponse(
+            request=request,
+            name="search.html",
+            context={
+                "request": request,
+                "page": "search",
+                "title": "搜索",
+                "q": q,
+                "search": _search_view(conn, result),
+                "unavailable": False,
+                "tracked": conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0],
+                "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
+                "all_tags": _all_tags(conn),
+            },
+        )
+    finally:
+        conn.close()
 
 
 async def _parse_translate_payload(request: Request) -> str:

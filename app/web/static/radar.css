@@ -572,3 +572,52 @@ header.top .translate-all ~ .sync-all { margin-left: 0; }
 /* P1 元信息行末尾"候选词"入口（§15.1 小字链接，不占顶栏——顶栏 5 项上限不破） */
 .meta a.cand-link { color: var(--blue); text-decoration: none; white-space: nowrap; }
 .meta a.cand-link:hover { text-decoration: underline; }
+
+/* ===== T-034 追加（P8 智能搜索 §17：顶栏 6 项收窄/折行、搜索框、意图透明行、池外徽标；样式照示意图 v5） ===== */
+
+/* 顶栏溢出处理（示意图 v5 暴露的已定问题）：加"搜索"变 6 项后在 1400px 宽已换行——
+   桌面轻微收窄间距（16→12）让更多宽度给导航；nav 允许折行（极端窄宽下项自己折行而非溢出挤破）；
+   折行形态 = flex-wrap 天然两行：logo+导航一行、期次控件+三按钮一行贴右（margin-left:auto 既有语义） */
+header.top .wrap { gap: var(--s3); }
+nav.tabs { flex-wrap: wrap; }
+
+/* 池外徽标（§17：虚边灰字，区分于语言徽标；无增星/译文/概要） */
+.badge.pool { border-style: dashed; color: var(--text-3); background: rgba(148,163,184,.06); }
+
+/* 大输入框 + 提交按钮（§17.1；照示意图 v5） */
+.search-box { display: flex; gap: var(--s2); margin-top: var(--s3); }
+.search-box input {
+  flex: 1; min-width: 0; min-height: 44px;
+  font-family: var(--font-sans); font-size: 14px; color: var(--text-1);
+  background: var(--card); border: 1px solid var(--line-strong); border-radius: var(--r-m);
+  padding: 8px 14px; outline: none;
+  transition: border-color var(--t-fast) ease, box-shadow var(--t-fast) ease;
+}
+.search-box input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(88,166,255,.18); }
+.search-box input::placeholder { color: var(--text-3); }
+.search-box button {
+  flex: none; min-height: 44px; padding: 0 22px;
+  font-size: 13.5px; font-weight: 600; color: var(--accent-hi);
+  background: rgba(34,197,94,.1); border: 1px solid rgba(34,197,94,.4); border-radius: var(--r-m);
+  cursor: pointer; transition: background var(--t-fast) ease, border-color var(--t-fast) ease;
+}
+.search-box button:hover:not(:disabled) { background: rgba(34,197,94,.16); border-color: var(--accent); }
+.search-box button:disabled { opacity: .55; cursor: default; }
+
+/* 意图透明行（§17.1）：LLM 理解结果如实展示（可纠错可预期） */
+.intent-line {
+  margin-top: var(--s3); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px;
+  font-size: 12.5px; color: var(--text-3);
+  background: var(--card); border: 1px dashed var(--line-strong); border-radius: var(--r-m);
+  padding: 9px 12px;
+}
+.intent-line b { color: var(--text-1); font-weight: 600; }
+.intent-line .kw { font-family: var(--font-mono); color: var(--blue); }
+.intent-line .sep { color: var(--text-3); margin: 0 2px; }
+
+/* 窄屏（≤640px，断点与既有页面同值）：导航项收窄让 6 项尽量少折行、搜索框纵向堆叠 */
+@media (max-width: 640px) {
+  nav.tabs a { padding: 5px 9px; font-size: 12.5px; }
+  .search-box { flex-direction: column; }
+  .search-box button { width: 100%; }
+}

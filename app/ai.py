@@ -305,6 +305,56 @@ class DeepSeekClient:
             raise DeepSeekError(f"候选主题建议响应解析失败（期望 JSON 对象）：{content[:200]}")
         return parsed
 
+    async def understand_intent(self, query: str) -> dict | None:
+        """智能搜索意图理解（T-034，§17）：用户自然语言 → 结构化查询 JSON（多关键词×多语言×主题词）。
+
+        输出 JSON 契约：{"keywords": [英文关键词...], "languages": [语言名...], "topics": [主题词...]}——
+        keywords 小写英文关键词（3~6 个），languages 取值对齐 classify.LANGUAGES 键集（GitHub 精确名，
+        如 "Python"），topics 小写 kebab-case（可空）；关键词与语言均为数组，不锁单个。
+        返回 None = 响应内容解析不出合法 JSON 对象（spec 口径：调用方退化为原输入单关键词，不当场失败）；
+        调用失败抛 DeepSeekError/DeepSeekAuthError（spec 口径：调用方按"搜索暂不可用"处理）——
+        None 与异常的分界即"有响应但内容烂"与"根本调不动"的分界。
+        """
+        system = (
+            "你是 GitHub 项目雷达的搜索意图理解器。把用户的中文自然语言搜索需求翻译成结构化查询。"
+            "只输出一个 JSON 对象，不要输出任何其他内容："
+            '{"keywords": [3~6 个英文关键词，小写，覆盖需求的核心技术/领域，如 "crawler", "scraping", "spider"],'
+            '"languages": [相关编程语言名数组，取值只能来自 Java/Go/Rust/TypeScript/JavaScript/Python，'
+            "不锁单个，拿不准就空],"
+            '"topics": [相关主题词数组，小写 kebab-case，可空]}'
+        )
+        content = await self._chat(system=system, user=query, temperature=0.2)  # 低温度：解析求稳
+        return _parse_suggested_topics(content)  # 复用 JSON 容错解析（剥 markdown 围栏 + 大括号截取）；None = 内容非法
+
+    async def select_and_reason(self, *, intent_summary: str, candidates: list[dict]) -> dict | None:
+        """智能搜索精选（T-034，§17）：候选 30 → 至多 10 条 + 各一句中文推荐理由（编号引用防幻觉）。
+
+        - candidates 为编号清单（id 从 1 起连续），每项含 full_name/description_en/language/stars；
+        - 输出 JSON：{"results": [{"id": 候选编号, "reason": 中文理由}]}——只许从清单中按编号选择
+          （LLM 无幻觉出不存在项目的机会），至多 10 条按匹配度排序，理由 ≤50 字"为什么适合你的意图"视角；
+        - 返回 None = 响应解析不出合法 JSON（调用方退化粗排直出记 WARNING）；
+          调用失败抛 DeepSeekError/DeepSeekAuthError（调用方处理：Auth 直通不可用，其余退化粗排）。
+        """
+        lines = [
+            f"{i}. {c['full_name']} | 语言 {c['language'] or '未知'} | {c['stars']} 星"
+            + (f" | {c['description_en']}" if c.get("description_en") else " | （无简介）")
+            for i, c in enumerate(candidates, 1)
+        ]
+        system = (
+            "你是技术雷达的编辑，为一位资深开发者读者从候选 GitHub 项目中挑选最匹配其搜索意图的项目。"
+            "只输出一个 JSON 对象，不要输出任何其他内容："
+            '{"results": [{"id": 候选编号, "reason": "中文推荐理由"}]}——'
+            "从候选清单中按编号选择至多 10 个最匹配的项目，按匹配度从高到低排序；"
+            "每个理由写一句 ≤50 字的中文，从“为什么适合你的意图”视角说明（不引用具体星数/排名数字）；"
+            "没有匹配的就不选，不要凑数。"
+        )
+        content = await self._chat(
+            system=system,
+            user=f"用户搜索意图：{intent_summary}\n\n候选清单（只许从中选择）：\n" + "\n".join(lines),
+            temperature=0.3,  # 与推荐语同值：允许一点措辞空间，但不许发散
+        )
+        return _parse_suggested_topics(content)
+
     async def _chat(self, *, system: str, user: str, temperature: float) -> str:
         """一次 chat/completions 调用：超时/传输错误/5xx/响应畸形重试一次后仍失败 → 抛清晰异常。"""
         # key 在使用点校验（与 GitHubClient 同姿态）：config 层不报错，这里第一刀拦住空 key
