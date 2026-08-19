@@ -1,13 +1,15 @@
-"""智能搜索（T-034，§17）：三段式链路——LLM 意图理解 → 池内召回粗排 → LLM 精选；池内不足 10 条时 GitHub Search 实时补足。
+"""智能搜索（T-034→T-036，§17）：三段式链路——LLM 意图理解 → 池内召回粗排 → LLM 精选；池内不足 20 条时 GitHub Search 实时补足。
 
 口径（spec smart-search 钉死，勿自由发挥）：
 - 意图理解：用户自然语言 → 多关键词×多语言×主题词（JSON，语言对齐 classify.LANGUAGES 键集）；
   返回内容非法 JSON → 退化为原输入单关键词（不当场失败）；调用失败/账户类错误 → 搜索暂不可用（fail-loud）；
+  追问时携带旧意图 JSON 要求 LLM 产出合并后新意图（同一 JSON 契约），合并非法 → 退化为本轮新输入单关键词
+  （不沿用旧意图，spec 钉死）；
 - 池内召回：alive 仓关键词组匹配（full_name/description_en/topics 任一命中任一关键词计一次命中，
-  instr 与 LIKE %kw% 等价且无通配符陷阱），语言过滤取交集；粗排 = 命中数降序 → 最新星数降序，取前 30；
-- 精选：候选 30 → 至多 10 条 + 每条约 50 字中文理由（编号引用防幻觉）；非法返回/超范围引用/调用失败
-  → 退化按粗排顺序直出池内候选（无推荐理由），记 WARNING；不足 10 条有几个列几个，不凑数；
-- 池外补搜：池内精选后不足 10 条才触发，同组关键词（含语言限定）GitHub Search 补足；池外行 external=True，
+  instr 与 LIKE %kw% 等价且无通配符陷阱），语言过滤取交集；粗排 = 命中数降序 → 最新星数降序，取前 50；
+- 精选：候选 50 → 至多 20 条 + 每条约 50 字中文理由（编号引用防幻觉）；非法返回/超范围引用/调用失败
+  → 退化按粗排顺序直出池内候选（无推荐理由），记 WARNING；不足 20 条有几个列几个，不凑数；
+- 池外补搜：池内精选后不足 20 条才触发，同组关键词（含语言限定）GitHub Search 补足；池外行 external=True，
   展示 GitHub 原始描述、无增星/译文/概要；失败/限速/token 缺失 → 跳过补搜（池内照常，页面标注）；
 - 空结果如实说明，不硬编任何条目；候选集永远来自真实池子/GitHub 真实响应。
 """
@@ -25,9 +27,9 @@ from app.classify import LANGUAGES
 from app.collector.github import normalize_github_created_at
 from app.report import _created_year
 
-# 展示/精选上限与候选粗排上限（spec 决策 2/3：粗排取约前 30、精选至多 10 条，不足不凑数）
-RESULT_LIMIT = 10
-POOL_TOP_N = 30
+# 展示/精选上限与候选粗排上限（spec 决策 2/3：粗排取约前 50、精选至多 20 条，不足不凑数）
+RESULT_LIMIT = 20
+POOL_TOP_N = 50
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +166,7 @@ def _count_hits(row: sqlite3.Row, keywords: list[str]) -> int:
 
 
 def recall_candidates(conn: sqlite3.Connection, intent: Intent) -> list[Candidate]:
-    """池内召回（spec 决策 2）：alive 仓关键词组匹配 + 语言过滤交集，按命中数降序 → 最新星数降序取前 30。
+    """池内召回（spec 决策 2）：alive 仓关键词组匹配 + 语言过滤交集，按命中数降序 → 最新星数降序取前 50。
 
     SQL 侧用 instr（子串包含，ASCII 大小写不敏感）与 LIKE '%kw%' 等价，但关键词含 %/_ 时无通配符
     陷阱；Python 侧 _count_hits 同构计数——两处口径一致，入选行必然 hits ≥ 1。
@@ -223,7 +225,7 @@ def recall_candidates(conn: sqlite3.Connection, intent: Intent) -> list[Candidat
 async def _select_with_ai(
     ai_client: DeepSeekClient, intent: Intent, candidates: list[Candidate]
 ) -> list[PoolHit]:
-    """LLM 精选（spec 决策 3）：候选 → 至多 10 条 + 理由，按 LLM 返回的匹配度顺序保持。
+    """LLM 精选（spec 决策 3）：候选 → 至多 20 条 + 理由，按 LLM 返回的匹配度顺序保持。
 
     解析失败/超范围编号/理由形态非法 → 整体退化按粗排顺序直出（无理由）记 WARNING——LLM 只许从
     候选清单中按编号选择，任何一个非法引用都说明本轮输出不可信（防幻觉口径，spec 钉死整体退化）。
@@ -338,26 +340,43 @@ async def run_search(
     github_client: Any,
     raw_query: str,
     *,
+    prev_intent: Intent | None = None,
     log: logging.Logger | None = None,
 ) -> SearchResult:
-    """完整检索链路（spec 决策 1/6）：意图理解 → 池内召回粗排 → LLM 精选 →（不足 10）池外补搜。
+    """完整检索链路（spec 决策 1/6）：意图理解 → 池内召回粗排 → LLM 精选 →（不足 20）池外补搜。
+
+    追问：传入上一轮 Intent 时，调 LLM 合并旧意图与本轮输入产出新意图；合并调用非法 JSON →
+    以本轮新输入单关键词退化（不沿用旧意图，spec 钉死），degraded=True。
 
     降级姿态：
     - 意图理解段——DeepSeekAuthError（key 未配置/无效/余额）与调用失败 → 搜索暂不可用（fail-loud，
-      spec AI 降级姿态，不影响榜单主链路）；响应内容非法 JSON → 退化为原输入单关键词继续池内检索；
+      spec AI 降级姿态，不影响榜单主链路）；响应内容非法 JSON（含追问合并失败） → 退化为原输入/本轮输入
+      单关键词继续池内检索；
     - 精选段——AuthError 直通不可用；其余失败 → 粗排直出（无理由）记 WARNING；
     - 补搜段——任何异常 → 跳过补搜，external_failed=True（池内结果照常，页面如实标注）。
     """
     log = log or logger
+    ai_kwargs: dict[str, Any] = {}
+    if prev_intent is not None:
+        ai_kwargs["prev_intent"] = {
+            "keywords": prev_intent.keywords,
+            "languages": prev_intent.languages,
+            "topics": prev_intent.topics,
+        }
     try:
-        parsed = await ai_client.understand_intent(raw_query)
+        parsed = await ai_client.understand_intent(raw_query, **ai_kwargs)
     except DeepSeekAuthError as exc:
         return SearchResult(unavailable=True, unavailable_reason=str(exc))
     except DeepSeekError as exc:
         log.warning("智能搜索意图理解调用失败，搜索暂不可用：%s", exc)
         return SearchResult(unavailable=True, unavailable_reason=str(exc))
     if parsed is None:
-        log.warning("智能搜索意图理解返回非法 JSON，退化为原输入单关键词：%r", raw_query)
+        log.warning(
+            "智能搜索%s返回非法 JSON，退化为%s单关键词：%r",
+            "意图合并" if prev_intent is not None else "意图理解",
+            "本轮新输入" if prev_intent is not None else "原输入",
+            raw_query,
+        )
         intent = Intent(raw_query, [_normalize_keyword(raw_query)], degraded=True)
     else:
         intent = _build_intent(raw_query, parsed)

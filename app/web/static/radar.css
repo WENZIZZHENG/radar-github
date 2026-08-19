@@ -669,3 +669,52 @@ nav.tabs { flex-wrap: wrap; }
 .tag-suggestion:not(:last-child) {
   border-bottom: 1px solid var(--line);
 }
+
+/* ===== T-036 追加（智能搜索追问：意图对比区 + 上一轮结果区）===== */
+
+/* 新旧意图对比条：复用 intent-line 的卡片/虚线气质，但以横向对比为主 */
+.intent-compare {
+  margin-top: var(--s3);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  background: var(--card);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-m);
+  padding: 9px 12px;
+}
+.intent-compare .label {
+  font-weight: 600;
+  color: var(--text-2);
+}
+.intent-compare .old,
+.intent-compare .new {
+  font-family: var(--font-mono);
+  color: var(--blue);
+}
+.intent-compare .arrow {
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+/* 上一轮结果区：与当前结果区分隔，区头带弱灰底 */
+.previous-board {
+  margin-top: var(--s3);
+  opacity: .92;
+}
+.previous-board .board > h3 {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.previous-board .board > h3 .n {
+  margin-left: 8px;
+  font-weight: 500;
+  color: var(--text-3);
+}

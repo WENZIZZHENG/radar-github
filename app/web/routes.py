@@ -71,7 +71,7 @@ from app.report import (
     quarter_label,
     week_label,
 )
-from app.search import run_search
+from app.search import Intent, run_search
 
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"  # 供 app.main 挂载 StaticFiles（/static）
@@ -1320,6 +1320,52 @@ async def _ai_client() -> AsyncIterator[DeepSeekClient]:
 _SEARCH_QUERY_MAX_LEN = 200
 
 
+def _parse_prev_intent(raw: list[str] | None) -> Intent | None:
+    """解析追问回传的上一轮意图 JSON：缺失/非法/形态非法 → None（按首搜处理，不报错）。"""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw[0])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    keywords = parsed.get("keywords")
+    languages = parsed.get("languages")
+    topics = parsed.get("topics")
+    if not isinstance(keywords, list) or not isinstance(languages, list) or not isinstance(topics, list):
+        return None
+    # 过滤非法元素（与 _build_intent 同口径，确保传给 run_search 的 Intent 可检索）
+    clean_keywords = [k.strip().lower() for k in keywords if isinstance(k, str) and k.strip()]
+    clean_languages = [lang for lang in languages if isinstance(lang, str)]
+    clean_topics = [t.strip().lower() for t in topics if isinstance(t, str) and t.strip()]
+    if not clean_keywords:
+        return None
+    return Intent(
+        raw_query=parsed.get("raw_query") or "",
+        keywords=clean_keywords,
+        languages=clean_languages,
+        topics=clean_topics,
+    )
+
+
+def _parse_prev_results(raw: list[str] | None) -> list[dict]:
+    """解析追问回传的上一轮结果摘要 JSON：缺失/非法/非对象列表 → 空列表（追问搜空只显示空结果说明）。"""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw[0])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    rows = []
+    for item in parsed:
+        if isinstance(item, dict) and isinstance(item.get("full_name"), str):
+            rows.append(item)
+    return rows
+
+
 def _search_view(conn: sqlite3.Connection, result) -> dict:
     """搜索结果模板视图：意图透明 + 行视图（_row.html 同字段契约，复用榜单行组件）。
 
@@ -1454,12 +1500,16 @@ async def search_submit(
     github: GitHubClient = Depends(_github_client),
 ) -> HTMLResponse:
     """P8 搜索执行（§17.2，表单 POST 服务端同步跑完整链路后 SSR）：意图理解 → 池内召回粗排 →
-    LLM 精选 →（池内不足 10 条）GitHub Search 补搜；加载态由 radar.js 提交瞬间置灰"搜索中…"。
+    LLM 精选 →（池内不足 20 条）GitHub Search 补搜；加载态由 radar.js 提交瞬间置灰"搜索中…"。
 
     form 体手动解析（urlencoded：不引 python-multipart——新版本 starlette 的 request.form() 也强制要求该包，
     项目零依赖惯例照 config.py 自解析 dotenv 先例）；降级（spec 决策 6）：DeepSeek 账户类/调用失败 →
     页面"搜索暂不可用"（fail-loud，主链路不受影响）；精选失败 → 粗排直出（行无推荐理由，如实）；
     补搜失败/限速/token 缺失 → 池外区标注，池内照常。
+
+    追问（T-036）：表单携带 prev_intent/prev_results 两个隐藏字段；prev_intent 有效时进入意图合并链路，
+    缺失/非法按首搜处理；追问搜空且 prev_results 有效时，原样重渲染上一轮结果区并展示新旧意图对比，
+    不额外调用 LLM。
     """
     body = await request.body()
     try:
@@ -1472,9 +1522,16 @@ async def search_submit(
         raise HTTPException(status_code=400, detail="搜索词不能为空")
     if len(q) > _SEARCH_QUERY_MAX_LEN:
         raise HTTPException(status_code=400, detail=f"搜索词长度不能超过 {_SEARCH_QUERY_MAX_LEN} 字符")
+    prev_intent = _parse_prev_intent(params.get("prev_intent"))
+    prev_results = _parse_prev_results(params.get("prev_results"))
     conn = get_conn()
     try:
-        result = await run_search(conn, ai, github, q, log=logger)
+        result = await run_search(conn, ai, github, q, prev_intent=prev_intent, log=logger)
+        search_view = _search_view(conn, result)
+        # 追问搜空保留上一轮结果（spec T-036）：不额外调 LLM，直接用回传摘要重渲染
+        if prev_intent is not None and not result.unavailable and not search_view["rows"] and prev_results:
+            search_view["old_intent"] = prev_intent
+            search_view["previous_rows"] = prev_results
         return templates.TemplateResponse(
             request=request,
             name="search.html",
@@ -1483,11 +1540,13 @@ async def search_submit(
                 "page": "search",
                 "title": "搜索",
                 "q": q,
-                "search": _search_view(conn, result),
+                "search": search_view,
                 "unavailable": False,
                 "tracked": conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0],
                 "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
                 "all_tags": _all_tags(conn),
+                "prev_intent_json": json.dumps(result.intent.__dict__ if result.intent else None, ensure_ascii=False),
+                "prev_results_json": json.dumps(search_view["rows"], ensure_ascii=False),
             },
         )
     finally:

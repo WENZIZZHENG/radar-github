@@ -2,8 +2,8 @@
 {% block title %}{{ title }}{% endblock %}
 
 {% block content %}
-{# P8 智能搜索（T-034 §17，示意图 v5 形态）：元信息行 → 大输入框 → 意图透明行 → 结果列表（行复用 _row.html） #}
-<p class="meta">基于池内 <b class="mono">{{ tracked }}</b> 个仓库（≥1000 星）本地检索 · 池内不足 10 条时 GitHub Search 实时补搜（池内在前、池外在后） · 检索走本地 SQL / GitHub API，AI 只做意图理解与精选 · 不建搜索缓存</p>
+{# P8 智能搜索（T-034→T-036 §17，示意图 v5 形态）：元信息行 → 大输入框 → 意图透明行 → 结果列表（行复用 _row.html） #}
+<p class="meta">基于池内 <b class="mono">{{ tracked }}</b> 个仓库（≥1000 星）本地检索 · 池内不足 20 条时 GitHub Search 实时补搜（池内在前、池外在后） · 检索走本地 SQL / GitHub API，AI 只做意图理解与精选 · 不建搜索缓存</p>
 
 <section>
   <h2 class="sec">搜索</h2>
@@ -11,6 +11,11 @@
   <form class="search-box" id="search-form" method="post" action="/search">
     <input id="search-input" name="q" type="text" value="{{ q }}" placeholder="说说你想做什么，如：我要做爬虫" aria-label="搜索输入" maxlength="200" required{% if unavailable %} disabled{% endif %}>
     <button type="submit" id="search-btn"{% if unavailable %} disabled title="DeepSeek API key 未配置"{% endif %}>搜索</button>
+    {# 追问上下文无状态回传（T-036）：结果页把当前意图与结果摘要注入隐藏字段，下一问提交时携带 #}
+    {% if search and not search.unavailable %}
+    <input type="hidden" name="prev_intent" value="{{ prev_intent_json | default('') | forceescape }}">
+    <input type="hidden" name="prev_results" value="{{ prev_results_json | default('') | forceescape }}">
+    {% endif %}
   </form>
 
   {# DeepSeek key 未配置（GET 页面直接判定，spec AI 降级姿态 fail-loud；榜单等主链路不受影响） #}
@@ -45,6 +50,21 @@
     <p class="empty-follows">没有找到匹配「{{ search.intent.display_text }}」的项目，换个说法试试？</p>
     {% if search.external_failed %}
     <p class="empty-follows">GitHub 实时补搜失败（限速或网络异常），仅展示池内结果。</p>
+    {% endif %}
+    {# 追问搜空保留上一轮结果（T-036）：新旧意图对比 + 上一轮结果区原样重渲染，不额外调 LLM #}
+    {% if search.previous_rows %}
+    <div class="intent-compare">
+      <span class="label">意图变化</span>
+      <span class="old">{{ search.old_intent.display_text }}</span>
+      <span class="arrow">→</span>
+      <span class="new">{{ search.intent.display_text }}</span>
+    </div>
+    <div class="boards previous-board">
+      <div class="board">
+        <h3>上一轮结果<span class="n">{{ search.previous_rows | length }} 条</span></h3>
+        {% for r in search.previous_rows %}{% set anchor = "p" %}{% set idx = loop.index0 %}{% include "_row.html" %}{% endfor %}
+      </div>
+    </div>
     {% endif %}
     {% endif %}
     {% endif %}

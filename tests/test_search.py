@@ -1,20 +1,22 @@
-"""T-034 智能搜索测试：检索链路（app.search）＋ P8 页面/路由（TestClient + 假 AI/GitHub client），全程离线禁真打 API。
+"""T-034→T-036 智能搜索测试：检索链路（app.search）＋ P8 页面/路由（TestClient + 假 AI/GitHub client），全程离线禁真打 API。
 
 覆盖任务书口径（spec smart-search 钉死）：
 - 意图理解：JSON 契约解析、语言归一/非法值丢弃、非法 JSON/坏形态退化原输入单关键词、多关键词多语言产出；
-- 池内召回：命中计数（字段×关键词）、语言过滤交集、粗排（命中数→星数）、dead 排除、topics 命中、不足 30/零候选；
+  追问时携带旧意图合并、合并非法退化为本轮新输入单关键词（不沿用旧意图）；
+- 池内召回：命中计数（字段×关键词）、语言过滤交集、粗排（命中数→星数）、dead 排除、topics 命中、不足 50/零候选；
 - 精选：正常编号+理由（LLM 顺序保持）、空 results 不凑数、解析失败/超范围编号/理由非法/调用失败 → 粗排直出无理由
   （WARNING）、AuthError 直通；
-- 池外补搜：补足到 10、池内在前池外在后、已在池排除、两次调用补不满按实际、失败/限速/token 缺失跳过补搜（池内照常）；
+- 池外补搜：补足到 20、池内在前池外在后、已在池排除、两次调用补不满按实际、失败/限速/token 缺失跳过补搜（池内照常）；
 - 降级：DeepSeek 不可用 → 页面"搜索暂不可用"，主链路不受影响；
-- 页面：顶栏 6 项、意图透明行、池外徽标、空结果如实说明、池外行关注星/已在池不显示关注入口（模板分支）、
-  池内行 created_year（T-033 红线：搜索行视图必须传该字段）。
+- 页面：顶栏 6 项、意图透明行、池外徽标、空结果如实说明、追问搜空保留上一轮结果、池外行关注星/已在池不显示关注入口
+  （模板分支）、池内行 created_year（T-033 红线：搜索行视图必须传该字段）。
 
 异步用例统一 asyncio.run 驱动（不引 pytest-asyncio，与 test_follows/test_ai 同口径）。
 """
 
 import asyncio
 import json
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -53,8 +55,8 @@ class FakeSearchAI:
         self.intent_calls: list[str] = []
         self.select_calls: list[dict] = []
 
-    async def understand_intent(self, query: str):
-        self.intent_calls.append(query)
+    async def understand_intent(self, query: str, *, prev_intent=None):
+        self.intent_calls.append((query, prev_intent))
         if self._intent_error is not None:
             raise self._intent_error
         return self._intent
@@ -133,8 +135,8 @@ def _add_repo(
     return repo_id
 
 
-def _run_search(conn, ai, gh, query):
-    return asyncio.run(run_search(conn, ai, gh, query))
+def _run_search(conn, ai, gh, query, *, prev_intent=None):
+    return asyncio.run(run_search(conn, ai, gh, query, prev_intent=prev_intent))
 
 
 # ---------- 4.1 意图理解：JSON 契约解析、非法 JSON 退化、多关键词/多语言产出 ----------
@@ -190,7 +192,49 @@ def test_run_search_degraded_on_invalid_intent_json(tmp_path):
     conn.close()
 
 
-# ---------- 4.2 池内召回：命中计数、语言过滤、粗排顺序、不足 30/零候选 ----------
+def test_run_search_follow_up_merge_intent(tmp_path):
+    """追问意图合并：旧意图 + 新输入 → LLM 收到 prev_intent 并产出合并意图，以新意图重跑检索。"""
+    conn = _open_db(tmp_path)
+    _add_repo(conn, "a/crawler", description_en="web crawler framework", language="Python", stars=2000)
+    _add_repo(conn, "a/go-crawler", description_en="go crawler framework", language="Go", stars=2000)
+    conn.commit()
+    old = Intent("我要做爬虫", ["crawler", "scraping"], ["Python"])
+    merged = {"keywords": ["crawler", "scraping"], "languages": ["Go"], "topics": []}
+    ai = FakeSearchAI(intent=merged, select={"results": [{"id": 2, "reason": "Go 版理由"}]})
+    result = _run_search(conn, ai, FakeSearchGitHub(), "换成 Go 的", prev_intent=old)
+    assert result.unavailable is False
+    assert not result.intent.degraded
+    assert result.intent.languages == ["Go"]
+    assert [h.candidate.full_name for h in result.pool_hits] == ["a/go-crawler"]
+    # 校验 LLM 收到旧意图
+    assert len(ai.intent_calls) == 1
+    assert ai.intent_calls[0] == ("换成 Go 的", {"keywords": ["crawler", "scraping"], "languages": ["Python"], "topics": []})
+    conn.close()
+
+
+def test_run_search_follow_up_merge_invalid_degrades_current(tmp_path):
+    """追问合并返回非法 JSON：以本轮新输入单关键词退化，不沿用旧意图。"""
+    conn = _open_db(tmp_path)
+    _add_repo(conn, "a/crawler", description_en="web crawler framework", language="Python", stars=2000)
+    conn.commit()
+    old = Intent("我要做爬虫", ["crawler", "scraping"], ["Python"])
+    ai = FakeSearchAI(intent=None, select={"results": [{"id": 1, "reason": "理由"}]})
+    result = _run_search(conn, ai, FakeSearchGitHub(), "只要异步的", prev_intent=old)
+    assert result.intent.degraded
+    assert result.intent.keywords == ["只要异步的"]  # 本轮新输入，非旧意图
+    assert result.intent.languages == []
+    conn.close()
+
+
+def test_constants_t036():
+    """T-036 数量口径：精选/补搜上限 20，候选粗排池 50。"""
+    from app.search import POOL_TOP_N, RESULT_LIMIT
+
+    assert RESULT_LIMIT == 20
+    assert POOL_TOP_N == 50
+
+
+# ---------- 4.2 池内召回：命中计数、语言过滤、粗排顺序、不足 50/零候选 ----------
 
 
 def _seed_recall(conn):
@@ -235,8 +279,8 @@ def test_recall_topics_and_full_name_match(tmp_path):
     conn.close()
 
 
-def test_recall_less_than_30_and_zero(tmp_path):
-    """不足 30 按实际（不凑数）；零候选返回空列表；关键词全空返回空列表。"""
+def test_recall_less_than_50_and_zero(tmp_path):
+    """不足 50 按实际（不凑数）；零候选返回空列表；关键词全空返回空列表。"""
     conn = _open_db(tmp_path)
     _add_repo(conn, "a/one", description_en="crawler", stars=100)
     conn.commit()
@@ -246,7 +290,7 @@ def test_recall_less_than_30_and_zero(tmp_path):
     conn.close()
 
 
-# ---------- 4.3 精选：正常 10 条+理由、失败粗排兜底、超范围编号拒绝 ----------
+# ---------- 4.3 精选：正常 20 条+理由、失败粗排兜底、超范围编号拒绝 ----------
 
 
 def _seed_select(conn, n):
@@ -257,7 +301,7 @@ def _seed_select(conn, n):
 
 
 def test_select_normal_keeps_llm_order(tmp_path):
-    """正常精选：编号引用 + 理由，输出顺序 = LLM 返回顺序（按匹配度排序），不足 10 条不凑数。"""
+    """正常精选：编号引用 + 理由，输出顺序 = LLM 返回顺序（按匹配度排序），不足 20 条不凑数。"""
     conn = _open_db(tmp_path)
     _seed_select(conn, 5)
     base = {"keywords": ["crawler"], "languages": [], "topics": []}
@@ -281,7 +325,7 @@ def test_select_empty_results_not_fallback(tmp_path):
 
 
 def test_select_parse_failure_falls_back_to_rank(tmp_path, caplog):
-    """精选解析失败（None）：退化按粗排顺序直出（至多 10 条、无理由），记 WARNING。"""
+    """精选解析失败（None）：退化按粗排顺序直出（至多 20 条、无理由），记 WARNING。"""
     conn = _open_db(tmp_path)
     _seed_select(conn, 12)
     base = {"keywords": ["crawler"], "languages": [], "topics": []}
@@ -289,10 +333,23 @@ def test_select_parse_failure_falls_back_to_rank(tmp_path, caplog):
     intent = _build_intent("crawler", base)
     with caplog.at_level("WARNING", logger="app.search"):
         hits = asyncio.run(_select_with_ai(ai, intent, recall_candidates(conn, intent)))
-    assert len(hits) == RESULT_LIMIT  # 粗排前 10
-    assert [h.candidate.full_name for h in hits] == [f"a/r{i:02d}" for i in range(RESULT_LIMIT)]  # 粗排顺序
+    assert len(hits) == 12  # 候选不足 20 按实际返回，不凑数
+    assert [h.candidate.full_name for h in hits] == [f"a/r{i:02d}" for i in range(12)]  # 粗排顺序
     assert all(h.reason is None for h in hits)
     assert any("退化粗排直出" in r.message for r in caplog.records)
+    conn.close()
+
+
+def test_select_fallback_truncates_to_result_limit(tmp_path):
+    """候选 >20 时退化直出截断到 RESULT_LIMIT（k3 评审 F3-2：10→20 后截断路径失去覆盖，补位）。"""
+    conn = _open_db(tmp_path)
+    _seed_select(conn, 25)
+    base = {"keywords": ["crawler"], "languages": [], "topics": []}
+    ai = FakeSearchAI(intent=base, select=None)
+    intent = _build_intent("crawler", base)
+    hits = asyncio.run(_select_with_ai(ai, intent, recall_candidates(conn, intent)))
+    assert len(hits) == RESULT_LIMIT
+    assert [h.candidate.full_name for h in hits] == [f"a/r{i:02d}" for i in range(RESULT_LIMIT)]
     conn.close()
 
 
@@ -335,7 +392,7 @@ def test_select_call_failure_falls_back_auth_raises(tmp_path):
     conn.close()
 
 
-# ---------- 4.4 池外补搜：补足到 10、池内在前池外在后、补搜失败降级、空结果如实说明 ----------
+# ---------- 4.4 池外补搜：补足到 20、池内在前池外在后、补搜失败降级、空结果如实说明 ----------
 
 
 def test_external_supplements_to_limit(tmp_path):
@@ -520,7 +577,8 @@ def test_search_post_full_chain(search_env):
         assert "概要文本" in text and "· 2020" in text
         # 池外行：池外徽标 + GitHub 原始描述 + 关注星；acts 区只留 GitHub 链接（无打标/翻译按钮）
         assert ">池外</span>" in text and "external crawler" in text
-        outside_section = text.split("b/outside")[1]
+        # 用 title 属性定位实际渲染行，避开隐藏字段中 prev_results JSON 也含 "b/outside"
+        outside_section = text.split('title="b/outside"')[1]
         assert "tag-add" not in outside_section and "translate-btn" not in outside_section
         # 关注星：池内行（已关注 on）+ 池外行（关注入口）都有
         assert 'data-repo="a/crawler"' in text and 'data-repo="b/outside"' in text
@@ -529,7 +587,7 @@ def test_search_post_full_chain(search_env):
 
 
 def test_search_post_pool_insufficient_triggers_external(search_env):
-    """池内不足 10 条触发补搜：池内 0 条 + 池外补足 → 池外行排后。"""
+    """池内不足 20 条触发补搜：池内 0 条 + 池外补足 → 池外行排后。"""
     conn = get_conn(search_env)
     conn.close()
     ai = FakeSearchAI(
@@ -585,6 +643,100 @@ def test_search_post_all_empty_honest_notice(search_env):
         text = client.post("/search", data={"q": "ghost"}).text
         assert "没有找到匹配「ghost」的项目，换个说法试试？" in text
         assert 'class="row' not in text
+    app.dependency_overrides.clear()
+
+
+def _extract_hidden(html: str, name: str) -> str:
+    """从 SSR HTML 提取指定隐藏字段的 value（HTML 实体已转义，需 unescape）。"""
+    import html as _html
+
+    m = re.search(rf'<input[^>]*name="{name}"[^>]*value="([^"]*)"', html)
+    assert m is not None, f"隐藏字段 {name} 未找到"
+    return _html.unescape(m.group(1))
+
+
+def test_search_post_follow_up_empty_keeps_previous_results(search_env):
+    """追问搜空保留上一轮：页面显示新旧意图对比 + 上一轮结果区，且不发生额外 LLM 调用。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    # 首搜：池内 1 条 + 池外 0 条
+    first_ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "首搜理由"}]},
+    )
+    with _web_client(search_env, first_ai, FakeSearchGitHub(pages=[[]])) as client:
+        first = client.post("/search", data={"q": "爬虫"}).text
+        assert "a/crawler" in first
+        prev_intent_value = _extract_hidden(first, "prev_intent")
+        prev_results_value = _extract_hidden(first, "prev_results")
+
+    # 追问：合并后新意图在池内/池外均无结果
+    follow_ai = FakeSearchAI(
+        intent={"keywords": ["ghost-term"], "languages": [], "topics": []},
+        select={"results": []},
+    )
+    with _web_client(search_env, follow_ai, FakeSearchGitHub(pages=[[]])) as client:
+        text = client.post("/search", data={"q": "只要 ghost 的", "prev_intent": prev_intent_value, "prev_results": prev_results_value}).text
+        # 空结果说明
+        assert "没有找到匹配" in text
+        # 新旧意图对比 + 上一轮结果区
+        assert "意图变化" in text
+        assert "上一轮结果" in text
+        assert "a/crawler" in text
+        # 不额外调 LLM：追问只调 1 次 understand_intent（合并），select 因池空未调
+        assert len(follow_ai.intent_calls) == 1
+        assert follow_ai.select_calls == []
+    app.dependency_overrides.clear()
+
+
+def test_search_post_follow_up_empty_invalid_prev_results(search_env):
+    """追问搜空但 prev_results 非法：只显示空结果说明，不渲染上一轮结果区。"""
+    conn = get_conn(search_env)
+    conn.close()
+    ai = FakeSearchAI(intent={"keywords": ["ghost"], "languages": [], "topics": []}, select={"results": []})
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        text = client.post(
+            "/search",
+            data={"q": "更窄的", "prev_intent": '{"keywords":["crawler"],"languages":[],"topics":[]}', "prev_results": "not-json"},
+        ).text
+        assert "没有找到匹配" in text
+        assert "上一轮结果" not in text
+        assert "意图变化" not in text
+        assert 'class="row' not in text
+    app.dependency_overrides.clear()
+
+
+def test_search_post_prev_intent_invalid_treated_as_first_search(search_env):
+    """prev_intent 缺失或非法按首搜处理：本轮输入单独走意图理解，不进入合并链路。"""
+    conn = get_conn(search_env)
+    _add_repo(conn, "a/crawler", description_en="web crawler framework", language="Python", stars=1200)
+    conn.commit()
+    ai = FakeSearchAI(intent={"keywords": ["crawler"], "languages": [], "topics": []}, select={"results": [{"id": 1, "reason": "r"}]})
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        # prev_intent 非法 JSON
+        text = client.post("/search", data={"q": "爬虫", "prev_intent": "bad-json"}).text
+        assert "a/crawler" in text
+        # 校验 LLM 调用未携带 prev_intent（None = 首搜）
+        assert ai.intent_calls == [("爬虫", None)]
+    app.dependency_overrides.clear()
+
+
+def test_search_post_hidden_fields_carried(search_env):
+    """结果页表单渲染 prev_intent/prev_results 隐藏字段，供下一问回传。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        text = client.post("/search", data={"q": "爬虫"}).text
+        assert 'name="prev_intent"' in text
+        assert 'name="prev_results"' in text
+        # prev_results JSON 中含当前结果行的 full_name
+        assert "a/crawler" in _extract_hidden(text, "prev_results")
     app.dependency_overrides.clear()
 
 
