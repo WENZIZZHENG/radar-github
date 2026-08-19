@@ -237,28 +237,35 @@ async function deleteTag(x) {
 }
 
 // 打标输入：按钮 → 输入框（maxLength 20）；Enter 提交（非法不提交：红边＋内联提示）；
-// Escape/blur 还原按钮；提交中（submitting）忽略 Escape/blur，防止 chip 无处可插
+// Escape/blur 还原按钮；提交中（submitting）忽略 Escape/blur，防止 chip 无处可插。
+// T-035：自绘建议下拉，替代浏览器原生 datalist（手机端 datalist 不可用）。
+// 保留 base.html 的 <datalist id="all-tags"> 作纯数据源；桌面/移动共用同一套组件。
 function startTagInput(btn) {
   const host = btn.parentElement;
+  const wrapper = document.createElement("span");
+  wrapper.className = "tag-input-wrap";
   const input = document.createElement("input");
   input.className = "tag-input";
   input.maxLength = 20;
   input.placeholder = "1~20 字符，回车确认";
   input.setAttribute("aria-label", "新标签名称");
-  // T-022 打标输入建议（datalist）：list 指向页内唯一 datalist（既有标签全量注入，base.html 渲染）；
-  // 空库页无 datalist → 安静跳过（浏览器对缺失 datalist 的 list 属性本就忽略，显式守卫语义清楚）
-  if (document.getElementById("all-tags")) input.setAttribute("list", "all-tags");
   const hint = document.createElement("span");
   hint.className = "tag-hint";
   hint.hidden = true;
-  btn.replaceWith(input);
-  input.insertAdjacentElement("afterend", hint);
+  // T-035：自绘下拉。datalist 不再通过 list 属性触发原生 UI，改为 JS 读取 option 过滤渲染。
+  const dropdown = document.createElement("div");
+  dropdown.className = "tag-suggestions";
+  dropdown.hidden = true;
+  wrapper.append(input, dropdown);
+  btn.replaceWith(wrapper);
+  wrapper.insertAdjacentElement("afterend", hint);
   input.focus();
   let submitting = false;
+  let highlightedIndex = null;
 
   const restore = () => {
     if (!input.isConnected) return; // 已被 chip 替换（提交成功）→ 无操作
-    input.replaceWith(btn);
+    wrapper.replaceWith(btn);
     hint.remove();
   };
   const fail = (msg) => {
@@ -271,30 +278,67 @@ function startTagInput(btn) {
       input.classList.remove("invalid");
       hint.hidden = true;
     }
+    updateSuggestions();
   });
-  input.addEventListener("keydown", async (ev) => {
-    if (ev.key === "Escape") {
-      if (!submitting) restore();
+  // T-035：子串匹配过滤，最多 8 条；无匹配或不输入时隐藏下拉。
+  function updateSuggestions() {
+    const term = input.value.trim();
+    const dl = document.getElementById("all-tags");
+    if (!dl || !term) {
+      dropdown.hidden = true;
+      highlightedIndex = null;
       return;
     }
-    if (ev.key !== "Enter") return;
-    ev.preventDefault();
-    if (submitting) return;
-    const tag = input.value.trim();
-    if (!tag || tag.length > 20) {
+    const all = Array.from(dl.options).map((o) => o.value);
+    const matches = all
+      .filter((t) => t.toLowerCase().includes(term.toLowerCase()))
+      .slice(0, 8);
+    if (matches.length === 0) {
+      dropdown.hidden = true;
+      highlightedIndex = null;
+      return;
+    }
+    dropdown.innerHTML = "";
+    matches.forEach((tag) => {
+      const item = document.createElement("div");
+      item.className = "tag-suggestion";
+      item.textContent = tag;
+      // 触控/鼠标点选即提交；preventDefault 抢在 input blur 前完成，避免 blur 先还原按钮。
+      const pick = (ev) => {
+        ev.preventDefault();
+        if (submitting) return;
+        submitTag(tag);
+      };
+      item.addEventListener("mousedown", pick);
+      item.addEventListener("touchstart", pick, { passive: false });
+      dropdown.append(item);
+    });
+    dropdown.hidden = false;
+    highlightedIndex = null;
+  }
+  function setHighlight(idx) {
+    const items = dropdown.querySelectorAll(".tag-suggestion");
+    items.forEach((el, i) => el.classList.toggle("active", i === idx));
+    highlightedIndex = idx;
+  }
+  async function submitTag(tag) {
+    const t = tag.trim();
+    if (!t || t.length > 20) {
       // 非法输入：不提交（流程说明 §4），红边＋内联提示
       input.classList.add("invalid");
-      hint.textContent = tag.length > 20 ? "标签最长 20 字符" : "标签不能为空";
+      hint.textContent = t.length > 20 ? "标签最长 20 字符" : "标签不能为空";
       hint.hidden = false;
       return;
     }
+    if (submitting) return;
     submitting = true;
+    dropdown.hidden = true;
     input.disabled = true;
     try {
       const resp = await fetch("/api/tags", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ full_name: btn.dataset.repo, tag }),
+        body: JSON.stringify({ full_name: btn.dataset.repo, tag: t }),
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
@@ -304,15 +348,15 @@ function startTagInput(btn) {
         chip.className = "tag";
         const link = document.createElement("a");
         link.className = "tag-link";
-        link.href = tagHref(tag);
-        link.textContent = tag;
+        link.href = tagHref(t);
+        link.textContent = t;
         const x = document.createElement("b");
         x.title = "删除标签";
         x.dataset.repo = btn.dataset.repo;
-        x.dataset.tag = tag;
+        x.dataset.tag = t;
         x.textContent = "×";
         chip.append(link, x);
-        input.replaceWith(chip);
+        wrapper.replaceWith(chip);
         hint.remove();
         chip.insertAdjacentElement("afterend", btn); // 按钮接回原位：同一行可连续打多枚标签（评审发现漏插）
         toast("已添加标签");
@@ -323,6 +367,43 @@ function startTagInput(btn) {
     } catch (err) {
       fail("添加标签失败：" + err.message); // 失败回滚原态（输入框还原为按钮）＋报错 toast
     }
+  }
+  input.addEventListener("keydown", async (ev) => {
+    if (ev.key === "Escape") {
+      if (!submitting) {
+        if (!dropdown.hidden) {
+          // T-035：第一下 Escape 先关下拉（保留输入值），再按才走既有还原语义。
+          dropdown.hidden = true;
+          highlightedIndex = null;
+        } else {
+          restore();
+        }
+      }
+      return;
+    }
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      if (dropdown.hidden) return;
+      ev.preventDefault();
+      const items = dropdown.querySelectorAll(".tag-suggestion");
+      if (items.length === 0) return;
+      if (ev.key === "ArrowDown") {
+        if (highlightedIndex === null) highlightedIndex = 0;
+        else highlightedIndex = (highlightedIndex + 1) % items.length;
+      } else {
+        if (highlightedIndex === null) highlightedIndex = items.length - 1;
+        else highlightedIndex = (highlightedIndex - 1 + items.length) % items.length;
+      }
+      setHighlight(highlightedIndex);
+      return;
+    }
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    if (submitting) return;
+    const tag =
+      highlightedIndex !== null && !dropdown.hidden
+        ? dropdown.querySelectorAll(".tag-suggestion")[highlightedIndex].textContent
+        : input.value.trim();
+    await submitTag(tag);
   });
   input.addEventListener("blur", () => {
     if (!submitting) restore();

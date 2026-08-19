@@ -47,8 +47,9 @@
   </footer>
 </div>
 
-{# T-022 打标输入建议（datalist）：既有标签全量一次注入，每页渲染一个（防每行一个）；空库不渲染——
-   JS 侧对缺失 datalist 的 list 属性静默忽略。标签云页不注入 all_tags，此处天然跳过 #}
+{# T-022 打标输入建议：既有标签全量一次注入，每页渲染一个（防每行一个）；空库不渲染。
+   T-035 起 datalist 仅作 JS 自绘下拉的纯数据源（输入框不挂 list 属性，原生建议手机端不可用）。
+   标签云页不注入 all_tags，此处天然跳过 #}
 {% if all_tags %}
 <datalist id="all-tags">
   {% for t in all_tags %}<option value="{{ t }}"></option>{% endfor %}

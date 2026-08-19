@@ -621,3 +621,51 @@ nav.tabs { flex-wrap: wrap; }
   .search-box { flex-direction: column; }
   .search-box button { width: 100%; }
 }
+
+/* ===== T-035 追加（自绘标签输入建议下拉；流程说明 §3.3 v2.8，替代原生 datalist） ===== */
+
+/* 输入框包裹层：为绝对定位下拉提供定位上下文 */
+.tag-input-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+/* 自绘建议下拉：复用卡片/面板色系与圆角，与输入框同宽、可随内容稍延展 */
+.tag-suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;  /* 低于 toast(--z-toast:60)，高于常规内容 */
+  min-width: 100%;
+  width: max-content;
+  max-width: 280px;
+  margin-top: 4px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  box-shadow: 0 10px 28px rgba(2,6,23,.55);
+  overflow-y: auto;
+}
+
+.tag-suggestion {
+  display: flex;
+  align-items: center;
+  min-height: 36px;  /* 触控目标 ≥36px（移动/桌面同一套） */
+  padding: 7px 12px;
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background var(--t-fast) ease, color var(--t-fast) ease;
+}
+
+.tag-suggestion:hover,
+.tag-suggestion.active {
+  background: rgba(88,166,255,.12);
+  color: var(--text-1);
+}
+
+.tag-suggestion:not(:last-child) {
+  border-bottom: 1px solid var(--line);
+}

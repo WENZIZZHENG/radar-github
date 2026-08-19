@@ -425,8 +425,8 @@ def _all_tags(conn: sqlite3.Connection) -> list[str]:
     """T-022 打标输入建议（datalist）：全部既有标签一次注入（SELECT DISTINCT 去重排序，几十个量级）。
 
     供渲染行页面的模板上下文（_boards_context / follows_page / tag_page）——每页渲染一个
-    `<datalist id="all-tags">`（base.html 统一落点，空库不渲染），行内输入框 list 属性指向它。
-    标签云页（无行列表）不注入。
+    `<datalist id="all-tags">`（base.html 统一落点，空库不渲染）；T-035 起 datalist 仅作 JS 自绘下拉的纯数据源，
+    输入框不再挂 list 属性（原生 datalist 建议手机端不可用）。标签云页（无行列表）不注入。
     """
     return [r["tag"] for r in conn.execute("SELECT DISTINCT tag FROM tags ORDER BY tag")]
 
