@@ -44,20 +44,29 @@ import httpx
 
 from app.classify import load_topics
 from app.collector.github import GitHubAuthError, GitHubClient
-from app.config import BASE_DIR, get_settings
+from app.config import (
+    BASE_DIR,
+    DEFAULT_AI_BASE_URL,
+    DEFAULT_AI_MAX_RETRIES,
+    DEFAULT_AI_MODEL,
+    DEFAULT_AI_README_HEAD_CHARS,
+    DEFAULT_AI_TIMEOUT_SECONDS,
+    get_settings,
+)
 from app.report import ReportRow, RisingRow, compute_boards, pool_days_label
 
-CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
-CHAT_MODEL = "deepseek-chat"
+CHAT_URL = DEFAULT_AI_BASE_URL  # 缺省端点别名；实际请求走实例 base_url（.env AI_BASE_URL 可换 OpenAI 兼容提供方）
+CHAT_MODEL = DEFAULT_AI_MODEL  # 缺省模型别名；实际请求走实例 model（.env AI_MODEL）
 TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"  # 与 web 层同一路径来源（app/web/routes.py TOPICS_PATH）
 
-DEFAULT_MAX_RETRIES = 1  # 任务书口径：重试一次后仍失败 → 抛清晰异常
+DEFAULT_MAX_RETRIES = DEFAULT_AI_MAX_RETRIES  # 缺省重试次数别名；实际走实例 max_retries（.env AI_MAX_RETRIES）
 RETRY_WAIT_SECONDS = 1.0  # 仅重试一次，固定等 1 秒即可，不引指数退避
-REQUEST_TIMEOUT_SECONDS = 60.0  # LLM 响应慢于普通 REST，放宽到 60 秒
+REQUEST_TIMEOUT_SECONDS = DEFAULT_AI_TIMEOUT_SECONDS  # 缺省超时别名；实际走实例 timeout（.env AI_TIMEOUT_SECONDS）
 
-# README 正文截断入 prompt 的字符上限（T-017 本人拍板授权实施）：≈2000~3000 tokens，
-# 覆盖 README 头部核心信息且不撑爆上下文；截断点取前部（README 惯例：开头即项目定位）
-README_HEAD_CHARS = 8000
+# README 正文截断入 prompt 的缺省字符上限（T-017 本人拍板授权实施）：≈2000~3000 tokens，
+# 覆盖 README 头部核心信息且不撑爆上下文；截断点取前部（README 惯例：开头即项目定位）。
+# 缺省值别名；实际截断走 _ReadmeState 实例 max_chars（.env AI_README_HEAD_CHARS——单次调用成本主杠杆）
+README_HEAD_CHARS = DEFAULT_AI_README_HEAD_CHARS
 
 _ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长（与 app.report 同口径）
 
@@ -132,23 +141,29 @@ def _parse_suggested_topics(content: str) -> dict | None:
 
 
 class DeepSeekClient:
-    """httpx AsyncClient 封装 DeepSeek chat/completions；transport / sleep 可注入（单测 MockTransport 离线跑）。"""
+    """httpx AsyncClient 封装 OpenAI 兼容 chat/completions（缺省 DeepSeek，.env AI_BASE_URL/AI_MODEL 可换
+    提供方；类名保留 DeepSeekClient 免大面积改名）；transport / sleep 可注入（单测 MockTransport 离线跑）。"""
 
     def __init__(
         self,
         api_key: str,
         *,
+        base_url: str = CHAT_URL,
+        model: str = CHAT_MODEL,
+        request_timeout: float = REQUEST_TIMEOUT_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self._api_key = api_key
+        self._base_url = base_url
+        self._model = model
         self._sleep = sleep
         self._max_retries = max_retries
         self._client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_key}"},
             transport=transport,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=request_timeout,
         )
 
     async def aclose(self) -> None:
@@ -386,10 +401,11 @@ class DeepSeekClient:
         # key 在使用点校验（与 GitHubClient 同姿态）：config 层不报错，这里第一刀拦住空 key
         if not self._api_key:
             raise DeepSeekAuthError(
-                "DeepSeek API key 为空：请在项目根 .env 配置 DEEPSEEK_API_KEY，或注入同名系统环境变量"
+                "AI API key 为空：请在项目根 .env 配置 AI_API_KEY（或兼容键 DEEPSEEK_API_KEY），"
+                "或注入同名系统环境变量；若置了 AI_ENABLED=0 则本服务不配真实 AI（本地开发口径）"
             )
         payload = {
-            "model": CHAT_MODEL,
+            "model": self._model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -398,7 +414,7 @@ class DeepSeekClient:
         }
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._client.post(CHAT_URL, json=payload)
+                response = await self._client.post(self._base_url, json=payload)
             except httpx.HTTPError as exc:  # 超时/连接错误等传输层失败
                 if attempt >= self._max_retries:
                     raise DeepSeekError(
@@ -410,8 +426,8 @@ class DeepSeekClient:
             if status in (401, 402, 403):
                 # 账户类确定性错误（401 key 无效 / 402 余额不足 / 403 无权限）：逐条重试无意义只会刷爆
                 # 日志且次日重演，与空 key 同姿态直通整轮 handler
-                hint = "请更新项目根 .env 中的 DEEPSEEK_API_KEY 后重试" if status == 401 else "请检查 DeepSeek 账户余额与权限"
-                raise DeepSeekAuthError(f"DeepSeek 账户类错误（HTTP {status}）：{hint}；响应：{response.text[:200]}")
+                hint = "请更新项目根 .env 中的 AI_API_KEY（或兼容键 DEEPSEEK_API_KEY）后重试" if status == 401 else "请检查 AI 账户余额与权限"
+                raise DeepSeekAuthError(f"AI 账户类错误（HTTP {status}）：{hint}；响应：{response.text[:200]}")
             if status >= 500:
                 if attempt >= self._max_retries:
                     raise DeepSeekError(f"DeepSeek 服务端错误（HTTP {status}）：重试 {self._max_retries} 次后放弃")
@@ -516,9 +532,12 @@ class _ReadmeState:
     stats["readme_fetched"] 计数（缓存命中不计）。
     """
 
-    def __init__(self, github_client: GitHubClient | None, log: logging.Logger) -> None:
+    def __init__(
+        self, github_client: GitHubClient | None, log: logging.Logger, max_chars: int = README_HEAD_CHARS
+    ) -> None:
         self._client = github_client
         self._log = log
+        self._max_chars = max_chars  # 截断入 prompt 上限（.env AI_README_HEAD_CHARS，单次调用成本主杠杆）
         self._auth_stopped = False
         self._cache: dict[str, tuple[str | None, str | None]] = {}
 
@@ -539,7 +558,7 @@ class _ReadmeState:
             self._log.warning("README 拉取失败，退化元数据输入 %s：%s", full_name, exc)
             return None, None
         if text is not None:
-            text = text[:README_HEAD_CHARS]  # 截断入 prompt（授权实施：取前部，README 惯例开头即定位）
+            text = text[: self._max_chars]  # 截断入 prompt（授权实施：取前部，README 惯例开头即定位）
         self._cache[full_name] = (text, sha)
         if sha:
             stats["readme_fetched"] += 1
@@ -606,7 +625,7 @@ async def recommend_missing(
     ):
         existing[(row["repo_id"], row["dimension"], row["period_label"])] = row
 
-    readme_state = _ReadmeState(github_client, log)
+    readme_state = _ReadmeState(github_client, log, max_chars=get_settings().ai_readme_head_chars)
 
     # --- 周维度：缺 (repo_id, 'week', 当周标签) 则生成；同周已存在跳过（幂等，跨周标签不同自然生成新行） ---
     for full_name, item in listed_by_period["week"].items():
@@ -824,8 +843,8 @@ async def ensure_daily_ai(
         "summary_failed": 0,
         "readme_fetched": 0,
     }
-    if not get_settings().deepseek_api_key:
-        log.info("DEEPSEEK_API_KEY 未配置：跳过 AI 翻译与推荐语生成（降级，榜单服务照常）")
+    if not get_settings().ai_api_key:
+        log.info("AI 未配置或已禁用（AI_API_KEY/AI_ENABLED）：跳过 AI 翻译与推荐语生成（降级，榜单服务照常）")
         return stats
 
     # a) 范围集 S（三口径榜一次算齐，翻译段与推荐段共用，避免重复计算）

@@ -132,7 +132,13 @@ async def _run_sync() -> DailyStats:
             except Exception:
                 log.exception("榜单预计算异常：吞掉不抛出（页面缺缓存时降级实时算兜底），次日调度自然重试")
             try:
-                async with DeepSeekClient(settings.deepseek_api_key) as ai_client:
+                async with DeepSeekClient(
+                    settings.ai_api_key,
+                    base_url=settings.ai_base_url,
+                    model=settings.ai_model,
+                    request_timeout=settings.ai_timeout_seconds,
+                    max_retries=settings.ai_max_retries,
+                ) as ai_client:
                     # T-032 候选词扫描（§15.2）：仅 UTC 周一、每周补捞（run_daily 内）之后执行；
                     # 扫描段内部自带 AI 降级（key 缺失/调用失败整段跳过不清表，页面显示上一轮），
                     # 外层再兜一层防意外异常——扫描失败绝不阻断 AI 生成与次日调度（§15.3 记日志不报警）

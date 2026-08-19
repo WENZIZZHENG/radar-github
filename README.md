@@ -46,7 +46,7 @@ uv venv .venv && uv pip install -r pyproject.toml --extra dev   # 装依赖
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 ```
 
-环境变量：复制 `.env.example` 为 `.env` 后填实值（`.env` 不落仓）。键位：`GITHUB_TOKEN`、`DEEPSEEK_API_KEY`（两者缺失时对应功能降级、不阻塞出榜）、`RADAR_DB_PATH`（缺省 `data/radar.db`）、`RADAR_JOBS_ENABLED=0`（本地关调度防误采集）；逐键说明见 `.env.example` 注释。
+环境变量：复制 `.env.example` 为 `.env` 后填实值（`.env` 不落仓）。键位：`GITHUB_TOKEN`、`AI_API_KEY`（AI 提供方 key，兼容回退旧键 `DEEPSEEK_API_KEY`；缺失时 AI 功能降级、不阻塞出榜）、`AI_ENABLED=0`（本地关真实 AI 调用防烧额度）、`AI_BASE_URL`/`AI_MODEL`（换 OpenAI 兼容提供方时改，缺省 DeepSeek）、`RADAR_DB_PATH`（缺省 `data/radar.db`）、`RADAR_JOBS_ENABLED=0`（本地关调度防误采集）；逐键说明见 `.env.example` 注释。
 
 ## 生产部署
 

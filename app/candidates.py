@@ -100,8 +100,8 @@ async def scan_candidates(
     scanned=False 表示本轮未执行（key 未配置 / AI 调用失败 / 解析失败）——未写表未清表（页面显示上一轮）。
     """
     log = log or logger
-    if not get_settings().deepseek_api_key:
-        log.info("DEEPSEEK_API_KEY 未配置：跳过候选词扫描（降级，页面显示上一轮结果）")
+    if not get_settings().ai_api_key:
+        log.info("AI 未配置或已禁用（AI_API_KEY/AI_ENABLED）：跳过候选词扫描（降级，页面显示上一轮结果）")
         return {"scanned": False}
     now = now or datetime.now(timezone.utc)
     table = load_topics(TOPICS_PATH)

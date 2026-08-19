@@ -517,7 +517,7 @@ def _make_logger():
 class _FakeCtxClient:
     """假 async context manager（GitHubClient / DeepSeekClient 替身）：daily_job 只用到 with 生命周期。"""
 
-    def __init__(self, token=""):
+    def __init__(self, token="", **_kwargs):  # DeepSeekClient 构造带 base_url/model/timeout/retries 配置 kw，照单全收
         self.token = token
 
     async def __aenter__(self):

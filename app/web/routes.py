@@ -1297,10 +1297,23 @@ _batch_state_lock = threading.Lock()  # 保护 _batch_state 读写；防重入�
 _batch_task: asyncio.Task | None = None  # 模块级持有后台任务引用，防 GC 意外回收
 
 
+def _build_ai_client() -> DeepSeekClient:
+    """从 settings 构造 AI client（key/base_url/model/timeout/retries 全走 .env，缺省 DeepSeek，
+    换 OpenAI 兼容提供方只改环境变量）；AI_ENABLED=0 时 key 为空，client 在使用点抛账户类错误。"""
+    s = get_settings()
+    return DeepSeekClient(
+        s.ai_api_key,
+        base_url=s.ai_base_url,
+        model=s.ai_model,
+        request_timeout=s.ai_timeout_seconds,
+        max_retries=s.ai_max_retries,
+    )
+
+
 def _make_ai_client() -> DeepSeekClient:
     """批量 worker 自造 DeepSeek client：后台任务无请求生命周期，不能复用请求级 _ai_client 依赖（响应结束即关闭）；
     单测 monkeypatch 本工厂注入假 client（不走 dependency_overrides）。"""
-    return DeepSeekClient(get_settings().deepseek_api_key)
+    return _build_ai_client()
 
 
 async def _ai_client() -> AsyncIterator[DeepSeekClient]:
@@ -1308,7 +1321,7 @@ async def _ai_client() -> AsyncIterator[DeepSeekClient]:
 
     依赖注入形态（Depends）：单测用 app.dependency_overrides 换假 client，不打真 API（同 _github_client）。
     """
-    client = DeepSeekClient(get_settings().deepseek_api_key)
+    client = _build_ai_client()
     try:
         yield client
     finally:
@@ -1489,7 +1502,7 @@ def search_page(request: Request) -> HTMLResponse:
                 "title": "搜索",
                 "q": "",
                 "search": None,  # None = 未搜索（模板不渲染结果区）
-                "unavailable": not get_settings().deepseek_api_key,
+                "unavailable": not get_settings().ai_api_key,
                 "tracked": conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0],
                 "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
                 "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
@@ -1831,8 +1844,9 @@ async def api_recommend(
         ).fetchone()
         if repo is None:
             raise HTTPException(status_code=404, detail=f"仓库不在跟踪池：{full_name}")
-        # README 输入（失败/空退化，绝不抛出阻塞）；stats 传占位 dict：单条不计 readme_fetched 计数
-        readme_state = _ReadmeState(github, logger)
+        # README 输入（失败/空退化，绝不抛出阻塞）；stats 传占位 dict：单条不计 readme_fetched 计数；
+        # max_chars 走 .env AI_README_HEAD_CHARS（与批量补缺同口径，F2-1 评审补接线）
+        readme_state = _ReadmeState(github, logger, max_chars=get_settings().ai_readme_head_chars)
         readme_text, readme_sha = await readme_state.get(full_name, {"readme_fetched": 0})
         delta = stars = None
         if dimension != "total":

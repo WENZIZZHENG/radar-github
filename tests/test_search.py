@@ -539,7 +539,7 @@ def test_search_page_ok_and_nav(search_env):
 
 
 def test_search_page_unavailable_without_key(tmp_path, monkeypatch):
-    """DeepSeek key 未配置：页面明确"搜索暂不可用（AI 未配置）"＋表单禁用；榜单页不受影响。"""
+    """AI key 未配置：页面明确"搜索暂不可用（AI 未配置或已禁用）"＋表单禁用；榜单页不受影响。"""
     db = tmp_path / "no-key.db"
     init_db(db)
     monkeypatch.setenv("RADAR_DB_PATH", str(db))
@@ -548,7 +548,7 @@ def test_search_page_unavailable_without_key(tmp_path, monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/search")
         assert resp.status_code == 200
-        assert "搜索暂不可用（AI 未配置）" in resp.text
+        assert "搜索暂不可用（AI 未配置或已禁用）" in resp.text
         assert 'id="search-btn" disabled' in resp.text  # 按钮禁用
         assert 'required disabled' in resp.text  # 输入框禁用（disabled 在标签尾，不与 id 相邻）
         assert client.get("/").status_code == 200  # 主链路不受影响

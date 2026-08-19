@@ -20,7 +20,7 @@
 
   {# DeepSeek key 未配置（GET 页面直接判定，spec AI 降级姿态 fail-loud；榜单等主链路不受影响） #}
   {% if unavailable %}
-  <p class="notice" role="status">搜索暂不可用（AI 未配置）：请在项目根 .env 配置 DEEPSEEK_API_KEY 后重启服务。榜单浏览等主功能不受影响。</p>
+  <p class="notice" role="status">搜索暂不可用（AI 未配置或已禁用）：请在项目根 .env 配置 AI_API_KEY（或兼容键 DEEPSEEK_API_KEY）且不要置 AI_ENABLED=0，然后重启服务。榜单浏览等主功能不受影响。</p>
   {% endif %}
 
   {% if search %}

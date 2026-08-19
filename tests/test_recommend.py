@@ -210,6 +210,23 @@ def test_api_recommend_force_regenerate_overwrites(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_api_recommend_honors_readme_head_chars_env(tmp_path, monkeypatch):
+    """AI_README_HEAD_CHARS 对单个重生路径生效（评审 F2-1 补接线后的回归锁）：截断长度走 env 配置。"""
+
+    def seed(conn):
+        _add_repo(conn, "a/one", description_en="english text")
+
+    monkeypatch.setenv("AI_README_HEAD_CHARS", "5")
+    fake = FakeAiClient()
+    fake_gh = FakeGitHubClient(readmes={"a/one": ("# One-long-readme-body", "sha-x")})
+    with _make_client(tmp_path, monkeypatch, seed=seed, override_ai=lambda: fake, override_gh=lambda: fake_gh) as client:
+        resp = client.post(
+            "/api/recommend", json={"full_name": "a/one", "dimension": "total", "period_label": "all"}
+        )
+    assert resp.status_code == 200
+    assert fake.calls[0]["readme"] == "# One"  # 截断到 5 字符（env 生效，非缺省 8000）
+
+
 def test_api_recommend_week_dimension_writes_current_week(tmp_path, monkeypatch):
     """周维度强制重生：写入 (repo_id, 'week', 当周标签)；增量语境按当期窗口换算（出席带 delta）。"""
     now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
