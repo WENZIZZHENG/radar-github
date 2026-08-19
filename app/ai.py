@@ -306,15 +306,16 @@ class DeepSeekClient:
         return parsed
 
     async def understand_intent(self, query: str, *, prev_intent: dict | None = None) -> dict | None:
-        """智能搜索意图理解（T-034→T-036，§17）：用户自然语言 → 结构化查询 JSON（多关键词×多语言×主题词）。
+        """智能搜索意图理解（T-034→T-036，§17）：用户自然语言 → 结构化查询 JSON（多关键词×多语言×主题词×filters×unsupported）。
 
-        输出 JSON 契约：{"keywords": [英文关键词...], "languages": [语言名...], "topics": [主题词...]}——
+        输出 JSON 契约：{"keywords": [...], "languages": [...], "topics": [...], "filters": {...}, "unsupported": [...]}——
         keywords 小写英文关键词（3~6 个），languages 取值对齐 classify.LANGUAGES 键集（GitHub 精确名，
-        如 "Python"），topics 小写 kebab-case（可空）；关键词与语言均为数组，不锁单个。
-        追问时传入 prev_intent（上一轮意图的 JSON，含 keywords/languages/topics），prompt 携带旧意图与
-        本轮新输入，要求 LLM 产出合并后的新意图（同一 JSON 契约）——如追加关键词、替换语言等。
-        返回 None = 响应内容解析不出合法 JSON 对象（spec 口径：调用方退化为原输入/本轮输入单关键词，
-        不当场失败）；调用失败抛 DeepSeekError/DeepSeekAuthError（spec 口径：调用方按"搜索暂不可用"处理）——
+        如 "Python"），topics 小写 kebab-case（可空），filters 白名单只含 created_within_days（创建至今天数上限，
+        正整数）与 min_stars（最新星数下限，正整数），unsupported 为白名单外/无法检索的条件字符串数组（仅展示不影响检索）。
+        追问时传入 prev_intent（上一轮意图的 JSON，含全部字段），prompt 携带旧意图与本轮新输入，要求 LLM 产出合并后的
+        新意图（同一 JSON 契约）——如追加关键词、替换语言、filters 同名覆盖/未提及保留等。
+        返回 None = 响应内容解析不出合法 JSON 对象（spec 口径：调用方退化为原输入/本轮输入单关键词，不当场失败）；
+        调用失败抛 DeepSeekError/DeepSeekAuthError（spec 口径：调用方按"搜索暂不可用"处理）——
         None 与异常的分界即"有响应但内容烂"与"根本调不动"的分界。
         """
         if prev_intent is None:
@@ -324,7 +325,11 @@ class DeepSeekClient:
                 '{"keywords": [3~6 个英文关键词，小写，覆盖需求的核心技术/领域，如 "crawler", "scraping", "spider"],'
                 '"languages": [相关编程语言名数组，取值只能来自 Java/Go/Rust/TypeScript/JavaScript/Python，'
                 "不锁单个，拿不准就空],"
-                '"topics": [相关主题词数组，小写 kebab-case，可空]}'
+                '"topics": [相关主题词数组，小写 kebab-case，可空],'
+                '"filters": {"created_within_days": 创建至今天数上限（正整数，可选）, "min_stars": 最新星数下限（正整数，可选）},'
+                '"unsupported": [用户提到但无法检索的条件字符串数组，可选]}。'
+                "filters 白名单只许 created_within_days 与 min_stars 两个字段，必须是正整数；"
+                "白名单外条件（如'最近一周有提交'、'MIT 协议'）必须放入 unsupported，不得塞进 keywords。"
             )
             user = query
         else:
@@ -335,9 +340,13 @@ class DeepSeekClient:
                 '{"keywords": [3~6 个英文关键词，小写，覆盖合并后需求的核心技术/领域],'
                 '"languages": [相关编程语言名数组，取值只能来自 Java/Go/Rust/TypeScript/JavaScript/Python，'
                 "不锁单个，拿不准就空],"
-                '"topics": [相关主题词数组，小写 kebab-case，可空]}。'
+                '"topics": [相关主题词数组，小写 kebab-case，可空],'
+                '"filters": {"created_within_days": ..., "min_stars": ...},'
+                '"unsupported": [...]}。'
                 "合并规则：本轮输入是补充/修正——如'只要异步的'可追加 async 等关键词；"
-                "如'换成 Go 的'可把语言替换为 Go 并保留相关关键词；如'不要 Python'则移除 Python。"
+                "如'换成 Go 的'可把语言替换为 Go 并保留相关关键词；如'不要 Python'则移除 Python；"
+                "filters 同名字段由本轮新输入覆盖（如'放宽到 3 年内'），未提及的 filters/unsupported 保留；"
+                "白名单外条件必须放入 unsupported，不得塞进 keywords。"
             )
             user = f"上一轮意图：{json.dumps(prev_intent, ensure_ascii=False)}\n本轮新输入：{query}"
         content = await self._chat(system=system, user=user, temperature=0.2)  # 低温度：解析求稳

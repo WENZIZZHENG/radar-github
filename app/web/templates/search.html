@@ -28,10 +28,21 @@
     {# 执行期 AI 不可用（key 失效/余额/调用失败，§17.3）：fail-loud 提示，主链路不受影响 #}
     <p class="notice" role="status">搜索暂不可用：{{ search.unavailable_reason }}（榜单浏览等主功能不受影响）</p>
     {% else %}
-    {# 意图透明行（§17.1）：LLM 解析结果如实展示（含退化单关键词），可纠错可预期；语言空不渲染语言段 #}
+    {# 意图透明行（§17.1）：LLM 解析结果如实展示（含退化单关键词/filters/unsupported），可纠错可预期 #}
     <div class="intent-line">
-      <span><b>理解为：</b>{% for kw in search.intent.keywords %}{% if not loop.first %}、{% endif %}<span class="kw">{{ kw }}</span>{% endfor %}</span>
-      {% if search.intent.languages %}<span class="sep">／</span><span><b>语言：</b>{% for l in search.intent.languages %}{% if not loop.first %}、{% endif %}<span class="kw">{{ l }}</span>{% endfor %}</span>{% endif %}
+      <span><b>理解为：</b>{% for kw in search.intent.keywords %}<span class="kw">{{ kw }}</span>{{ "、" if not loop.last }}{% endfor %}</span>
+      {% if search.intent.languages %}
+      <span class="sep">／</span>
+      <span><b>语言：</b>{% for lang in search.intent.languages %}<span class="kw">{{ lang }}</span>{{ "、" if not loop.last }}{% endfor %}</span>
+      {% endif %}
+      {% if search.intent.filters %}
+      <span class="sep">／</span>
+      <span>{{ search.intent.filters_text }}</span>
+      {% endif %}
+      {% if search.intent.unsupported %}
+      <span class="sep">／</span>
+      <span>暂不支持：{{ search.intent.unsupported | join("、") }}</span>
+      {% endif %}
     </div>
 
     {% if search.rows %}

@@ -1,16 +1,19 @@
 """智能搜索（T-034→T-036，§17）：三段式链路——LLM 意图理解 → 池内召回粗排 → LLM 精选；池内不足 20 条时 GitHub Search 实时补足。
 
 口径（spec smart-search 钉死，勿自由发挥）：
-- 意图理解：用户自然语言 → 多关键词×多语言×主题词（JSON，语言对齐 classify.LANGUAGES 键集）；
-  返回内容非法 JSON → 退化为原输入单关键词（不当场失败）；调用失败/账户类错误 → 搜索暂不可用（fail-loud）；
-  追问时携带旧意图 JSON 要求 LLM 产出合并后新意图（同一 JSON 契约），合并非法 → 退化为本轮新输入单关键词
-  （不沿用旧意图，spec 钉死）；
+- 意图理解：用户自然语言 → 多关键词×多语言×主题词×filters×unsupported（JSON，语言对齐 classify.LANGUAGES 键集）；
+  filters 白名单只含 created_within_days/min_stars（正整数），白名单外/类型非法 → 丢弃该字段记 WARNING；
+  unsupported 为仅展示不影响检索的条件字符串数组；返回内容非法 JSON → 退化为原输入单关键词（不当场失败）；
+  调用失败/账户类错误 → 搜索暂不可用（fail-loud）；追问时携带旧意图 JSON 要求 LLM 产出合并后新意图
+  （同一 JSON 契约，filters 同名覆盖、未提及保留），合并非法 → 退化为本轮新输入单关键词（不沿用旧意图，spec 钉死）；
 - 池内召回：alive 仓关键词组匹配（full_name/description_en/topics 任一命中任一关键词计一次命中，
-  instr 与 LIKE %kw% 等价且无通配符陷阱），语言过滤取交集；粗排 = 命中数降序 → 最新星数降序，取前 50；
+  instr 与 LIKE %kw% 等价且无通配符陷阱），语言过滤取交集，再叠加 filters（created_within_days/min_stars）；
+  粗排 = 命中数降序 → 最新星数降序，取前 50；
 - 精选：候选 50 → 至多 20 条 + 每条约 50 字中文理由（编号引用防幻觉）；非法返回/超范围引用/调用失败
   → 退化按粗排顺序直出池内候选（无推荐理由），记 WARNING；不足 20 条有几个列几个，不凑数；
-- 池外补搜：池内精选后不足 20 条才触发，同组关键词（含语言限定）GitHub Search 补足；池外行 external=True，
-  展示 GitHub 原始描述、无增星/译文/概要；失败/限速/token 缺失 → 跳过补搜（池内照常，页面标注）；
+- 池外补搜：池内精选后不足 20 条才触发，同组关键词（含语言限定）GitHub Search 补足；filters 追加限定词
+  （created:>/stars:>=，不占 5 个布尔运算符预算）；池外行 external=True，展示 GitHub 原始描述、无增星/译文/概要；
+  失败/限速/token 缺失 → 跳过补搜（池内照常，页面标注）；
 - 空结果如实说明，不硬编任何条目；候选集永远来自真实池子/GitHub 真实响应。
 """
 
@@ -20,6 +23,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.ai import DeepSeekAuthError, DeepSeekClient, DeepSeekError
@@ -33,25 +37,53 @@ POOL_TOP_N = 50
 
 logger = logging.getLogger(__name__)
 
+_ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"  # schema 硬约定：UTC 定长（与 app.report 同口径）
+
 
 @dataclass(frozen=True)
 class Intent:
     """LLM 意图理解结果（或退化形态）：keywords 小写英文关键词、languages 为 LANGUAGES 键集内的
-    GitHub 精确语言名（可能空 = 不过滤）、topics 小写主题词（仅供补搜查询参考）；degraded=True
-    表示 LLM 内容非法退化为原输入单关键词（spec 口径，页面意图透明行如实展示）。"""
+    GitHub 精确语言名（可能空 = 不过滤）、topics 小写主题词（仅供补搜查询参考）；filters 为白名单
+    内结构化条件（created_within_days/min_stars），unsupported 为仅展示不影响检索的条件；
+    degraded=True 表示 LLM 内容非法退化为原输入单关键词（spec 口径，页面意图透明行如实展示）。"""
 
     raw_query: str
     keywords: list[str]
     languages: list[str] = field(default_factory=list)
     topics: list[str] = field(default_factory=list)
     degraded: bool = False
+    filters: dict = field(default_factory=dict)
+    unsupported: list[str] = field(default_factory=list)
+
+    @property
+    def filters_text(self) -> str:
+        """filters 展示段（"创建：近 N 年内/近 N 天内 ／ 星数 ≥N"形态，无 filters 为空串）；
+        意图行分段渲染与 display_text 拼装共用此单点。"""
+        filter_parts: list[str] = []
+        days = self.filters.get("created_within_days")
+        if isinstance(days, int):
+            if days % 365 == 0:
+                filter_parts.append(f"创建：近 {days // 365} 年内")
+            else:
+                filter_parts.append(f"创建：近 {days} 天内")
+        min_stars = self.filters.get("min_stars")
+        if isinstance(min_stars, int):
+            filter_parts.append(f"星数 ≥{min_stars}")
+        return " ／ ".join(filter_parts)
 
     @property
     def display_text(self) -> str:
-        """意图透明行展示文本（"理解为：crawler、scraping ／ 语言：Python"形态；语言空则省略语言段）。"""
+        """意图透明行纯文本形态（"crawler、scraping ／ 语言：Python ／ 创建：近 1 年内 ／ 暂不支持：…"，
+        语言/filters/unsupported 空则省略对应段）；模板意图行按 keywords/languages/filters_text/
+        unsupported 分段渲染 pill，本属性供空结果说明与追问意图对比条使用。"""
         text = "、".join(self.keywords)
         if self.languages:
             text += f" ／ 语言：{'、'.join(self.languages)}"
+        ft = self.filters_text
+        if ft:
+            text += " ／ " + ft
+        if self.unsupported:
+            text += f" ／ 暂不支持：{'、'.join(self.unsupported)}"
         return text
 
 
@@ -119,9 +151,34 @@ def _normalize_language(raw: str) -> str | None:
     return None
 
 
+def _validate_filters(filters: Any) -> dict[str, int]:
+    """filters 逐字段白名单校验：仅保留 created_within_days 与 min_stars 两个正整数字段；
+    白名单外字段或类型非法 → 丢弃该字段并记 WARNING，不整体失败。"""
+    if not isinstance(filters, dict):
+        return {}
+    clean: dict[str, int] = {}
+    for k, v in filters.items():
+        if k not in ("created_within_days", "min_stars"):
+            logger.warning("智能搜索 filters 白名单外字段丢弃：%s=%r", k, v)
+            continue
+        if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+            logger.warning("智能搜索 filters 字段类型非法丢弃：%s=%r", k, v)
+            continue
+        clean[k] = v
+    return clean
+
+
+def _validate_unsupported(unsupported: Any) -> list[str]:
+    """unsupported 字符串数组：丢弃非字符串/空元素；非法形态整体视为空。"""
+    if not isinstance(unsupported, list):
+        return []
+    return [item.strip() for item in unsupported if isinstance(item, str) and item.strip()]
+
+
 def _build_intent(raw_query: str, parsed: Any) -> Intent:
     """LLM 解析结果 → Intent：字段形态/元素类型非法或关键词全空 → 退化原输入单关键词（spec 口径，
-    不当场失败）；语言与主题词逐元素归一后丢弃非法值（语言取值对齐 classify.LANGUAGES 键集）。"""
+    不当场失败）；语言与主题词逐元素归一后丢弃非法值（语言取值对齐 classify.LANGUAGES 键集）；
+    filters 逐字段白名单校验、unsupported 仅展示不影响检索。"""
     if not isinstance(parsed, dict):
         return Intent(raw_query, [_normalize_keyword(raw_query)], degraded=True)
     kws = parsed.get("keywords")
@@ -147,7 +204,9 @@ def _build_intent(raw_query: str, parsed: Any) -> Intent:
     if not keywords:
         # 无关键词无法检索：退化原输入（LLM 给了空/非法关键词数组也算内容非法）
         return Intent(raw_query, [_normalize_keyword(raw_query)], degraded=True)
-    return Intent(raw_query, keywords, languages, topic_words)
+    clean_filters = _validate_filters(parsed.get("filters"))
+    clean_unsupported = _validate_unsupported(parsed.get("unsupported"))
+    return Intent(raw_query, keywords, languages, topic_words, filters=clean_filters, unsupported=clean_unsupported)
 
 
 def _endpoint_snapshot(conn: sqlite3.Connection, repo_id: int) -> sqlite3.Row | None:
@@ -166,7 +225,9 @@ def _count_hits(row: sqlite3.Row, keywords: list[str]) -> int:
 
 
 def recall_candidates(conn: sqlite3.Connection, intent: Intent) -> list[Candidate]:
-    """池内召回（spec 决策 2）：alive 仓关键词组匹配 + 语言过滤交集，按命中数降序 → 最新星数降序取前 50。
+    """池内召回（spec 决策 2/6）：alive 仓关键词组匹配 + 语言过滤交集，再叠加 filters
+    （created_within_days → github_created_at 非 NULL 且距今 <N 天；min_stars → 最新快照星数 ≥N），
+    按命中数降序 → 最新星数降序取前 50。
 
     SQL 侧用 instr（子串包含，ASCII 大小写不敏感）与 LIKE '%kw%' 等价，但关键词含 %/_ 时无通配符
     陷阱；Python 侧 _count_hits 同构计数——两处口径一致，入选行必然 hits ≥ 1。
@@ -189,10 +250,22 @@ def recall_candidates(conn: sqlite3.Connection, intent: Intent) -> list[Candidat
         params.extend([kw] * 3)
     sql += " AND (" + " OR ".join(kw_conds) + ")"
     rows = conn.execute(sql, params).fetchall()
+    now = datetime.now(timezone.utc)
+    created_cutoff = None
+    if "created_within_days" in intent.filters:
+        created_cutoff = (now - timedelta(days=intent.filters["created_within_days"])).strftime(_ISO_FMT)
+    min_stars = intent.filters.get("min_stars")
+
     starred: list[tuple[int, int, sqlite3.Row, sqlite3.Row | None]] = []
     for r in rows:
         snap = _endpoint_snapshot(conn, r["id"])
         stars = snap["stars"] if snap is not None else 0
+        if min_stars is not None and stars < min_stars:
+            continue
+        if created_cutoff is not None:
+            created_at = r["github_created_at"]
+            if created_at is None or created_at < created_cutoff:
+                continue
         starred.append((_count_hits(r, keywords), stars, r, snap))
     starred.sort(key=lambda t: (-t[0], -t[1]))  # 命中数降序 → 星数降序（粗排键钉死）
     candidates: list[Candidate] = []
@@ -290,6 +363,12 @@ def _github_query(intent: Intent) -> str:
     if intent.languages:
         lang_list = [f'language:"{lang}"' for lang in intent.languages[:2]]
         parts.append(f"({' OR '.join(lang_list)})" if len(lang_list) > 1 else lang_list[0])
+    # filters 限定词不占 GitHub 单查询 5 个布尔运算符预算（spec 决策 6）
+    if "created_within_days" in intent.filters:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=intent.filters["created_within_days"])).date().isoformat()
+        parts.append(f"created:>{cutoff}")
+    if "min_stars" in intent.filters:
+        parts.append(f"stars:>={intent.filters['min_stars']}")
     return " ".join(parts)
 
 
@@ -362,6 +441,8 @@ async def run_search(
             "keywords": prev_intent.keywords,
             "languages": prev_intent.languages,
             "topics": prev_intent.topics,
+            "filters": prev_intent.filters,
+            "unsupported": prev_intent.unsupported,
         }
     try:
         parsed = await ai_client.understand_intent(raw_query, **ai_kwargs)

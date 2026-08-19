@@ -17,6 +17,7 @@
 import asyncio
 import json
 import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -206,9 +207,12 @@ def test_run_search_follow_up_merge_intent(tmp_path):
     assert not result.intent.degraded
     assert result.intent.languages == ["Go"]
     assert [h.candidate.full_name for h in result.pool_hits] == ["a/go-crawler"]
-    # 校验 LLM 收到旧意图
+    # 校验 LLM 收到旧意图（含 filters/unsupported）
     assert len(ai.intent_calls) == 1
-    assert ai.intent_calls[0] == ("换成 Go 的", {"keywords": ["crawler", "scraping"], "languages": ["Python"], "topics": []})
+    assert ai.intent_calls[0] == (
+        "换成 Go 的",
+        {"keywords": ["crawler", "scraping"], "languages": ["Python"], "topics": [], "filters": {}, "unsupported": []},
+    )
     conn.close()
 
 
@@ -839,3 +843,197 @@ def test_search_external_follow_closes_loop(search_env):
         ).fetchone()
         assert snap["stars"] == 9000  # 基线快照
     app.dependency_overrides.clear()
+
+
+# ---------- T-036 追加：filters 白名单、unsupported 仅展示、召回/补搜过滤、追问合并 ----------
+
+
+def test_intent_build_filters_and_unsupported():
+    """filters 白名单字段与 unsupported 字符串数组正常进入 Intent。"""
+    intent = _build_intent(
+        "x",
+        {
+            "keywords": ["k"],
+            "languages": [],
+            "topics": [],
+            "filters": {"created_within_days": 365, "min_stars": 5000},
+            "unsupported": ["最近一周有提交"],
+        },
+    )
+    assert intent.filters == {"created_within_days": 365, "min_stars": 5000}
+    assert intent.unsupported == ["最近一周有提交"]
+    assert "创建：近 1 年内" in intent.display_text
+    assert "星数 ≥5000" in intent.display_text
+    assert "暂不支持：最近一周有提交" in intent.display_text
+
+
+def test_intent_build_invalid_filters_dropped_with_warning(caplog):
+    """白名单外字段/类型非法/非正整数 → 丢弃该字段记 WARNING，其余合法字段仍生效。"""
+    with caplog.at_level("WARNING", logger="app.search"):
+        intent = _build_intent(
+            "x",
+            {
+                "keywords": ["k"],
+                "languages": [],
+                "topics": [],
+                "filters": {
+                    "created_within_days": 365,
+                    "forks_min": 100,
+                    "min_stars": "5000",
+                    "bad_bool": True,
+                    "negative": -1,
+                },
+                "unsupported": ["a", 123, "", "b"],
+            },
+        )
+    assert intent.filters == {"created_within_days": 365}
+    assert intent.unsupported == ["a", "b"]
+    assert any("白名单外字段丢弃" in r.message for r in caplog.records)
+    assert any("类型非法丢弃" in r.message for r in caplog.records)
+
+
+def test_intent_display_text_days_not_multiple_of_365():
+    """created_within_days 不能整除 365 时显示'近 N 天内'。"""
+    intent = _build_intent(
+        "x",
+        {"keywords": ["k"], "languages": [], "topics": [], "filters": {"created_within_days": 180}},
+    )
+    assert "创建：近 180 天内" in intent.display_text
+    assert "年" not in intent.display_text
+
+
+def _iso_now() -> str:
+    """当前 UTC 的 ISO 定长字符串（与 schema 同口径）。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_recall_filters_created_within_days_and_min_stars(tmp_path):
+    """filters 叠加过滤：created_within_days 排除 NULL 与超期；min_stars 排除星数不足。"""
+    fresh = _iso_now()
+    old = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = _open_db(tmp_path)
+    # 命中关键词，但创建时间 NULL
+    _add_repo(conn, "a/no-created", description_en="crawler tool", stars=9000, github_created_at=None)
+    # 命中，创建时间太近（在 N 天内）
+    _add_repo(conn, "a/fresh", description_en="crawler tool", stars=9000, github_created_at=fresh)
+    # 命中，创建时间太远
+    _add_repo(conn, "a/old", description_en="crawler tool", stars=9000, github_created_at=old)
+    # 命中，星数不足
+    _add_repo(conn, "a/low-stars", description_en="crawler tool", stars=100, github_created_at=fresh)
+    conn.commit()
+    intent = Intent(
+        "crawler",
+        ["crawler"],
+        filters={"created_within_days": 30, "min_stars": 1000},
+    )
+    cands = recall_candidates(conn, intent)
+    assert [c.full_name for c in cands] == ["a/fresh"]
+    conn.close()
+
+
+def test_recall_filter_created_null_excluded(tmp_path):
+    """created_within_days 过滤：github_created_at 为 NULL 的仓不入选。"""
+    fresh = _iso_now()
+    conn = _open_db(tmp_path)
+    _add_repo(conn, "a/null-created", description_en="crawler tool", stars=9000, github_created_at=None)
+    _add_repo(conn, "a/fresh", description_en="crawler tool", stars=9000, github_created_at=fresh)
+    conn.commit()
+    cands = recall_candidates(conn, Intent("crawler", ["crawler"], filters={"created_within_days": 30}))
+    assert [c.full_name for c in cands] == ["a/fresh"]
+    conn.close()
+
+
+def test_github_query_with_filters():
+    """_github_query 追加 filters 限定词：created:>YYYY-MM-DD、stars:>=N；限定词不占运算符预算。"""
+    import re
+
+    # 4 关键词（3 个 OR）＋2 语言（1 个 OR）恰满 4 个运算符预算，filters 限定词若计入必然超 4
+    intent = Intent(
+        "crawler",
+        ["crawler", "scraping", "spider", "scrape"],
+        ["Python", "Go"],
+        filters={"created_within_days": 365, "min_stars": 5000},
+    )
+    q = _github_query(intent)
+    assert re.search(r"created:>\d{4}-\d{2}-\d{2}", q)
+    assert "stars:>=5000" in q
+    assert "(crawler OR scraping OR spider OR scrape)" in q
+    assert '(language:"Python" OR language:"Go")' in q
+    # 限定词不计入 OR 预算（恰满 4，多一个即破）
+    assert q.count(" OR ") == 4
+
+
+def test_run_search_follow_up_merge_filters_override(tmp_path):
+    """追问合并：LLM 返回的合并意图中 filters 同名覆盖、未提及保留；服务端把旧 filters/unsupported 传给 LLM。"""
+    conn = _open_db(tmp_path)
+    _add_repo(conn, "a/crawler", description_en="web crawler framework", language="Python", stars=2000)
+    conn.commit()
+    old = Intent(
+        "我要做爬虫",
+        ["crawler", "scraping"],
+        ["Python"],
+        filters={"created_within_days": 365, "min_stars": 1000},
+        unsupported=["最近一周有提交"],
+    )
+    # LLM 合并结果：created_within_days 被覆盖，min_stars 保留，unsupported 清空
+    merged = {
+        "keywords": ["crawler", "scraping"],
+        "languages": ["Python"],
+        "topics": [],
+        "filters": {"created_within_days": 1095, "min_stars": 1000},
+        "unsupported": [],
+    }
+    ai = FakeSearchAI(intent=merged, select={"results": [{"id": 1, "reason": "理由"}]})
+    result = _run_search(conn, ai, FakeSearchGitHub(), "放宽到 3 年内", prev_intent=old)
+    assert result.intent.filters == {"created_within_days": 1095, "min_stars": 1000}
+    assert result.intent.unsupported == []
+    assert ai.intent_calls[0][1]["filters"] == {"created_within_days": 365, "min_stars": 1000}
+    assert ai.intent_calls[0][1]["unsupported"] == ["最近一周有提交"]
+    conn.close()
+
+
+def test_search_post_filters_and_unsupported_rendered(search_env):
+    """意图透明行渲染 filters 生效段与 unsupported 段。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    ai = FakeSearchAI(
+        intent={
+            "keywords": ["crawler"],
+            "languages": [],
+            "topics": [],
+            "filters": {"created_within_days": 365, "min_stars": 5000},
+            "unsupported": ["最近一周有提交"],
+        },
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        text = client.post("/search", data={"q": "爬虫"}).text
+        assert "创建：近 1 年内" in text
+        assert "星数 ≥5000" in text
+        assert "暂不支持：最近一周有提交" in text
+    app.dependency_overrides.clear()
+
+
+def test_search_post_prev_intent_filters_parsed(search_env):
+    """追问回传的 prev_intent 含 filters/unsupported 时正确解析并进入合并链路。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    first_ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, first_ai, FakeSearchGitHub(pages=[[]])) as client:
+        first = client.post("/search", data={"q": "爬虫"}).text
+        prev_intent_value = _extract_hidden(first, "prev_intent")
+
+    follow_ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, follow_ai, FakeSearchGitHub(pages=[[]])) as client:
+        client.post("/search", data={"q": "更窄的", "prev_intent": prev_intent_value}).text
+        # 合并调用携带的 prev_intent 含 filters/unsupported（即使为空对象/数组）
+        assert follow_ai.intent_calls[0][1]["filters"] == {}
+        assert follow_ai.intent_calls[0][1]["unsupported"] == []

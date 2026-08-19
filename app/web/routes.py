@@ -71,7 +71,7 @@ from app.report import (
     quarter_label,
     week_label,
 )
-from app.search import Intent, run_search
+from app.search import Intent, _validate_filters, _validate_unsupported, run_search
 
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"  # 供 app.main 挂载 StaticFiles（/static）
@@ -1322,7 +1322,8 @@ _SEARCH_QUERY_MAX_LEN = 200
 
 
 def _parse_prev_intent(raw: list[str] | None) -> Intent | None:
-    """解析追问回传的上一轮意图 JSON：缺失/非法/形态非法 → None（按首搜处理，不报错）。"""
+    """解析追问回传的上一轮意图 JSON：缺失/非法/形态非法 → None（按首搜处理，不报错）；
+    filters/unsupported 按 _build_intent 同一白名单校验口径过滤非法字段。"""
     if not raw:
         return None
     try:
@@ -1342,11 +1343,15 @@ def _parse_prev_intent(raw: list[str] | None) -> Intent | None:
     clean_topics = [t.strip().lower() for t in topics if isinstance(t, str) and t.strip()]
     if not clean_keywords:
         return None
+    clean_filters = _validate_filters(parsed.get("filters"))
+    clean_unsupported = _validate_unsupported(parsed.get("unsupported"))
     return Intent(
         raw_query=parsed.get("raw_query") or "",
         keywords=clean_keywords,
         languages=clean_languages,
         topics=clean_topics,
+        filters=clean_filters,
+        unsupported=clean_unsupported,
     )
 
 
