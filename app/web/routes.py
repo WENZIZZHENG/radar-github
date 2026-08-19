@@ -422,13 +422,14 @@ def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict, summa
 
 
 def _all_tags(conn: sqlite3.Connection) -> list[str]:
-    """T-022 打标输入建议（datalist）：全部既有标签一次注入（SELECT DISTINCT 去重排序，几十个量级）。
+    """T-035 打标输入建议：全部既有标签按使用次数降序、同次数按标签名字母序注入。
 
-    供渲染行页面的模板上下文（_boards_context / follows_page / tag_page）——每页渲染一个
-    `<datalist id="all-tags">`（base.html 统一落点，空库不渲染）；T-035 起 datalist 仅作 JS 自绘下拉的纯数据源，
-    输入框不再挂 list 属性（原生 datalist 建议手机端不可用）。标签云页（无行列表）不注入。
+    供 _boards_context（P1/P2/P3 榜单页）与 follows_page/tag_page 注入 all_tags，统一落点在
+    base.html 的 <datalist id="all-tags">；标签云页（/tags）无打标输入框，不注入。
+    datalist 仅作 JS 自绘下拉的纯数据源（输入框不挂 list 属性），空库不渲染。
     """
-    return [r["tag"] for r in conn.execute("SELECT DISTINCT tag FROM tags ORDER BY tag")]
+    rows = conn.execute("SELECT tag, COUNT(*) AS n FROM tags GROUP BY tag ORDER BY n DESC, tag").fetchall()
+    return [r["tag"] for r in rows]
 
 
 def _display_maps(

@@ -262,6 +262,7 @@ function startTagInput(btn) {
   input.focus();
   let submitting = false;
   let highlightedIndex = null;
+  updateSuggestions(); // T-035：输入框出现立即列出前 8 条既有标签
 
   const restore = () => {
     if (!input.isConnected) return; // 已被 chip 替换（提交成功）→ 无操作
@@ -280,19 +281,20 @@ function startTagInput(btn) {
     }
     updateSuggestions();
   });
-  // T-035：子串匹配过滤，最多 8 条；无匹配或不输入时隐藏下拉。
+  // T-035：子串匹配过滤，最多 8 条；空输入时直接列出前 8 条（数据源已按频率降序）。
   function updateSuggestions() {
     const term = input.value.trim();
     const dl = document.getElementById("all-tags");
-    if (!dl || !term) {
+    if (!dl) {
       dropdown.hidden = true;
       highlightedIndex = null;
       return;
     }
     const all = Array.from(dl.options).map((o) => o.value);
-    const matches = all
-      .filter((t) => t.toLowerCase().includes(term.toLowerCase()))
-      .slice(0, 8);
+    const matches = (term
+      ? all.filter((t) => t.toLowerCase().includes(term.toLowerCase()))
+      : all
+    ).slice(0, 8);
     if (matches.length === 0) {
       dropdown.hidden = true;
       highlightedIndex = null;

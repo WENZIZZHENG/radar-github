@@ -788,6 +788,34 @@ def test_no_datalist_on_empty_tag_db(fresh_client):
         assert '<datalist id="all-tags">' not in resp.text, path
 
 
+def test_datalist_sorted_by_frequency_then_name(tmp_path, monkeypatch):
+    """T-035：_all_tags 按使用次数降序、同次数按标签名字母序注入 datalist。"""
+    db = tmp_path / "tags-freq.db"
+    init_db(db)
+    conn = get_conn(db)
+    try:
+        # a/py 打 2 枚"common"、1 枚"ai"；a/go 打 1 枚"common"；a/rs 打 1 枚"rust"
+        for name in ("a/py", "a/go", "a/rs"):
+            _add_repo(conn, name, language="Python", snapshots=[(f"{SNAP_DAY}T00:00:00Z", 100)])
+        py_id = conn.execute("SELECT id FROM repos WHERE full_name = 'a/py'").fetchone()["id"]
+        go_id = conn.execute("SELECT id FROM repos WHERE full_name = 'a/go'").fetchone()["id"]
+        rs_id = conn.execute("SELECT id FROM repos WHERE full_name = 'a/rs'").fetchone()["id"]
+        for tag, rid in [("common", py_id), ("common", go_id), ("ai", py_id), ("rust", rs_id)]:
+            conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, ?)", (rid, tag))
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("RADAR_DB_PATH", str(db))
+    monkeypatch.setenv("RADAR_JOBS_ENABLED", "0")
+    with TestClient(app) as client:
+        text = client.get("/total").text
+        # 按次数降序：common(2) > ai(1) = rust(1)；同次数按名字母序：ai < rust
+        m = re.search(r'<datalist id="all-tags">(.*?)</datalist>', text, re.S)
+        assert m is not None
+        inner = m.group(1)
+        assert inner.index('value="common"') < inner.index('value="ai"') < inner.index('value="rust"')
+
+
 # ---------- T-021：左侧边栏（§12.1，仅 P1/P2/P3）＋P6 标签筛选（§12.2） ----------
 
 
