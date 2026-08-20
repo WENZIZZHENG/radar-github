@@ -11,17 +11,19 @@
 - 推荐语三维度（输入含 README 正文截断，拉取失败/空退化元数据输入、不持久化；按
   (repo_id, dimension, period_label) 写入 recommendations）：
   * week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
-  * quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
-  * total：(repo_id, 'total', 'all') 缺失或 README blob sha 变化 → 生成/REPLACE（README 变更当日重生，
-    总星文本懒口径不每周重刷；prompt 不引用具体星数/排名数字，防 evergreen 数字陈旧）；
-    README 拉取失败（sha 未取到，含 404/auth 停拉）不触发重生、保留旧行旧指纹——防失败制造每日 churn
-    （README 被删除的 404 场景因此不再触发，属探测能力边界）；
+  * quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周且跑批日在半月窗口内
+    → 生成/REPLACE（每月 1 号、15 号重生；季内其余日期跳过已有行）；
+  * total：(repo_id, 'total', 'all') 缺失或跑批日在半月窗口内且 README blob sha 变化 → 生成/REPLACE
+    （每月 1 号、15 号比对 sha 决定是否重生，非窗口日不拉 README 不比 sha；总星文本懒口径不每周重刷；
+    prompt 不引用具体星数/排名数字，防 evergreen 数字陈旧）；README 拉取失败（sha 未取到，含 404/auth 停拉）
+    不触发重生、保留旧行旧指纹——防失败制造每日 churn（README 被删除的 404 场景因此不再触发，属探测能力边界）；
   * 概要（T-024，§11）：与推荐语并存——推荐语＝为什么值得关注（营销视角），概要＝是什么
     （README 文档视角、段落级 3~5 句中文、无维度概念、全页面同一条）；key=(repo_id, 'summary', 'all')，
-    覆盖 S 全集（上榜∪关注，同 T-017 推荐语 S 集口径）；懒生成（缺时每日 ensure 补）＋README 变更
-    当日重生（同 total 段 F2-1 守卫）；仅每日 ensure（refresh=True）执行，无任何手动入口
-    （手动批量 worker refresh=False 整段跳过——§11 无手动按钮）；prompt 不引用任何星数/增星/排名数字；
-  * README sha 比对仅每日 ensure 对 S 内仓进行；sha NULL 仓后续出现 README 视为变更自愈；
+    覆盖 S 全集（上榜∪关注，同 T-017 推荐语 S 集口径）；懒生成（缺时每日 ensure 补）＋半月窗口内 README 变更
+    重生（同 total 段 F2-1 守卫，非窗口日对已有行不拉 README）；仅每日 ensure（refresh=True）执行，
+    无任何手动入口（手动批量 worker refresh=False 整段跳过——§11 无手动按钮）；
+    prompt 不引用任何星数/增星/排名数字；
+  * README sha 比对仅每日 ensure 且在半月窗口日对 S 内仓进行；sha NULL 仓后续出现 README 视为变更自愈；
     周/季维度不随 README 触发；
 - 降级：DEEPSEEK_API_KEY 未配置 → 记 INFO 返回零统计，服务照常；单条 translate/recommend 失败 →
   记 WARNING 跳过该条计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额/账户权限 401/402/403）
@@ -132,6 +134,14 @@ def _week_label(d: date) -> str:
 def _quarter_label(d: date) -> str:
     """date → 季度标签（2026-Q3）；与 app/web/routes.py 的 _quarter_label 同一口径（内联同构）。"""
     return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+
+
+def _refresh_window_open(d: date) -> bool:
+    """AI 推荐语/概要重生半月窗口：每月 1 号、15 号才允许对已有行执行重生（quarter/total/summary）。
+
+    窗口判定只读 date，不引入新依赖；周榜（week）与手动批量补缺（refresh=False）不受此窗口影响。
+    """
+    return d.day in (1, 15)
 
 
 def _extract_content(response: object) -> str | None:
@@ -660,13 +670,16 @@ async def recommend_missing(
     ∪ 关注集（周/季含新崛起区 Top10；三口径含新项目区 Top20，与主榜行同待遇）。
 
     - week：(repo_id, 'week', 当周标签) 缺失则生成（同周已存在跳过，幂等），输入带本周增量语境；
-    - quarter：(repo_id, 'quarter', 当季标签) 缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季内每周重生）；
-    - total：(repo_id, 'total', 'all') 缺失则生成（懒口径）；refresh=True（每日 ensure）时 README blob sha
-      变化 → REPLACE 重生并更新 sha（README 变更当日重生，自愈）；总星文本不每周重刷、prompt 不引用数字；
+    - quarter：(repo_id, 'quarter', 当季标签) 缺失，或跑批日在半月窗口内且 generated_week ≠ 当周
+      → 生成/REPLACE（每月 1 号、15 号重生；非窗口日跳过已有行）；
+    - total：(repo_id, 'total', 'all') 缺失则生成（懒口径）；refresh=True（每日 ensure）且跑批日在半月窗口内
+      时，才拉 README 比对 blob sha；sha 非空且变化 → REPLACE 重生并更新 sha（每月 1 号、15 号比对重生，
+      非窗口日不拉 README 不比对，自愈）；总星文本不每周重刷、prompt 不引用数字；
     - summary（T-024，§11）：key=(repo_id, 'summary', 'all')，覆盖 S 全集（all_names 即上榜∪关注去重），
       仅 refresh=True（每日 ensure 路径）执行——§11 无手动入口，手动批量 worker refresh=False 整段跳过；
-      缺失则生成；refresh 时 README sha 非空且与 cur['readme_sha'] 不同 → REPLACE 重生并更新 sha
-      （与 total 段同一 F2-1 守卫：本次 sha 未取到不触发重生、保留旧行旧指纹）；概要懒口径不每周重刷；
+      缺失则生成；refresh 且窗口日才拉 README 比对 sha，sha 非空且与 cur['readme_sha'] 不同 → REPLACE 重生
+      （与 total 段同一 F2-1 守卫：非窗口日不拉 README，本次 sha 未取到不触发重生、保留旧行旧指纹）；
+      概要懒口径不每周重刷；
     - 输入含 README 正文（截断；拉取失败/空退化元数据，不持久化）；README 拉取失败绝不抛出阻塞
       （GitHub token 缺失/无效 → 全量退化、readme_sha 保持 NULL）；README 复用同一 _ReadmeState 实例
       （逐仓缓存，同轮同仓只拉一次，total 段与 summary 段共享）；
@@ -698,6 +711,7 @@ async def recommend_missing(
     repo_info = _load_repo_info(conn, all_names)
     week_label = _week_label(now.date())
     quarter_label = _quarter_label(now.date())
+    window_open = _refresh_window_open(now.date())  # 半月窗口：仅 1 号、15 号允许 quarter/total/summary 重生
 
     # 预取现有行（(repo_id, dimension, period_label) → 行），避免逐仓查询；手动 API 写入后本轮不重判
     existing: dict[tuple[int, str, str], sqlite3.Row] = {}
@@ -752,15 +766,15 @@ async def recommend_missing(
         if on_progress is not None:
             on_progress(stats)
 
-    # --- 季维度：缺失或其 generated_week ≠ 当周 → 生成/REPLACE（季文本季内每周重生；季榜 90 天窗口
-    #     未满时自然为空，实现照做，不许为"看到效果"改榜单口径） ---
+    # --- 季维度：缺失，或跑批日在半月窗口内且 generated_week ≠ 当周 → 生成/REPLACE
+    #     （每月 1 号、15 号重生；非窗口日跳过已有行；季榜 90 天窗口未满时自然为空，实现照做） ---
     for full_name, item in listed_by_period["quarter"].items():
         info = repo_info.get(full_name)
         if info is None:
             continue
         key = (info["id"], "quarter", quarter_label)
         cur = existing.get(key)
-        if cur is not None and (not refresh or cur["generated_week"] == week_label):
+        if cur is not None and (not refresh or not window_open or cur["generated_week"] == week_label):
             continue
         readme_text, _ = await readme_state.get(full_name, stats)
         # T-018：新区行带入池语境（在池增量/在池天数），主榜行保持既有增量参数
@@ -799,7 +813,8 @@ async def recommend_missing(
             on_progress(stats)
 
     # --- 总星维度：S_total = total 榜 ∪ 关注集（关注未上榜仓生成总星文本，供关注页展示）；
-    #     缺失则生成；refresh=True 时 README sha 变化 → REPLACE 重生并更新 sha（懒口径不每周重刷） ---
+    #     缺失则生成；refresh=True 且跑批日在半月窗口内时，才拉 README 比对 sha；sha 非空且变化
+    #     → REPLACE 重生并更新 sha（非窗口日对已有行不拉 README 不比 sha，懒口径不每周重刷） ---
     total_names = list(follow_names)
     for full_name in listed_by_period["total"]:
         if full_name not in total_names:
@@ -811,11 +826,14 @@ async def recommend_missing(
         rid = info["id"]
         key = (rid, "total", "all")
         cur = existing.get(key)
+        # 非窗口日或手动批量（refresh=False）：已有行直接跳过，不拉 README、不比 sha（省 GitHub API）
+        if cur is not None and (not refresh or not window_open):
+            continue
         readme_text, sha = await readme_state.get(full_name, stats)
-        # F2-1 修复：本次未拉到 sha（拉取失败/404/账户类停拉）不触发重生——保留旧行与旧指纹，
+        # F2-1 修复：窗口日本次未拉到 sha（拉取失败/404/账户类停拉）不触发重生——保留旧行与旧指纹，
         # 防拉取失败制造每日 churn；README 被删除（404）的场景因此不再触发重生，属探测能力边界
         # （无 README 的仓 sha 恒 NULL，懒口径下不动）；sha 非空且变化才视为 README 变更
-        if cur is not None and (not refresh or sha is None or cur["readme_sha"] == sha):
+        if cur is not None and (sha is None or cur["readme_sha"] == sha):
             continue  # 已有且未触发重生：总星文本懒口径不重刷
         item = listed_by_period["total"].get(full_name)
         try:
@@ -848,8 +866,9 @@ async def recommend_missing(
 
     # --- 概要维度（T-024，§11）：key=(repo_id, 'summary', 'all')，覆盖 S 全集（all_names = 三榜去重 ∪ 关注）；
     #     仅 refresh=True（每日 ensure 路径）执行——§11 无手动入口，手动批量 worker refresh=False 整段跳过；
-    #     缺失则生成；refresh 时 README sha 非空且与旧指纹不同 → REPLACE 重生（与 total 段同一 F2-1 守卫：
-    #     本次 sha 未取到不触发重生、保留旧行旧指纹）；概要与推荐语并存（文档视角，无维度概念，全页面同一条） ---
+    #     缺失则生成；跑批日在半月窗口内才拉 README 比对 sha，sha 非空且与旧指纹不同 → REPLACE 重生
+    #     （与 total 段同一 F2-1 守卫：非窗口日对已有行不拉 README，本次 sha 未取到不触发重生、保留旧行旧指纹）；
+    #     概要与推荐语并存（文档视角，无维度概念，全页面同一条） ---
     if refresh:
         for full_name in all_names:
             info = repo_info.get(full_name)
@@ -858,9 +877,12 @@ async def recommend_missing(
             rid = info["id"]
             key = (rid, "summary", "all")
             cur = existing.get(key)
+            # 非窗口日：已有 summary 行直接跳过，不拉 README、不比 sha（省 GitHub API）
+            if cur is not None and not window_open:
+                continue
             readme_text, sha = await readme_state.get(full_name, stats)  # 复用同一 _ReadmeState：同轮同仓缓存命中
             if cur is not None and (sha is None or cur["readme_sha"] == sha):
-                continue  # 已有且未触发重生：概要懒口径不重刷（README 变更当日才重生）
+                continue  # 已有且未触发重生：概要懒口径不重刷（README 变更窗口日才重生）
             try:
                 text = await client.summarize(
                     full_name=full_name,
@@ -969,7 +991,7 @@ async def ensure_daily_ai(
         if cur.rowcount:
             stats["translated"] += 1
 
-    # c) 推荐语三维度＋概要（refresh=True：quarter 每周 REPLACE、total/summary README 变更重生；概要段仅 refresh 路径）
+    # c) 推荐语三维度＋概要（refresh=True：quarter/total/summary 均在半月窗口日才重生；概要段仅 refresh 路径）
     sub = await recommend_missing(
         conn, client, now=now, log=log, github_client=github_client, refresh=True, scope=scope
     )

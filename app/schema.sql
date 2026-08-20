@@ -52,11 +52,12 @@ CREATE TABLE IF NOT EXISTS tags (
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags (tag);
 
 -- 推荐理由（T-017 三口径分维度）＋ AI 概要（T-024）：同一仓库按"维度 × 期次标签"各存一条——周/季文本带增量语境
---（期次标签换行/REPLACE，每周重生），总星文本存量语境（period_label 固定 'all'，懒生成＋README 变更重生）；
+--（期次标签换行/REPLACE；周维度每周重生，季维度仅在半月窗口日 1 号/15 号 REPLACE）；
+-- 总星文本存量语境（period_label 固定 'all'，懒生成＋半月窗口日 README 变更重生）；
 -- 概要与推荐语并存（推荐语＝为什么值得关注，营销视角；概要＝是什么，README 文档视角、无维度概念，
--- 全页面同一条，period_label 恒 'all'，懒生成＋README 变更当日重生，无任何手动入口——§11）。
--- readme_sha 存 README blob sha 指纹供每日 ensure 比对（NULL＝未拉取过；NULL 仓后续出现 README 视为变更自愈）；
--- generated_week 写生成时所在 ISO 周（周/季文本"本周已生成"幂等与季内每周 REPLACE 判断用）。
+-- 全页面同一条，period_label 恒 'all'，懒生成＋半月窗口日 README 变更重生，无任何手动入口——§11）。
+-- readme_sha 存 README blob sha 指纹供每日 ensure 在半月窗口日比对（NULL＝未拉取过；NULL 仓后续出现 README 视为变更自愈）；
+-- generated_week 写生成时所在 ISO 周（周文本"本周已生成"幂等与季文本窗口日 REPLACE 判断用）。
 -- 旧结构 (repo_id, report_week, text) 与 3 值 CHECK 结构的幂等迁移在 db.py init_db（PRAGMA table_info 探列
 -- / sqlite_master 读建表 SQL），本定义只服务新装库（最终结构 = 4 值 CHECK，两条迁移路径收敛于此）。
 CREATE TABLE IF NOT EXISTS recommendations (

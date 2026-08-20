@@ -11,7 +11,7 @@ T-017 口径：翻译收窄为范围集 S = 三口径榜去重 ∪ 关注集；�
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -20,6 +20,7 @@ from app.ai import (
     DeepSeekAuthError,
     DeepSeekClient,
     DeepSeekError,
+    _refresh_window_open,
     ensure_daily_ai,
     has_cjk,
     recommend_missing,
@@ -36,6 +37,14 @@ QUARTER1 = "2026-Q3"  # AS_OF_DT 所在季度（8 月 → Q3）
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize(
+    "day,expected", [(1, True), (15, True), (2, False), (14, False), (16, False), (31, False)]
+)
+def test_refresh_window_open(day, expected):
+    """半月窗口判定（T-037）：仅每月 1 号、15 号开窗——钉死窗口定义，防日后改动无声漂移。"""
+    assert _refresh_window_open(date(2026, 8, day)) is expected
 
 
 def _add_repo(
@@ -493,7 +502,7 @@ def test_same_week_rerun_idempotent(conn):
 
 
 def test_new_week_regenerates_recommendation(conn):
-    """跨周生成新行（每周重新生成）：新周标签 INSERT，历史周保留；总星文本懒口径不重刷；已译不重译。"""
+    """跨周生成新行（每周重新生成）：新周标签 INSERT，历史周保留；总星/季榜文本懒口径在非窗口日不重刷；已译不重译。"""
     repo_id = _add_repo(conn, "a/one", description_en="first project")
     fake = FakeDeepSeekClient()
     _run_ensure(conn, fake)
@@ -504,7 +513,8 @@ def test_new_week_regenerates_recommendation(conn):
     )
     conn.commit()
     stats2 = _run_ensure(conn, fake, now=AS_OF_DT + timedelta(days=7))
-    assert stats2["listed"] == 1 and stats2["recommended"] == 2  # T-018：新周行 1 ＋ 季新区行 REPLACE 1
+    # 2026-08-16 为非窗口日：仅新周行 1；quarter/total 懒口径跳过
+    assert stats2["listed"] == 1 and stats2["recommended"] == 1
     assert stats2["translated"] == 0
     weeks = {
         r["period_label"]
@@ -666,9 +676,9 @@ def test_partial_failure_converges_next_run_translate(conn):
     assert _zh_map(conn)["a/one"] == "译文-first project"
 
 
-def test_quarter_dimension_generated_and_weekly_republish(conn):
-    """季维度（86~94 天窗口快照 → 季榜出席）：首轮生成；同季次周 ensure 因其 generated_week ≠ 当周
-    → REPLACE 重生（季内每周重生）；周/总星行不受影响。"""
+def test_quarter_dimension_generated_and_biweekly_republish(conn):
+    """季维度（86~94 天窗口快照 → 季榜出席）：首轮生成；仅在半月窗口日（1 号/15 号）且 generated_week ≠ 当周
+    → REPLACE 重生；非窗口日跳过；周/总星行不受影响。"""
     repo_id = _add_repo(conn, "a/q", description_en="quarter repo", quarter=True)
     fake = FakeDeepSeekClient()
     stats1 = _run_ensure(conn, fake)
@@ -677,7 +687,8 @@ def test_quarter_dimension_generated_and_weekly_republish(conn):
     assert ("a/q", "quarter", QUARTER1, "推荐语-a/q-quarter") in rows1
     q_call = _calls_by_dim(fake, "quarter")[0]
     assert q_call["delta"] == 100 and q_call["stars"] == 1100  # 季维度带本季增量语境
-    # 次周（同季内）：quarter 行 generated_week ≠ 当周 → REPLACE 重生；周维度生成新周行；总星懒口径不动
+
+    # 非窗口日次周（2026-08-16，W33）：generated_week ≠ 当周，但窗口关闭 → 不重生
     conn.execute(
         "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
         (repo_id, _iso(AS_OF_DT + timedelta(days=7)), 1600),
@@ -685,14 +696,23 @@ def test_quarter_dimension_generated_and_weekly_republish(conn):
     conn.commit()
     fake2 = FakeDeepSeekClient()
     stats2 = _run_ensure(conn, fake2, now=AS_OF_DT + timedelta(days=7))
-    assert stats2["recommended"] == 2  # 季 REPLACE 1 ＋ 新周 1；总星懒口径跳过
+    assert stats2["recommended"] == 1  # 仅新周行 1；季/总星懒口径跳过
     rows2 = _recommend_rows(conn)
-    assert ("a/q", "quarter", QUARTER1, "推荐语-a/q-quarter") in rows2  # 仍同季标签，文本 REPLACE
     assert ("a/q", "week", WEEK2, "推荐语-a/q-week") in rows2
-    assert len([r for r in rows2 if r[1] == "quarter"]) == 1  # REPLACE 不累积行
-    # 同季同周再跑：季行 generated_week == 当周 → 全跳过
-    stats3 = _run_ensure(conn, FakeDeepSeekClient(), now=AS_OF_DT + timedelta(days=7))
-    assert stats3["recommended"] == 0
+    quarter_rows = [r for r in rows2 if r[1] == "quarter"]
+    assert len(quarter_rows) == 1 and quarter_rows[0][3] == "推荐语-a/q-quarter"  # 文本未变
+
+    # 窗口日（2026-08-15，W33）：generated_week ≠ 当周且窗口开 → REPLACE 重生
+    fake3 = FakeDeepSeekClient()
+    stats3 = _run_ensure(conn, fake3, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc))
+    assert stats3["recommended"] == 1  # 仅季 REPLACE；总星懒口径跳过，周行已存在
+    rows3 = _recommend_rows(conn)
+    assert ("a/q", "quarter", QUARTER1, "推荐语-a/q-quarter") in rows3
+    assert len([r for r in rows3 if r[1] == "quarter"]) == 1  # REPLACE 不累积行
+
+    # 同季同窗口日再跑：季行 generated_week == 当周 → 全跳过
+    stats4 = _run_ensure(conn, FakeDeepSeekClient(), now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc))
+    assert stats4["recommended"] == 0
 
 
 def test_has_cjk_detection():
@@ -725,39 +745,54 @@ def test_readme_used_in_recommend_input_and_stored_sha(conn):
     assert github.readme_calls == ["a/one"]
 
 
-def test_readme_sha_change_triggers_total_regeneration(conn):
-    """README blob sha 变化 → 当日 ensure REPLACE 重生 ('total','all') 行并更新 sha；周行不受影响（不随 README 触发）。"""
+def test_readme_sha_change_triggers_total_regeneration_on_window_day(conn):
+    """README blob sha 变化 → 仅在半月窗口日 ensure 才 REPLACE 重生 ('total','all') 行并更新 sha；
+    非窗口日即使 sha 变也不重生；周行不受影响（不随 README 触发）。"""
     _add_repo(conn, "a/one", description_en="first project")
     github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
     fake1 = FakeDeepSeekClient()
+    # 首轮在非窗口日生成 total 行
     _run_ensure(conn, fake1, github_client=github)
     rows1 = _recommend_rows(conn)
     assert ("a/one", "total", "all", "推荐语-a/one-total") in rows1
-    week_count1 = len([r for r in rows1 if r[1] == "week"])
 
-    # README 内容变化（sha 变）：total 重生（新文本），week 行保留原文本不重生成
+    # 非窗口日 README 内容变化（sha 变）：total 不重生（选用同 ISO 周 2026-08-05，避免跨周生成新 week 行）
     github.readmes["a/one"] = ("v2 readme", "sha-v2")
     fake2 = FakeDeepSeekClient()
-    stats2 = _run_ensure(conn, fake2, github_client=github)
-    assert stats2["recommended"] == 1  # 仅 total REPLACE
-    assert stats2["translated"] == 0
-    rows2 = _recommend_rows(conn)
-    assert ("a/one", "total", "all", "推荐语-a/one-total") in rows2  # 文本同形（fake 回显），行数不变
-    assert len([r for r in rows2 if r[1] == "total"]) == 1
-    assert len([r for r in rows2 if r[1] == "week"]) == week_count1  # 周行未随 README 重生
+    non_window = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
+    stats2 = _run_ensure(conn, fake2, now=non_window, github_client=github)
+    assert stats2["recommended"] == 0  # 非窗口日不拉 README 不比 sha
+    assert fake2.recommend_calls == []
+    row = conn.execute(
+        "SELECT readme_sha, generated_week FROM recommendations WHERE dimension = 'total'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-v1"  # 指纹保留
+
+    # 窗口日 README 内容变化：total 重生（新文本）并更新 sha；周行同周已存在则保留
+    fake3 = FakeDeepSeekClient()
+    stats3 = _run_ensure(conn, fake3, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    assert stats3["translated"] == 0
+    # total 行必须被 REPLACE（sha 已变 + 窗口日）
+    assert any(c["full_name"] == "a/one" and c["dimension"] == "total" for c in fake3.recommend_calls)
+    rows3 = _recommend_rows(conn)
+    assert ("a/one", "total", "all", "推荐语-a/one-total") in rows3  # 文本同形（fake 回显），行数不变
+    assert len([r for r in rows3 if r[1] == "total"]) == 1
+    # 注：窗口日 2026-08-15 跨到 W33，会额外生成一条 week 行，这是周榜正常行为，与 total 无关
     row = conn.execute(
         "SELECT readme_sha, generated_week FROM recommendations WHERE dimension = 'total'"
     ).fetchone()
     assert row["readme_sha"] == "sha-v2"
 
-    # sha 未再变：第三轮全跳过（懒口径不重刷）
-    stats3 = _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
-    assert stats3["recommended"] == 0
+    # sha 未再变：下一轮窗口日 total 也跳过（懒口径不重刷）
+    fake4 = FakeDeepSeekClient()
+    _run_ensure(conn, fake4, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    assert all(not (c["full_name"] == "a/one" and c["dimension"] == "total") for c in fake4.recommend_calls)
 
 
 def test_readme_fetch_failure_keeps_existing_sha(conn):
-    """F2-1 修复：已有 sha 指纹的行＋本次 README 拉取失败（sha 未取到）→ 不触发重生、指纹保留
-    （防拉取失败制造每日 churn；下次拉取成功且 sha 变化才重生）。"""
+    """F2-1 修复：已有 sha 指纹的行＋窗口日本次 README 拉取失败（sha 未取到）→ 不触发重生、指纹保留
+    （防拉取失败制造 churn；下次窗口日拉取成功且 sha 变化才重生）。第二轮必须跑在窗口日，
+    否则窗口守卫提前 continue、根本走不到拉取与 sha 守卫，本测试将空转。"""
     _add_repo(conn, "a/one", description_en="first project")
     github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
     _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
@@ -766,12 +801,14 @@ def test_readme_fetch_failure_keeps_existing_sha(conn):
     ).fetchone()
     assert row["readme_sha"] == "sha-v1"
 
-    # 本次拉取抛普通异常 → sha=None：不重生、旧指纹保留
+    # 窗口日（2026-08-15）本次拉取抛普通异常 → sha=None：total 不重生、旧指纹保留
+    # （跨到 W33 会多生成一条 week 行——周榜正常行为，断言按维度过滤 total）
     github.fail_for = {"a/one"}
     fake2 = FakeDeepSeekClient()
-    stats2 = _run_ensure(conn, fake2, github_client=github)
-    assert stats2["recommended"] == 0  # 不重生（week 行已存在、total 未触发）
-    assert fake2.recommend_calls == []
+    calls_before = len(github.readme_calls)
+    _run_ensure(conn, fake2, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    assert len(github.readme_calls) > calls_before  # 确认真走到了拉取（窗口守卫未提前跳过）
+    assert all(c["dimension"] != "total" for c in fake2.recommend_calls)
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'total'"
     ).fetchone()
@@ -779,24 +816,26 @@ def test_readme_fetch_failure_keeps_existing_sha(conn):
 
 
 def test_readme_auth_failure_keeps_existing_sha(conn):
-    """F2-1 修复：已有 sha 指纹的行＋GitHubAuthError（确定性停拉）→ 不重生、指纹保留。"""
+    """F2-1 修复：已有 sha 指纹的行＋窗口日 GitHubAuthError（确定性停拉）→ 不重生、指纹保留。
+    第二轮必须跑在窗口日（同上，防空转）。"""
     _add_repo(conn, "a/one", description_en="first project")
     github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
     _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
 
     github.auth_for = {"a/one"}  # 之后拉取抛账户类错误 → 停拉降级
     fake2 = FakeDeepSeekClient()
-    stats2 = _run_ensure(conn, fake2, github_client=github)
-    assert stats2["recommended"] == 0
-    assert fake2.recommend_calls == []
+    calls_before = len(github.readme_calls)
+    _run_ensure(conn, fake2, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    assert len(github.readme_calls) > calls_before  # 确认真走到了拉取
+    assert all(c["dimension"] != "total" for c in fake2.recommend_calls)
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'total'"
     ).fetchone()
     assert row["readme_sha"] == "sha-v1"
 
 
-def test_readme_null_sha_self_heals_on_first_appearance(conn):
-    """sha NULL 自愈：首轮无 README（sha=NULL 落库）→ 后续出现 README（sha 非空）→ 视为变更当日重生。"""
+def test_readme_null_sha_self_heals_on_window_day(conn):
+    """sha NULL 自愈：首轮无 README（sha=NULL 落库）→ 后续窗口日出现 README（sha 非空）→ 视为变更重生并更新 sha。"""
     _add_repo(conn, "a/one", description_en="first project")
     github = FakeGitHubClient(readmes={"a/one": (None, None)})  # 无 README（404 退化）
     fake1 = FakeDeepSeekClient()
@@ -806,10 +845,13 @@ def test_readme_null_sha_self_heals_on_first_appearance(conn):
     ).fetchone()
     assert row["readme_sha"] is None
 
-    # 后续 README 出现（sha 非空）→ 自愈：total 重生并更新 sha
+    # 后续窗口日 README 出现（sha 非空）→ 自愈：total 重生并更新 sha
     github.readmes["a/one"] = ("now has readme", "sha-new")
-    stats2 = _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
-    assert stats2["recommended"] == 1
+    window_day = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+    fake2 = FakeDeepSeekClient()
+    _run_ensure(conn, fake2, now=window_day, github_client=github)
+    # total 必须因 sha 从 NULL 变为非空而重生
+    assert any(c["full_name"] == "a/one" and c["dimension"] == "total" for c in fake2.recommend_calls)
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'total'"
     ).fetchone()
@@ -928,34 +970,125 @@ def test_summary_generated_for_scope_and_idempotent(conn):
     assert stats2["summarized"] == 0 and fake2.summarize_calls == []  # 已生成：幂等不重刷
 
 
-def test_summary_sha_change_regenerates(conn):
-    """README blob sha 变化 → summary 行 REPLACE 重生并更新 sha（README 变更当日重生，懒口径不每周重刷）。"""
+def test_summary_sha_change_regenerates_on_window_day(conn):
+    """README blob sha 变化 → 仅在半月窗口日 summary 行才 REPLACE 重生并更新 sha；
+    非窗口日即使 sha 变也不重生；total 段同窗口触发。"""
     _add_repo(conn, "a/one", description_en="first project")
     github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
     fake1 = FakeDeepSeekClient()
+    # 首轮在非窗口日生成 summary 行
     _run_ensure(conn, fake1, github_client=github)
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
     ).fetchone()
     assert row["readme_sha"] == "sha-v1"
 
+    # 非窗口日 README 内容变化：summary 不重生（选用同 ISO 周 2026-08-05，避免跨周生成新 week 行）
     github.readmes["a/one"] = ("v2 readme", "sha-v2")
     fake2 = FakeDeepSeekClient()
-    stats2 = _run_ensure(conn, fake2, github_client=github)
-    assert stats2["summarized"] == 1  # 仅概要 REPLACE 重生
-    assert stats2["recommended"] == 1  # total 段同触发（README 变更当日 total 也重生）
+    non_window = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
+    stats2 = _run_ensure(conn, fake2, now=non_window, github_client=github)
+    assert stats2["summarized"] == 0
+    assert stats2["recommended"] == 0  # total 段同样不重生
+    assert fake2.summarize_calls == []
+    row = conn.execute(
+        "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
+    ).fetchone()
+    assert row["readme_sha"] == "sha-v1"  # 指纹保留
+
+    # 窗口日 README 内容变化：summary 与 total 同时重生
+    fake3 = FakeDeepSeekClient()
+    _run_ensure(conn, fake3, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    # summary/total 必须各被 REPLACE 一次
+    assert any(c["full_name"] == "a/one" for c in fake3.summarize_calls)
+    assert any(c["full_name"] == "a/one" and c["dimension"] == "total" for c in fake3.recommend_calls)
     assert conn.execute("SELECT COUNT(*) FROM recommendations WHERE dimension = 'summary'").fetchone()[0] == 1
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
     ).fetchone()
     assert row["readme_sha"] == "sha-v2"
 
-    stats3 = _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
-    assert stats3["summarized"] == 0  # sha 未再变：懒口径不重刷
+    # sha 未再变：下一轮窗口日 summary 也跳过（懒口径不重刷）
+    fake4 = FakeDeepSeekClient()
+    _run_ensure(conn, fake4, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    assert all(c["full_name"] != "a/one" for c in fake4.summarize_calls)
+
+
+def test_non_window_day_skips_quarter_total_summary_regeneration(conn):
+    """非窗口日：quarter/total/summary 已有行完全跳过，不拉 README、不调用 AI；周行同周已存在则跳过。"""
+    _add_repo(conn, "a/one", description_en="first project", quarter=True)
+    github1 = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
+    _run_ensure(conn, FakeDeepSeekClient(), github_client=github1)
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 4  # week + quarter + total + summary
+
+    # 非窗口日再跑：换一个 github client 以便单独统计本轮 README 调用次数（同 ISO 周，避免跨周生成 week 行）
+    github2 = FakeGitHubClient(readmes={"a/one": ("v2 readme", "sha-v2")})
+    fake2 = FakeDeepSeekClient()
+    non_window = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
+    stats2 = _run_ensure(conn, fake2, now=non_window, github_client=github2)
+    assert stats2["recommended"] == 0 and stats2["summarized"] == 0
+    assert fake2.recommend_calls == [] and fake2.summarize_calls == []
+    assert github2.readme_calls == []  # 非窗口日对已有行零 GitHub API 调用
+    row_total = conn.execute("SELECT readme_sha FROM recommendations WHERE dimension = 'total'").fetchone()
+    row_summary = conn.execute("SELECT readme_sha FROM recommendations WHERE dimension = 'summary'").fetchone()
+    assert row_total["readme_sha"] == "sha-v1" and row_summary["readme_sha"] == "sha-v1"
+
+
+def test_missing_rows_backfilled_on_non_window_day(conn):
+    """非窗口日：缺失的 quarter/total/summary 行照常补缺生成，不受窗口限制。"""
+    _add_repo(conn, "a/one", description_en="first project", quarter=True)
+    # 首轮生成全部行
+    _run_ensure(conn, FakeDeepSeekClient())
+    # 删掉 quarter/total/summary，保留 week（同周已存在则不再生成）
+    conn.execute("DELETE FROM recommendations WHERE dimension != 'week'")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 1
+
+    # 非窗口日再跑：缺失的三行补齐（同 ISO 周，避免跨周生成额外 week 行）
+    fake2 = FakeDeepSeekClient()
+    non_window = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
+    stats2 = _run_ensure(conn, fake2, now=non_window)
+    assert stats2["recommended"] == 2  # quarter + total
+    assert stats2["summarized"] == 1  # summary
+    rows = _recommend_rows(conn)
+    assert ("a/one", "quarter", QUARTER1, "推荐语-a/one-quarter") in rows
+    assert ("a/one", "total", "all", "推荐语-a/one-total") in rows
+    assert ("a/one", "summary", "all", "概要-a/one") in rows
+
+
+def test_week_regeneration_ignores_refresh_window(conn):
+    """周榜维度不受半月窗口影响：跨周照常生成新周行，quarter/total/summary 非窗口日不重生。"""
+    repo_id = _add_repo(conn, "a/one", description_en="first project", quarter=True)
+    github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
+    _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 4
+
+    # 次周非窗口日（2026-08-16，W33）：week 重生 1，其余跳过
+    conn.execute(
+        "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
+        (repo_id, _iso(AS_OF_DT + timedelta(days=7)), 1500),
+    )
+    conn.commit()
+    github2 = FakeGitHubClient(readmes={"a/one": ("v2 readme", "sha-v2")})
+    fake2 = FakeDeepSeekClient()
+    stats2 = _run_ensure(conn, fake2, now=AS_OF_DT + timedelta(days=7), github_client=github2)
+    assert stats2["recommended"] == 1  # 仅新周行
+    assert stats2["summarized"] == 0
+    week_calls = _calls_by_dim(fake2, "week")
+    assert len(week_calls) == 1 and week_calls[0]["full_name"] == "a/one"
+    weeks = {
+        r["period_label"]
+        for r in conn.execute(
+            "SELECT period_label FROM recommendations WHERE repo_id = ? AND dimension = 'week'", (repo_id,)
+        )
+    }
+    assert weeks == {WEEK1, WEEK2}
+    assert github2.readme_calls == ["a/one"]  # 仅 week 维度触发一次 README 拉取（新周行缺失）
 
 
 def test_summary_sha_none_keeps_existing(conn):
-    """F2-1 守卫（与 total 段同款）：已有行＋本次 sha 未取到（拉取失败）→ 不触发重生、旧指纹保留。"""
+    """F2-1 守卫（与 total 段同款）：已有行＋窗口日本次 sha 未取到（拉取失败）→ 不触发重生、旧指纹保留。
+    第二轮必须跑在窗口日，否则窗口守卫提前 continue、走不到拉取与 sha 守卫，本测试将空转。"""
     _add_repo(conn, "a/one", description_en="first project")
     github = FakeGitHubClient(readmes={"a/one": ("v1 readme", "sha-v1")})
     _run_ensure(conn, FakeDeepSeekClient(), github_client=github)
@@ -964,9 +1097,11 @@ def test_summary_sha_none_keeps_existing(conn):
     ).fetchone()
     assert row["readme_sha"] == "sha-v1"
 
-    github.fail_for = {"a/one"}  # 本次拉取抛普通异常 → sha=None
+    github.fail_for = {"a/one"}  # 窗口日（2026-08-15）本次拉取抛普通异常 → sha=None
     fake2 = FakeDeepSeekClient()
-    stats2 = _run_ensure(conn, fake2, github_client=github)
+    calls_before = len(github.readme_calls)
+    stats2 = _run_ensure(conn, fake2, now=datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), github_client=github)
+    assert len(github.readme_calls) > calls_before  # 确认真走到了拉取（窗口守卫未提前跳过）
     assert stats2["summarized"] == 0 and fake2.summarize_calls == []
     row = conn.execute(
         "SELECT readme_sha FROM recommendations WHERE dimension = 'summary'"
