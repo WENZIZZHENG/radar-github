@@ -36,14 +36,14 @@ uv venv .venv && uv pip install -r pyproject.toml --extra dev
 ### 4.1 打包上传（本地 Git Bash，项目根）
 
 ```bash
-tar czf /tmp/radar-deploy.tar.gz --exclude='./.git' --exclude='./.env' --exclude='./data' \
+tar czf /tmp/radar-deploy.tar.gz --exclude='./.git' --exclude='./.env' --exclude='./.env.dev' --exclude='./.env.prod' --exclude='./data' \
   --exclude='./.venv' --exclude='./.idea' --exclude='./.pytest_cache' --exclude='./.ruff_cache' \
   --exclude='./__pycache__' --exclude='*/__pycache__' .
 sha256sum /tmp/radar-deploy.tar.gz   # 记一下，服务器侧要核对
 scp -i ~/.ssh/your-deploy-key.pem /tmp/radar-deploy.tar.gz root@<SERVER_IP>:/tmp/
 ```
 
-排除清单是红线：`.env`（密钥只在服务器）、`data/`（生产库绝不能被本地库覆盖）。
+排除清单是红线：`.env*`（密钥只在服务器；文件名按环境错开——本地 `.env.dev`、生产 `.env.prod`，应用代码只读 `.env.dev`，生产由 radar.service 的 EnvironmentFile 注入，本地配置误传上去也不会被加载）、`data/`（生产库绝不能被本地库覆盖）。`.env.example` 模板正常入包。
 
 ### 4.2 服务器侧解压＋重启
 
@@ -80,6 +80,6 @@ $SSH 'for u in "/" "/?board=all" "/total" "/total?board=all"; do
 - 首次启用榜单预计算（T-027 类）可手跑一轮立即生效，不等次日 05:00：
   `$SSH "sudo -u radar -H bash -c 'cd /opt/radar && .venv/bin/python -c \"from app.db import get_conn; from app.classify import load_topics; from app.config import BASE_DIR; from app.report import precompute_boards; c=get_conn(); print(precompute_boards(c, load_topics(BASE_DIR/\\\"config\\\"/\\\"topics.yaml\\\"))); c.close()\"'"`
   （引号层数深，复杂脚本改走 `ssh 'bash -s' <<EOF` 管道更稳。）
-- 回滚：无 git remote，回滚 = 本地 `git checkout <旧 commit>` 重打 tar 重走 4.1~4.3；生产 data/ 与 .env 不受影响。
+- 回滚：无 git remote，回滚 = 本地 `git checkout <旧 commit>` 重打 tar 重走 4.1~4.3；生产 data/ 与 .env.prod 不受影响。
 - 部署结果回填《任务拆解表》对应任务详情卡（含耗时对比留痕）。
 

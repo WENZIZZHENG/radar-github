@@ -2,6 +2,10 @@
 
 token 缺失时不在这里报错——榜单服务本身不依赖外部 API；
 由真正使用它的模块（采集 T-003 / AI T-011）在使用点校验并给出清晰报错。
+
+dotenv 文件分工（2026-08-20 拍板）：代码只读 `.env.dev`（本地开发实例，git 忽略）；
+生产不走 dotenv——密钥由 radar.service 的 EnvironmentFile=/opt/radar/.env.prod 注入进程环境，
+系统环境变量优先于本文件（setdefault 不覆盖）。文件名按环境错开，本地配置误传上服务器也不会被加载。
 """
 
 from __future__ import annotations
@@ -12,9 +16,9 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "radar.db"
-ENV_PATH = BASE_DIR / ".env"
+ENV_PATH = BASE_DIR / ".env.dev"
 
-# AI 提供方缺省值（DeepSeek；OpenAI 兼容 chat/completions 协议，换提供方只改 .env 变量）
+# AI 提供方缺省值（DeepSeek；OpenAI 兼容 chat/completions 协议，换提供方只改 .env.dev/.env.prod 变量）
 DEFAULT_AI_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
 DEFAULT_AI_MODEL = "deepseek-chat"
 DEFAULT_AI_TIMEOUT_SECONDS = 60  # LLM 响应慢于普通 REST，缺省放宽到 60 秒
@@ -26,7 +30,7 @@ def _load_dotenv(path: Path) -> None:
     """自解析 KEY=VALUE 行注入环境变量（不引 python-dotenv：需要的格式规则只有三行）。
 
     系统环境变量优先——已存在的键一律不覆盖（setdefault），服务器/CI 直接注入的变量永远生效；
-    .env 不存在时静默跳过，本机开发之外的部署形态不依赖该文件。
+    文件不存在时静默跳过（生产即如此：无 .env.dev，密钥全由 systemd EnvironmentFile 注入）。
     """
     try:
         # utf-8-sig：兼容编辑器存出的 UTF-8 BOM——否则首行键名静默变成 \ufeffGITHUB_TOKEN，token 为空且根因难查
@@ -34,8 +38,8 @@ def _load_dotenv(path: Path) -> None:
     except FileNotFoundError:
         return
     except UnicodeDecodeError as exc:
-        # 中文 Windows 记事本默认 ANSI/GBK 保存会触发：报错必须指向 .env 编码，不在远处炸
-        raise ValueError(f"{path} 不是有效 UTF-8：请用 UTF-8 编码重新保存 .env（{exc}）") from exc
+        # 中文 Windows 记事本默认 ANSI/GBK 保存会触发：报错必须指向文件编码，不在远处炸
+        raise ValueError(f"{path} 不是有效 UTF-8：请用 UTF-8 编码重新保存该文件（{exc}）") from exc
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:

@@ -35,11 +35,12 @@ User=radar
 Group=radar
 WorkingDirectory=/opt/radar
 
-# 环境变量（可选项，双保险）：app/config.py 会自解析 /opt/radar/.env，
-# 且系统环境变量优先于 .env（setdefault 不覆盖），所以不靠这行也能拿到密钥。
+# 环境变量（生产密钥唯一入口）：systemd 把 /opt/radar/.env.prod 的 KEY=VALUE 行注入进程环境，
+# 系统环境变量优先于一切 dotenv 文件（config.py setdefault 不覆盖）；应用代码只读 .env.dev（本地开发），
+# 生产上没有该文件、dotenv 加载静默跳过——本行即生产配置的唯一来源。
 # `-` 前缀表示文件缺失不报错。注意 systemd EnvironmentFile 只认纯 KEY=VALUE 行，
-# 不支持 export 前缀和复杂引号转义——.env 保持简单格式即可两处通用。
-EnvironmentFile=-/opt/radar/.env
+# 不支持 export 前缀和复杂引号转义——.env.prod 保持简单格式即可。
+EnvironmentFile=-/opt/radar/.env.prod
 
 # 只绑回环：公网唯一入口是 Caddy（反代 127.0.0.1:8000，见 deploy/Caddyfile），
 # 应用不直接暴露公网，攻击面收敛到 Caddy 一层；改端口需与 Caddyfile 同步改。
