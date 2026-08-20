@@ -41,6 +41,15 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 import httpx
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+)
 
 from app.classify import load_topics
 from app.collector.github import GitHubAuthError, GitHubClient
@@ -107,16 +116,25 @@ def _quarter_label(d: date) -> str:
     return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
 
 
-def _extract_content(response: httpx.Response) -> str | None:
-    """从 chat/completions 响应取首条 message.content 并去首尾空白；JSON 畸形/结构缺失/空内容一律 None。"""
+def _extract_content(response: object) -> str | None:
+    """从 chat/completions 响应取首条 message.content 并去首尾空白；结构缺失/空内容一律 None。"""
     try:
-        payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError):
+        content = response.choices[0].message.content  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, TypeError):
         return None
     if not isinstance(content, str):
         return None
     return content.strip() or None
+
+
+def _response_text(response: object) -> str:
+    """取 SDK 响应对象的文本表示，用于错误日志（畸形响应时记录）。"""
+    if hasattr(response, "model_dump"):
+        try:
+            return json.dumps(response.model_dump(), ensure_ascii=False)  # type: ignore[attr-defined]
+        except (ValueError, TypeError):
+            pass
+    return repr(response)
 
 
 def _parse_suggested_topics(content: str) -> dict | None:
@@ -141,7 +159,7 @@ def _parse_suggested_topics(content: str) -> dict | None:
 
 
 class DeepSeekClient:
-    """httpx AsyncClient 封装 OpenAI 兼容 chat/completions（缺省 DeepSeek，.env AI_BASE_URL/AI_MODEL 可换
+    """OpenAI 官方 AsyncOpenAI 封装 OpenAI 兼容 chat/completions（缺省 DeepSeek，.env AI_BASE_URL/AI_MODEL 可换
     提供方；类名保留 DeepSeekClient 免大面积改名）；transport / sleep 可注入（单测 MockTransport 离线跑）。"""
 
     def __init__(
@@ -156,18 +174,26 @@ class DeepSeekClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self._api_key = api_key
-        self._base_url = base_url
         self._model = model
         self._sleep = sleep
         self._max_retries = max_retries
-        self._client = httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {api_key}"},
-            transport=transport,
+        # transport 注入时，把 transport 包进 httpx.AsyncClient 再作为 http_client 传给 SDK，
+        # 单测 MockTransport handler 收到的请求 URL 保持为 {base_url}/chat/completions。
+        http_client = None
+        if transport is not None:
+            http_client = httpx.AsyncClient(transport=transport, timeout=request_timeout)
+        self._client = AsyncOpenAI(
+            # SDK 3.x 构造函数会校验空 key；用占位符绕过，真实"空 key"拦截保留在 _chat 使用点，
+            # 与原有语义一致（config 层不报错，调用第一刀才报错）。
+            api_key=api_key or " ",
+            base_url=base_url,
             timeout=request_timeout,
+            max_retries=0,  # 自带重试关闭：重试语义由本类循环保证，避免双重复试放大调用量
+            http_client=http_client,
         )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._client.close()
 
     async def __aenter__(self) -> DeepSeekClient:
         return self
@@ -404,41 +430,72 @@ class DeepSeekClient:
                 "AI API key 为空：请在项目根 .env 配置 AI_API_KEY（或兼容键 DEEPSEEK_API_KEY），"
                 "或注入同名系统环境变量；若置了 AI_ENABLED=0 则本服务不配真实 AI（本地开发口径）"
             )
-        payload = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-        }
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._client.post(self._base_url, json=payload)
-            except httpx.HTTPError as exc:  # 超时/连接错误等传输层失败
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=temperature,
+                )
+            except AuthenticationError as exc:
+                raise DeepSeekAuthError(
+                    "AI 账户类错误（HTTP 401）：请更新项目根 .env 中的 AI_API_KEY"
+                    "（或兼容键 DEEPSEEK_API_KEY）后重试；"
+                    f"响应：{exc.message[:200]}"
+                ) from exc
+            except PermissionDeniedError as exc:
+                raise DeepSeekAuthError(
+                    "AI 账户类错误（HTTP 403）：请检查 AI 账户余额与权限；"
+                    f"响应：{exc.message[:200]}"
+                ) from exc
+            except APIStatusError as exc:
+                if exc.status_code == 402:
+                    raise DeepSeekAuthError(
+                        "AI 账户类错误（HTTP 402）：请检查 AI 账户余额与权限；"
+                        f"响应：{exc.message[:200]}"
+                    ) from exc
+                if exc.status_code >= 500:
+                    if attempt >= self._max_retries:
+                        raise DeepSeekError(
+                            f"DeepSeek 服务端错误（HTTP {exc.status_code}）：重试 {self._max_retries} 次后放弃"
+                        ) from exc
+                    await self._sleep(RETRY_WAIT_SECONDS)
+                    continue
+                # 其他 4xx 不重试（含 429 限速：有意不重试——盲重试只会放大调用量，
+                # 余额事故背景；未来若要支持应尊重 Retry-After 而非立即重试）
+                raise DeepSeekError(
+                    f"DeepSeek 请求失败（HTTP {exc.status_code}）：{exc.message[:200]}"
+                ) from exc
+            except (APITimeoutError, APIConnectionError) as exc:
                 if attempt >= self._max_retries:
                     raise DeepSeekError(
                         f"DeepSeek 请求失败（{type(exc).__name__}: {exc}）：重试 {self._max_retries} 次后放弃"
                     ) from exc
                 await self._sleep(RETRY_WAIT_SECONDS)
                 continue
-            status = response.status_code
-            if status in (401, 402, 403):
-                # 账户类确定性错误（401 key 无效 / 402 余额不足 / 403 无权限）：逐条重试无意义只会刷爆
-                # 日志且次日重演，与空 key 同姿态直通整轮 handler
-                hint = "请更新项目根 .env 中的 AI_API_KEY（或兼容键 DEEPSEEK_API_KEY）后重试" if status == 401 else "请检查 AI 账户余额与权限"
-                raise DeepSeekAuthError(f"AI 账户类错误（HTTP {status}）：{hint}；响应：{response.text[:200]}")
-            if status >= 500:
+            except APIError as exc:
+                # 响应无法解析等畸形响应，按"响应畸形"重试一次
                 if attempt >= self._max_retries:
-                    raise DeepSeekError(f"DeepSeek 服务端错误（HTTP {status}）：重试 {self._max_retries} 次后放弃")
+                    raise DeepSeekError(
+                        f"DeepSeek 响应畸形（{type(exc).__name__}: {exc}）"
+                    ) from exc
                 await self._sleep(RETRY_WAIT_SECONDS)
                 continue
-            if status >= 400:
-                raise DeepSeekError(f"DeepSeek 请求失败（HTTP {status}）：{response.text[:200]}")
+            except Exception as exc:
+                # 未知异常不重试
+                raise DeepSeekError(
+                    f"DeepSeek 请求失败（{type(exc).__name__}: {exc}）"
+                ) from exc
+
             content = _extract_content(response)
             if content is None:
                 if attempt >= self._max_retries:
-                    raise DeepSeekError(f"DeepSeek 响应畸形（JSON 无法解析或缺 content）：{response.text[:200]}")
+                    raise DeepSeekError(
+                        f"DeepSeek 响应畸形（JSON 无法解析或缺 content）：{_response_text(response)[:200]}"
+                    )
                 await self._sleep(RETRY_WAIT_SECONDS)
                 continue
             return content

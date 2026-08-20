@@ -45,7 +45,7 @@ def test_defaults_when_unset(monkeypatch, tmp_path):
     s = get_settings()
     assert s.ai_enabled is True
     assert s.ai_api_key == ""
-    assert s.ai_base_url == DEFAULT_AI_BASE_URL == "https://api.deepseek.com/v1/chat/completions"
+    assert s.ai_base_url == DEFAULT_AI_BASE_URL == "https://api.deepseek.com/v1"
     assert s.ai_model == DEFAULT_AI_MODEL == "deepseek-chat"
     assert s.ai_timeout_seconds == DEFAULT_AI_TIMEOUT_SECONDS == 60
     assert s.ai_max_retries == DEFAULT_AI_MAX_RETRIES == 1
@@ -111,7 +111,7 @@ def test_client_uses_custom_base_url_and_model():
 
     client = DeepSeekClient(
         "k",
-        base_url="https://example.com/v1/chat/completions",
+        base_url="https://example.com/v1",
         model="some-other-model",
         transport=httpx.MockTransport(handler),
     )
