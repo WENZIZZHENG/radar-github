@@ -277,7 +277,7 @@ def test_client_4xx_fails_fast_without_retry():
 
 
 def test_client_401_raises_auth_error_without_retry():
-    """401 → DeepSeekAuthError（key 修复指引），不重试；402/403 账户类错误同样直通（评审低-3）。"""
+    """401 → DeepSeekAuthError（key 修复指引），不重试；402 及普通 403 账户类错误同样直通（评审低-3）。"""
     for status, hint in ((401, "DEEPSEEK_API_KEY"), (402, "余额与权限"), (403, "余额与权限")):
         calls = []
 
@@ -290,6 +290,75 @@ def test_client_401_raises_auth_error_without_retry():
             asyncio.run(client.translate("x"))
         assert len(calls) == 1  # 确定性错误不重试
         asyncio.run(client.aclose())
+
+
+def test_client_403_content_policy_raises_deep_seek_error_not_auth():
+    """403 且响应含 content_policy_violation → DeepSeekError（单仓跳过），不得抛 DeepSeekAuthError（生产事故修复）。"""
+    bodies = {
+        "translate": ("x", {}),
+        "recommend": (
+            None,
+            {
+                "full_name": "a/b",
+                "description": "desc",
+                "language": "Python",
+                "categories": ["Python"],
+                "dimension": "week",
+            },
+        ),
+        "summarize": (
+            None,
+            {
+                "full_name": "a/b",
+                "description": "desc",
+                "language": "Python",
+            },
+        ),
+    }
+
+    def make_handler(calls: list):
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(
+                403,
+                json={
+                    "error": {
+                        "message": "内容触发安全政策，类型：content_policy_violation",
+                        "type": "content_policy_violation",
+                    }
+                },
+            )
+
+        return handler
+
+    for method, (first_arg, kwargs) in bodies.items():
+        calls: list = []
+        client = DeepSeekClient("k", transport=httpx.MockTransport(make_handler(calls)), sleep=_no_sleep)
+        coro = (
+            getattr(client, method)(first_arg, **kwargs)
+            if first_arg is not None
+            else getattr(client, method)(**kwargs)
+        )
+        with pytest.raises(DeepSeekError, match="内容审核拦截") as exc_info:
+            asyncio.run(coro)
+        assert not isinstance(exc_info.value, DeepSeekAuthError)
+        assert len(calls) == 1  # 4xx 不重试
+        asyncio.run(client.aclose())
+
+
+def test_client_403_plain_still_auth_error():
+    """普通 403（无 content_policy 标记）仍维持 DeepSeekAuthError 直通。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(403, text="Forbidden")
+
+    client = DeepSeekClient("k", transport=httpx.MockTransport(handler), sleep=_no_sleep)
+    with pytest.raises(DeepSeekAuthError, match="余额与权限"):
+        asyncio.run(client.translate("x"))
+    assert len(calls) == 1
+    asyncio.run(client.aclose())
 
 
 def test_client_malformed_json_retried_once_then_raises():

@@ -24,7 +24,8 @@
   * README sha 比对仅每日 ensure 对 S 内仓进行；sha NULL 仓后续出现 README 视为变更自愈；
     周/季维度不随 README 触发；
 - 降级：DEEPSEEK_API_KEY 未配置 → 记 INFO 返回零统计，服务照常；单条 translate/recommend 失败 →
-  记 WARNING 跳过该条计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额）直通整轮 handler；
+  记 WARNING 跳过该条计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额/账户权限 401/402/403）
+  直通整轮 handler；403 内容审核拦截（content_policy）属单仓失败，按 DeepSeekError 跳过该条；
   GitHub token 缺失/无效 → README 全量退化（readme_sha 保持 NULL），不报错；
   AI 整段异常由调用方（daily_job）吞掉记 ERROR——任何情况下快照主流程不受影响。
 """
@@ -93,7 +94,24 @@ class DeepSeekError(RuntimeError):
 
 
 class DeepSeekAuthError(DeepSeekError):
-    """API key 缺失/无效及账户类确定性错误（401 key 无效、402 余额不足、403 无权限）：逐条重试无意义，直通整轮 handler（与 GitHubAuthError 同姿态）。"""
+    """API key 缺失/无效及账户类确定性错误（401 key 无效、402 余额不足、403 账户权限）：逐条重试无意义，直通整轮 handler（与 GitHubAuthError 同姿态）。
+
+    注：403 中含 content_policy 标记的内容审核拦截属单仓确定性失败，不归此类，按 DeepSeekError 跳过单条。
+    """
+
+
+def _is_content_policy_403(exc: PermissionDeniedError) -> bool:
+    """判定 403 是否来自上游内容审核拦截（命中 content_policy 子串即认定，大小写不敏感）。"""
+    marker = "content_policy"
+    haystack = " ".join(
+        str(part)
+        for part in (
+            getattr(exc, "message", ""),
+            exc,
+            getattr(exc, "body", ""),
+        )
+    )
+    return marker in haystack.lower()
 
 
 def has_cjk(text: str) -> bool:
@@ -447,6 +465,11 @@ class DeepSeekClient:
                     f"响应：{exc.message[:200]}"
                 ) from exc
             except PermissionDeniedError as exc:
+                if _is_content_policy_403(exc):
+                    raise DeepSeekError(
+                        "AI 内容审核拦截（content_policy_violation），该仓跳过；"
+                        f"响应：{exc.message[:200]}"
+                    ) from exc
                 raise DeepSeekAuthError(
                     "AI 账户类错误（HTTP 403）：请检查 AI 账户余额与权限；"
                     f"响应：{exc.message[:200]}"
@@ -647,7 +670,8 @@ async def recommend_missing(
     - 输入含 README 正文（截断；拉取失败/空退化元数据，不持久化）；README 拉取失败绝不抛出阻塞
       （GitHub token 缺失/无效 → 全量退化、readme_sha 保持 NULL）；README 复用同一 _ReadmeState 实例
       （逐仓缓存，同轮同仓只拉一次，total 段与 summary 段共享）；
-    - 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError 直通整轮 handler；
+    - 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额/账户权限 401/402/403）
+      直通整轮 handler；403 内容审核拦截（content_policy）属单仓失败，按 DeepSeekError 跳过该条；
     - 单条写入即 commit（崩溃不丢已花配额，重跑幂等补缺）。
 
     被每日 ensure_daily_ai 与手动批量补缺 worker（refresh=False，只补缺失不重生）共用。
@@ -879,8 +903,9 @@ async def ensure_daily_ai(
     b) 翻译段收窄：只译 S 内 description_zh IS NULL 且英文非空无 CJK 的仓（原文变更采集层已清译文，
     当日本轮自然重译；译过的不重译；S 之外永不翻译——v3 全池口径作废）；
     c) 推荐语三维度＋概要（口径详见 recommend_missing docstring；refresh=True → 概要段随行执行）；
-    d) 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效）是确定性配置错误，
-    直通抛出由调用方整轮捕获（与采集层 GitHubAuthError 同姿态）；
+    d) 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额/账户权限）
+    是确定性配置错误，直通抛出由调用方整轮捕获（与采集层 GitHubAuthError 同姿态）；
+    403 内容审核拦截（content_policy）属单仓失败，按 DeepSeekError 跳过该条；
     e) key 未配置记 INFO 直接返回零统计；GitHub token 缺失/无效 → README 全量退化不报错。
 
     事务选择：单条写入即 commit（不开整体事务）——后台串行、量级小（S ≤ 数百仓），
@@ -930,7 +955,7 @@ async def ensure_daily_ai(
         try:
             zh = await client.translate(text_en)
         except DeepSeekAuthError:
-            raise  # 账户类确定性错误（401/402/403）：逐条重试只会刷爆日志，直通整轮 handler
+            raise  # 账户类确定性错误（401/402/403 账户权限）：逐条重试只会刷爆日志，直通整轮 handler
         except Exception as exc:
             log.warning("AI 翻译失败，跳过 %s：%s", full_name, exc)
             stats["translate_failed"] += 1
