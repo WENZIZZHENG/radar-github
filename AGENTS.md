@@ -38,20 +38,16 @@
   - 验收口径：机器可执行的工程验证类验收动作（verify.ps1 一次跑绿、pytest、可脚本化检查等）由 AI 直接执行验收并放行，无需本人逐步操作；保留本人验收的：页面/交互走查（四格尺感知类）、词表封板、拍板决策与冻结物确认。
   - 复验交付：交付本人走查必须给**规范复验步骤卡**，预演按改动分级——A 级（含异步/状态机/后台任务/外部 API 接线的改动；功能改动其单测覆盖靠 mock 顶替真实外部依赖的自动归 A；核心链路一律 A）强制真实环境字面预演，B 级（纯展示层）起服务截图核对即收口，C 级（纯文档/测试/配置）验证入口跑绿即收口；判不了级从紧归 A。步骤卡格式、各级预演细则与执行分工按 `docs/sop/复验交付规范.md`（细则单点，本文件不复制）。
 
-## 3. 子 agent 模型路由（本人拍板，优先级高于全局同名条款）
+## 3. 子 agent 模型
 
-- 实施类全部 DeepSeek（secondary）起手；评审一律 k3（primary）。
-- 每任务评审最多三轮（k3 初审→DeepSeek 修→k3 复审→DeepSeek 修→k3 三审）；三轮后仍有未清零的中/高 findings 则 k3 接手**该任务**（不牵连后续任务，下一任务仍 DeepSeek 起手）。
-- 低 findings 可留痕不修，不算"不过"。
-- 图形/视觉判断（截图判读、视觉核对）一律 k3：DeepSeek 无 image_in，不做看图环节。
+子 agent 一律继承主会话模型，无模型路由规则；本项目无额外加严或覆盖。
 
 ## 4. 验证与评审门禁
 
 - 统一验证入口（收口只认它一次跑绿）：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1`（ruff + pytest）。
 - 日常开发命令全集（本地起服务、依赖安装等）见 `docs/dev-commands.md`；新增或变更验证命令必须实际跑通后同步该文档。
-- 评审门禁：按全局 `AGENTS.md` 任务路由表"评审"列与 dev-sop 铁律执行；独立评审子 agent 一律 k3（见 §3）。
+- 评审门禁：按全局 `AGENTS.md` 任务路由表"评审"列与 dev-sop 铁律执行；评审子 agent 模型按 §3 口径。
 
 ## 5. Git 与文档提交节奏（本人拍板）
 
-- commit message 用 Conventional Commits：`feat:` / `fix:` / `docs:` / `chore:` / `refactor:` / `test:` 开头，中文描述；历史 commit 不回刷。
-- 文档提交节奏：代码 commit 后，文档改动不立即单独 commit——任务状态/验证留痕仍当场写入文件，但 git 提交等本人反馈确认后与后续改动一起提交。
+- 按全局 `AGENTS.md` §3"commit message 与文档提交节奏"段口径执行（Conventional Commits 中文描述、历史不回刷；文档当场写文件、git 提交等本人反馈确认后攒批），本项目无额外加严或覆盖。

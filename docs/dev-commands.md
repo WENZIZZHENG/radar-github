@@ -21,6 +21,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 uv venv .venv && uv pip install -r pyproject.toml --extra dev
 ```
 
+> 踩坑记录（2026-08-20）：`&&` 连写是 bash 语法，**Windows PowerShell 5.1 不支持**（报"标记 && 不是此版本中的有效语句分隔符"）。
+> PowerShell 下拆两行跑：`uv venv .venv` 然后 `uv pip install -r pyproject.toml --extra dev`；或直接用 Git Bash 跑原命令。
+> 本手册所有 `&&` 连写同理（本地命令默认 Git Bash 环境）。
+
 ## 4. 生产部署（tar+scp，2026-08-14 实跑固化）
 
 > 服务器：root@<SERVER_IP>（CentOS 9）；应用 /opt/radar 归 radar 用户；systemd 单元 radar.service；
@@ -43,15 +47,23 @@ sha256sum /tmp/radar-deploy.tar.gz   # 记一下，服务器侧要核对
 scp -i ~/.ssh/your-deploy-key.pem /tmp/radar-deploy.tar.gz root@<SERVER_IP>:/tmp/
 ```
 
-排除清单是红线：`.env*`（密钥只在服务器；文件名按环境错开——本地 `.env.dev`、生产 `.env.prod`，应用代码只读 `.env.dev`，生产由 radar.service 的 EnvironmentFile 注入，本地配置误传上去也不会被加载）、`data/`（生产库绝不能被本地库覆盖）。`.env.example` 模板正常入包。
+排除清单是红线：`.env*`（密钥不进包——文件名按环境错开：本地 `.env.dev`、生产 `.env.prod`，应用代码只读 `.env.dev`，生产由 radar.service 的 EnvironmentFile 注入，本地配置误传上去也不会被加载）、`data/`（生产库绝不能被本地库覆盖）。`.env.example` 模板正常入包。**`.env.prod` 例外口径（2026-08-20 本人拍板）：本地 `.env.prod` 是生产配置的唯一事实来源，每次部署必须单独 scp 覆盖生产（见 4.2 第 ② 步），防两端漂移。**
 
 ### 4.2 服务器侧解压＋重启
 
 ```bash
+# ① 代码包：本地先 scp /tmp/radar-deploy.tar.gz，服务器侧核对 sha 后解压
 $SSH '
 set -e
 sha256sum /tmp/radar-deploy.tar.gz        # 必须与本地一致，不一致中止
 tar xzf /tmp/radar-deploy.tar.gz -C /opt/radar --no-same-owner
+'
+# ② .env.prod 覆盖（2026-08-20 本人拍板：每次部署必做，本地为唯一事实来源）
+scp -i ~/.ssh/your-deploy-key.pem .env.prod root@<SERVER_IP>:/tmp/radar-env.prod
+$SSH 'install -o radar -g radar -m 600 /tmp/radar-env.prod /opt/radar/.env.prod'
+# ③ 权限＋重启＋活性检查
+$SSH '
+set -e
 chown -R radar:radar /opt/radar
 systemctl restart radar
 sleep 4
