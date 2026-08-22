@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 import app.jobs as jobs_module  # 同步后台任务/状态的模块级引用（运行时取最新值，非 import 时快照）
 from app.collector.discover import DailyStats, run_daily
-from app.collector.github import GitHubAuthError
+from app.collector.github import GitHubAuthError, GitHubError
 from app.db import get_conn, init_db
 from app.jobs import DAILY_JOB_ID, create_scheduler, daily_job, sync_status, try_start_sync
 from app.main import app
@@ -318,6 +318,114 @@ def test_batch_failure_is_logged_and_following_batches_continue(tmp_path):
     assert conn.execute("SELECT stars FROM star_snapshots WHERE repo_id = ?", (ids[100],)).fetchone()["stars"] == 777
     assert any("快照批次失败" in r.getMessage() for r in records)
     assert any("每日任务汇总" in r.getMessage() for r in records)  # 每轮必有汇总行
+    conn.close()
+
+
+# ---------- 快照坏仓剔除重试：node_id 不可解析（仓已删除/转移）→ 标 dead 剔出后重试本批 ----------
+
+
+class BadNodeClient(FakeClient):
+    """按次脚本抛 GitHubError（生产实锤的 "Could not resolve ... global id" 形态），脚本用尽后正常返回 nodes。"""
+
+    def __init__(self, *, error_messages: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.error_messages = list(error_messages)
+
+    async def fetch_repos_by_ids(self, ids):
+        self.fetch_calls.append(list(ids))
+        if self.error_messages:
+            raise GitHubError(self.error_messages.pop(0))
+        return [self.nodes_by_id.get(node_id) for node_id in ids]
+
+
+def _unresolvable_msg(*node_ids: str) -> str:
+    """造 GraphQL errors join 后的消息（与 github.py fetch_repos_by_ids 的 join 口径一致；多个坏 id 一条消息）。"""
+    return "GitHub GraphQL 返回错误：" + "; ".join(
+        f"Could not resolve to a node with the global id of '{nid}'" for nid in node_ids
+    )
+
+
+def test_snapshot_unresolvable_node_marked_dead_and_batch_retried(tmp_path):
+    """批内一个坏 node_id：首次调用抛错 → 该仓标 dead=1、其余 99 仓快照正常写入、剔除后重试本批成功。"""
+    conn = _open_db(tmp_path)
+    seed_repo(conn, "a/bad", "R_bad")
+    for i in range(99):
+        seed_repo(conn, f"o/r{i:02d}", f"nid-{i:02d}")
+    client = BadNodeClient(
+        error_messages=[_unresolvable_msg("R_bad")],
+        nodes_by_id={f"nid-{i:02d}": make_node(f"o/r{i:02d}", stars=1000 + i) for i in range(99)},
+    )
+    logger, records = make_logger()
+    stats = _run(client, conn, logger)
+
+    assert conn.execute("SELECT dead FROM repos WHERE node_id = 'R_bad'").fetchone()["dead"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM star_snapshots").fetchone()[0] == 99  # 坏仓无快照，其余 99 仓全写入
+    assert stats.dead_marked == 1 and stats.snapshots_written == 99
+    assert [len(c) for c in client.fetch_calls] == [100, 99]  # 首次 100 → 剔除后 99 重试
+    assert "R_bad" not in client.fetch_calls[1]
+    assert any(r.levelno == logging.WARNING and "剔除" in r.getMessage() and "R_bad" in r.getMessage() for r in records)
+    conn.close()
+
+
+def test_snapshot_two_unresolvable_nodes_pruned_in_one_round(tmp_path):
+    """一条 join 消息里两个坏 id：一轮全部剔除（各标 dead=1），重试一次即成功。"""
+    conn = _open_db(tmp_path)
+    seed_repo(conn, "a/bad1", "R_bad1")
+    seed_repo(conn, "a/bad2", "R_bad2")
+    id_live = seed_repo(conn, "a/live", "nid-live")
+    client = BadNodeClient(
+        error_messages=[_unresolvable_msg("R_bad1", "R_bad2")],
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000)},
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    assert conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 1").fetchone()[0] == 2
+    assert stats.dead_marked == 2 and stats.snapshots_written == 1
+    assert len(client.fetch_calls) == 2  # 一轮剔除两个：总共只调两次
+    assert client.fetch_calls[1] == ["nid-live"]
+    assert conn.execute("SELECT stars FROM star_snapshots WHERE repo_id = ?", (id_live,)).fetchone()["stars"] == 2000
+    conn.close()
+
+
+def test_snapshot_github_error_without_node_id_skips_batch(tmp_path):
+    """GitHubError 但消息提不出 node_id：维持既有行为——跳过本批、无 dead 标记、后续批照常。"""
+    conn = _open_db(tmp_path)
+    ids = [seed_repo(conn, f"o/r{i:03d}", f"nid-{i:03d}") for i in range(101)]  # 101 个 → 2 批（100+1）
+    client = BadNodeClient(
+        error_messages=["GitHub GraphQL 返回错误：Something went wrong while executing your query"],
+        nodes_by_id={"nid-100": make_node("o/r100", stars=777)},
+    )
+    logger, records = make_logger()
+    stats = _run(client, conn, logger)
+
+    assert len(client.fetch_calls) == 2  # 失败不中断：两批都尝试了
+    assert stats.dead_marked == 0  # 提不出坏 id：一个仓都不标 dead
+    assert conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 1").fetchone()[0] == 0
+    assert stats.snapshots_written == 1  # 仅第 2 批成功
+    assert conn.execute("SELECT stars FROM star_snapshots WHERE repo_id = ?", (ids[100],)).fetchone()["stars"] == 777
+    assert any("快照批次失败" in r.getMessage() for r in records)
+    conn.close()
+
+
+def test_snapshot_retry_reveals_new_bad_node_pruned_again(tmp_path):
+    """重试时又冒出一个新坏 id：循环再剔再试直至成功（每轮至少剔一个，循环自然有界）。"""
+    conn = _open_db(tmp_path)
+    seed_repo(conn, "a/bad1", "R_bad1")
+    seed_repo(conn, "a/bad2", "R_bad2")
+    id_live = seed_repo(conn, "a/live", "nid-live")
+    client = BadNodeClient(
+        error_messages=[_unresolvable_msg("R_bad1"), _unresolvable_msg("R_bad2")],  # 首轮剔 R_bad1，重试再冒 R_bad2
+        nodes_by_id={"nid-live": make_node("a/live", stars=2000)},
+    )
+    logger, _records = make_logger()
+    stats = _run(client, conn, logger)
+
+    assert conn.execute("SELECT dead FROM repos WHERE node_id = 'R_bad1'").fetchone()["dead"] == 1
+    assert conn.execute("SELECT dead FROM repos WHERE node_id = 'R_bad2'").fetchone()["dead"] == 1
+    assert stats.dead_marked == 2 and stats.snapshots_written == 1
+    assert client.fetch_calls == [["R_bad1", "R_bad2", "nid-live"], ["R_bad2", "nid-live"], ["nid-live"]]
+    assert conn.execute("SELECT stars FROM star_snapshots WHERE repo_id = ?", (id_live,)).fetchone()["stars"] == 2000
     conn.close()
 
 

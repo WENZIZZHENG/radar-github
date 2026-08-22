@@ -4,7 +4,9 @@
 
 - 快照走 GraphQL nodes(ids:) 分批（≤100/批）：核心池全量约 6.4 万仓库≈640 请求（架构决策 1），
   比逐仓 REST 省一个数量级；批内 null / isPrivate / isDisabled 是死库信号 → repos.dead=1，
-  只停采不删历史快照（schema 注释口径）。
+  只停采不删历史快照（schema 注释口径）；node_id 在 GitHub 侧不可解析（errors 报 "Could not resolve
+  to a node"，仓已删除/转移）与上述信号同类 → 坏仓标 dead=1 剔除后重试本批（每轮至少剔一个，循环有界），
+  提不出坏 id 才按单批失败跳过。
 - T-016/T-017 变更检测（决策 5 v2）：nodes 本已拉 description 字段，与库内 description_en 比对，
   有变更 → 更新原文＋清 description_zh=NULL＋DELETE 该仓全部维度推荐语（当日 ensure 对范围内仓自然重译/重生）；
   无变更不动。T-025 追加 language/topics 漂移检测（流程说明 §7.4）：只 UPDATE repos 归类字段，
@@ -24,7 +26,8 @@
   老仓慢涨过 1000 星但近期无更新永远翻不进每日前 500；7 周扫完全谱，长尾段 7 周轮转、
   头部优先（每段只捞 Top 500 属既定截断）；判重与入池完全复用发现池路径。
 - 静默容错（共识 §8：连续 3 天失败允许数据空洞，次日调度自然重试）：
-  单批/单页失败记日志后继续跑完本批之外的量；整任务异常吞掉只记日志，不报警、不抛出。
+  快照批内坏仓（node_id 不可解析）剔除重试、提不出坏 id 才记日志跳过本批，单页失败记日志后继续下一页；
+  整任务异常吞掉只记日志，不报警、不抛出。
 - 任务日志双写 data/jobs.log（RotatingFileHandler，data/ 已 gitignore）与控制台，
   每轮结束记一行汇总（快照/新发现/dead/漂移/耗时），出问题有据可查。
 """
@@ -34,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Callable
@@ -46,6 +50,7 @@ from app.collector.github import (
     MAX_NODES_PER_QUERY,
     GitHubAuthError,
     GitHubClient,
+    GitHubError,
     normalize_github_created_at,
     utc_now_iso,
 )
@@ -159,10 +164,57 @@ def _apply_snapshot_batch(
                 stats.snapshots_written += 1
 
 
+# GraphQL errors 里"node 不可解析"消息的 node_id 提取正则（仓已删除/转移：与 null/isPrivate/isDisabled 同类死库信号）
+_UNRESOLVABLE_NODE_RE = re.compile(r"global id of '([^']+)'")
+
+
+def _extract_unresolvable_node_ids(exc: GitHubError) -> set[str]:
+    """从 GitHubError 消息里提取不可解析的 node_id（errors 数组 join 后可能含多条，全部提取）。"""
+    return set(_UNRESOLVABLE_NODE_RE.findall(str(exc)))
+
+
+async def _snapshot_chunk(
+    client: GitHubClient,
+    conn: sqlite3.Connection,
+    chunk: list[sqlite3.Row],
+    *,
+    captured_at: str,
+    stats: DailyStats,
+    log: logging.Logger,
+) -> None:
+    """单批快照＋坏仓剔除重试：GitHubError 消息里提取出的不可解析 node_id（仓已删除/转移）标 dead=1 后
+    剔除重试本批，循环直到成功或提不出新坏 id（每轮至少剔一个，循环自然有界）；
+    提不出坏 id（或坏 id 不在本批）原样上抛，归调用方按单批失败跳过。
+    """
+    alive = chunk
+    while True:
+        try:
+            nodes = await client.fetch_repos_by_ids([row["node_id"] for row in alive])
+            _apply_snapshot_batch(conn, alive, nodes, captured_at, stats)
+            return
+        except GitHubAuthError:
+            raise  # token 失效是确定性错误：直通，不进坏仓剔除（与 _snapshot_all 直通分支同口径）
+        except GitHubError as exc:
+            dead_ids = _extract_unresolvable_node_ids(exc) & {row["node_id"] for row in alive}
+            if not dead_ids:
+                raise  # 提不出坏 id 或坏 id 不在本批：上抛，按既有单批失败跳过处理
+            with conn:  # 与 _apply_snapshot_batch 同事务风格：一批一个事务
+                conn.executemany("UPDATE repos SET dead = 1 WHERE node_id = ?", [(nid,) for nid in sorted(dead_ids)])
+            stats.dead_marked += len(dead_ids)
+            log.warning(
+                "快照批次剔除 %d 个不可解析 node_id（仓已删除/转移，标 dead=1 停采）：%s（%s）",
+                len(dead_ids),
+                ", ".join(sorted(dead_ids)),
+                exc,
+            )
+            alive = [row for row in alive if row["node_id"] not in dead_ids]
+
+
 async def _snapshot_all(
     client: GitHubClient, conn: sqlite3.Connection, *, captured_at: str, stats: DailyStats, log: logging.Logger
 ) -> None:
-    """每日快照：全部 dead=0 仓库按 node_id 分批走 nodes(ids:)；单批失败记日志跳过，不拖垮整轮。
+    """每日快照：全部 dead=0 仓库按 node_id 分批走 nodes(ids:)；批内坏仓剔除重试（_snapshot_chunk），
+    提不出坏 id 才记日志跳过本批，不拖垮整轮。
 
     SELECT 带 description_en/language/topics 供 T-016/T-025 变更检测（_apply_snapshot_batch 内比对更新），
     github_created_at 供 T-033 顺手回填比对（值有变才写）。
@@ -173,8 +225,7 @@ async def _snapshot_all(
     for offset in range(0, len(rows), MAX_NODES_PER_QUERY):
         chunk = rows[offset : offset + MAX_NODES_PER_QUERY]
         try:
-            nodes = await client.fetch_repos_by_ids([row["node_id"] for row in chunk])
-            _apply_snapshot_batch(conn, chunk, nodes, captured_at, stats)
+            await _snapshot_chunk(client, conn, chunk, captured_at=captured_at, stats=stats, log=log)
         except GitHubAuthError:
             raise  # token 失效是确定性错误：逐批重试只会刷爆日志还可能触发二次限速，直通整轮 handler 记一次
         except Exception:
