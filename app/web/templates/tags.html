@@ -20,9 +20,32 @@
 <p class="empty-follows">还没有项目打过「{{ tag }}」标签。<a href="/tags">返回标签列表</a></p>
 {% endif %}
 {% else %}
-{# ---- 标签云总页：每个标签＋项目数（项目数降序、同数按标签名，排序在 routes._tag_cloud） ---- #}
+{# ---- 标签云总页 ---- #}
 <p class="meta">全部 {{ tags | length }} 个标签 · 从任意标签进入项目列表</p>
-{% if tags %}
+{# T-039 §19.2 页头"＋新建分类"（打标输入框同款形态，交互在 radar.js；管理控件只在 /tags 总页） #}
+<p class="cat-toolbar"><button type="button" class="tag-add" id="cat-create">＋新建分类</button></p>
+{% if groups %}
+{# T-039 §19.1 分组云视图：分类组（组头＝分类名＋组内标签数，组间字典序、组内使用次数降序）＋底部"未分类"组；
+   一标签属多分类时在多组各出现一次；归类钮自绘多选下拉数据源 = data-cats（已属分类）＋ #all-categories #}
+{% for g in groups %}
+<section>
+  <h2 class="sec cat-head">
+    {%- if g.category -%}
+      {{ g.category }}<i>{{ g.tags | length }}</i>
+      <button type="button" class="cat-op" data-cat-rename="{{ g.category }}" title="改名">改名</button>
+      <button type="button" class="cat-op" data-cat-delete="{{ g.category }}" title="删除分类">删除</button>
+    {%- else -%}
+      未分类<i>{{ g.tags | length }}</i>
+    {%- endif -%}
+  </h2>
+  <div class="chips">
+    {% for t in g.tags %}<span class="tag-item"><a class="tag tag-cloud" href="{{ t.href }}">{{ t.tag }}<i>{{ t.n }}</i></a><button type="button" class="cat-assign" data-tag="{{ t.tag }}" data-cats="{{ t.cats | tojson | forceescape }}" title="归类">▾</button></span>{% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% elif tags %}
+{# 零分类退化（§19.1）：平铺标签云与本变更前一致，不渲染分组结构与"未分类"组头；
+   每个标签＋项目数（项目数降序、同数按标签名，排序在 routes._tag_cloud） #}
 <section>
   <h2 class="sec">全部标签</h2>
   <div class="chips">
@@ -33,5 +56,11 @@
 {# 空库空态（任务书口径）：引导打标入口 #}
 <p class="empty-follows">还没有任何标签：展开项目行点「＋ 标签」即可打标。<a href="/">回首页</a></p>
 {% endif %}
+{% endif %}
+{% if categories %}
+{# T-039：归类多选下拉的分类全集数据源（同 all-tags datalist 纯数据源手法，不挂原生 UI） #}
+<datalist id="all-categories">
+  {% for c in categories %}<option value="{{ c }}"></option>{% endfor %}
+</datalist>
 {% endif %}
 {% endblock %}

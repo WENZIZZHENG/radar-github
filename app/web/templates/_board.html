@@ -3,27 +3,34 @@
    show_sidebar 恒 True，无死分支。
    三段区头对仗 h4（§16.1）：新崛起（绿，既有）／新项目（蓝，T-033）／主榜（灰，T-033 补对仗区头）；
    新崛起/新项目空区不渲染（区头/说明全不出现，榜块本体照常），主榜区头恒渲染（§16.2）。
-   idx 偏移（面板 data-b/data-i 定位不撞行）：新崛起区接主榜行数后、新项目区再接新崛起行数后。 #}
+   idx 偏移（面板 data-b/data-i 定位不撞行）：新崛起区接主榜行数后、新项目区再接新崛起行数后。
+   T-038 §18：榜头/区头计数用过滤前口径（main_total/rising_total/fresh_total），不随隐藏缩水；
+   三区行全被隐藏（all_hidden）时只渲染榜头＋空态小字，区头与空壳不渲染。 #}
 <div class="board" id="{{ b.anchor }}">
-  <h3>{{ b.label }}<span class="n">Top {{ b.rows | length }}</span></h3>
+  <h3>{{ b.label }}<span class="n">Top {{ b.main_total }}</span></h3>
+  {% if b.all_hidden %}
+  {# T-038 §18.1 榜块空态：三区行全被隐藏 → 榜头保留，一行小字交代去向 #}
+  <p class="board-empty">本榜 {{ b.hidden_count }} 个项目均已打标隐藏</p>
+  {% else %}
   {% if b.rising_rows %}
   <div class="rising">
-    <h4 class="rising-h">新崛起 · 入池未满一个统计窗口<span class="n">Top {{ b.rising_rows | length }}</span></h4>
+    <h4 class="rising-h">新崛起 · 入池未满一个统计窗口<span class="n">Top {{ b.rising_total }}</span></h4>
     <p class="rising-note">以下项目入池不足 {{ b.rising_days }} 天，按入池以来增星排序</p>
     {% for r in b.rising_rows %}{% set anchor = b.anchor %}{% set idx = b.rows | length + loop.index0 %}{% include "_row.html" %}{% endfor %}
   </div>
   {% endif %}
   {% if b.fresh_rows %}
   <div class="newzone">
-    <h4 class="zone-h fresh">新项目 · 创建未满 1 年<span class="n">Top {{ b.fresh_rows | length }}</span></h4>
+    <h4 class="zone-h fresh">新项目 · 创建未满 1 年<span class="n">Top {{ b.fresh_total }}</span></h4>
     {% for r in b.fresh_rows %}{% set anchor = b.anchor %}{% set idx = b.rows | length + b.rising_rows | length + loop.index0 %}{% include "_row.html" %}{% endfor %}
   </div>
   {% endif %}
   <div class="mainzone">
-    <h4 class="zone-h main">主榜 · {{ b.main_note }}<span class="n">Top {{ b.rows | length }}</span></h4>
+    <h4 class="zone-h main">主榜 · {{ b.main_note }}<span class="n">Top {{ b.main_total }}</span></h4>
     {% for r in b.rows %}{% set anchor = b.anchor %}{% set idx = loop.index0 %}{% include "_row.html" %}{% else %}
     {# 空榜也渲染板块（示意图口径：0 也列出板块） #}
     <p class="board-empty">本期暂无数据</p>
     {% endfor %}
   </div>
+  {% endif %}
 </div>

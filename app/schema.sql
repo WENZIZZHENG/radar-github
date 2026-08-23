@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS tags (
 -- 主键服务"仓库 → 标签"方向；分主题榜单走"标签 → 仓库"反查，需独立索引
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags (tag);
 
+-- 标签分类（T-039，流程说明 §19）：标签↔分类多对多映射；无映射记录的标签＝未分类。
+-- 新建空分类写 (tag='', category=...) 占位行（打标校验最小 1 字符，空串不可能撞真实标签），
+-- 分组装配与使用次数统计一律跳过 tag='' 行；打标流程不写本表（新标签天然落未分类）；
+-- 删除分类只删本表行（tags 表与仓上打标记录不动）。
+CREATE TABLE IF NOT EXISTS tag_category (
+    tag TEXT NOT NULL,
+    category TEXT NOT NULL,
+    PRIMARY KEY (tag, category)
+);
+
 -- 推荐理由（T-017 三口径分维度）＋ AI 概要（T-024）：同一仓库按"维度 × 期次标签"各存一条——周/季文本带增量语境
 --（期次标签换行/REPLACE；周维度每周重生，季维度仅在半月窗口日 1 号/15 号 REPLACE）；
 -- 总星文本存量语境（period_label 固定 'all'，懒生成＋半月窗口日 README 变更重生）；

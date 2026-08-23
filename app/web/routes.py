@@ -210,24 +210,26 @@ def _earliest_labels(conn: sqlite3.Connection) -> tuple[str, str] | None:
     return _week_label(d), _quarter_label(d)
 
 
-def _switcher(period: str, label: str, now: datetime, earliest_label: str) -> dict:
+def _switcher(period: str, label: str, now: datetime, earliest_label: str, hide_tagged: bool = False) -> dict:
     """期次分段控件（示意图顶栏右侧）：上一期/下一期，越界禁用（禁用原因走 tooltip——流程说明 §0）。
 
     季度回看用与周次同款分段控件而非《交互流程说明》§1 的"期次下拉"：当前仅单个季度可选，
     下拉无内容可列；控件形态已在 v3 示意图冻结，保持一致（流程偏差已在交付报告留痕）。
+    hide_tagged（T-038 §18.2）：开关开启时 prev/next 链接携带 hide_tagged=1，跨期次不丢开关。
     """
     cur = _week_label(now.date()) if period == "week" else _quarter_label(now.date())
+    suffix = "&hide_tagged=1" if hide_tagged else ""  # 关态链接一律不带该参数（URL 保持干净）
     if period == "week":
         monday = _parse_week_param(label)  # label 上游已校验，这里复用解析拿周一做 ±7 天
-        prev_url = f"/?week={_week_label(monday - timedelta(days=7))}"
-        next_url = f"/?week={_week_label(monday + timedelta(days=7))}"
+        prev_url = f"/?week={_week_label(monday - timedelta(days=7))}{suffix}"
+        next_url = f"/?week={_week_label(monday + timedelta(days=7))}{suffix}"
         unit = "周"
     else:
         year, q = _parse_quarter_param(label)
         py, pq = (year - 1, 4) if q == 1 else (year, q - 1)
         ny, nq = (year + 1, 1) if q == 4 else (year, q + 1)
-        prev_url = f"/quarter?quarter={py}-Q{pq}"
-        next_url = f"/quarter?quarter={ny}-Q{nq}"
+        prev_url = f"/quarter?quarter={py}-Q{pq}{suffix}"
+        next_url = f"/quarter?quarter={ny}-Q{nq}{suffix}"
         unit = "季"
     return {
         "current": label,
@@ -596,7 +598,31 @@ def _board_view(board: Board, **row_ctx) -> dict:
         # main_note 为主榜区头文案（周/季"按本期增星排序"、total"按总星排序"，§16.1 对仗区头）
         "fresh_rows": [_row_view(i + 1, r, **row_ctx) for i, r in enumerate(board.fresh)],
         "main_note": "按本期增星排序" if row_ctx["period"] != "total" else "按总星排序",
+        # T-038 §18.3：榜头/区头计数徽标保持过滤前完整榜单口径（不随隐藏缩水）——
+        # 三区过滤前数量在此处固定，模板一律用 *_total 而非 rows|length
+        "main_total": len(board.rows),
+        "rising_total": len(board.rising_rows),
+        "fresh_total": len(board.fresh),
+        "hidden_count": 0,  # 本榜被隐藏行数（_filter_board_view 回填；all_hidden 空态文案用）
+        "all_hidden": False,  # 三区行全被隐藏 → 模板只渲染榜头＋空态小字（§18.1）
     }
+
+
+def _filter_board_view(view: dict) -> int:
+    """T-038 §18.2/§18.3 展示装配层过滤（hide_tagged=1 时调用）：丢弃 tags 非空的行视图
+    （主榜 rows／新崛起区 rising_rows／新项目区 fresh_rows 三区统一），返回本榜被隐藏行数。
+
+    "已打标"＝该仓在 tags 表存在任意标签（不看标签内容/分类）；行视图 tags 由 _display_maps 注入。
+    计数按行计（同仓多榜重复出现按行分别计）；过滤前三区非空、过滤后全空 → all_hidden（榜块空态）。
+    """
+    before = len(view["rows"]) + len(view["rising_rows"]) + len(view["fresh_rows"])
+    view["rows"] = [r for r in view["rows"] if not r["tags"]]
+    view["rising_rows"] = [r for r in view["rising_rows"] if not r["tags"]]
+    view["fresh_rows"] = [r for r in view["fresh_rows"] if not r["tags"]]
+    after = len(view["rows"]) + len(view["rising_rows"]) + len(view["fresh_rows"])
+    view["hidden_count"] = before - after
+    view["all_hidden"] = before > 0 and after == 0
+    return before - after
 
 
 # ===== T-026 单榜整页（§13.1）：board 查询参数解析与边栏整页链接 =====
@@ -626,15 +652,19 @@ def _resolve_board(raw: str | None, topic_table: dict) -> str:
     return f"language-{next(iter(LANGUAGES.values()))}"
 
 
-def _sidebar_items(boards: list[Board], *, base: str, period_query: str, current: str) -> list[dict]:
+def _sidebar_items(
+    boards: list[Board], *, base: str, period_query: str, current: str, hide_tagged: bool = False
+) -> list[dict]:
     """边栏项数据（T-026 §13.1 起边栏项为整页链接，原页内锚点 scrollspy 移除，active 由服务端渲染）。
 
     - base/period_query：整页 URL 形态——P1/P2 `/?board=xxx`（历史周携带 `week=...`）、
       P3 `/quarter?board=xxx`（携带 `quarter=...`）、P4 `/total?board=xxx`（无期次）；
     - current：当前榜 key 或 "all"（全量/降级页当前为全部项）；
     - 结构：顶部"全部"项（样式同 sb-item，灰点色，徽标=榜总数）→ 语言组头 + 7 项 → 主题组头 + 10 项；
-    - 徽标 = 单榜模式非当前榜用 Board.count（只计数不建行），全量模式 len(rows)——两边栏数据同源同语义。
+    - 徽标 = 单榜模式非当前榜用 Board.count（只计数不建行），全量模式 len(rows)——两边栏数据同源同语义；
+    - hide_tagged（T-038 §18.2）：开关开启时链接追加 hide_tagged=1（跨榜导航不丢开关），关态不带。
     """
+    suffix = "&hide_tagged=1" if hide_tagged else ""
     items = [
         {
             "key": _BOARD_ALL,
@@ -642,7 +672,7 @@ def _sidebar_items(boards: list[Board], *, base: str, period_query: str, current
             "dot": _DEFAULT_LANG_COLOR,
             "count": len(boards),
             "active": current == _BOARD_ALL,
-            "href": f"{base}?board={_BOARD_ALL}" + (f"&{period_query}" if period_query else ""),
+            "href": f"{base}?board={_BOARD_ALL}" + (f"&{period_query}" if period_query else "") + suffix,
         }
     ]
     last_kind: str | None = None
@@ -664,7 +694,7 @@ def _sidebar_items(boards: list[Board], *, base: str, period_query: str, current
                 "dot": dot,
                 "count": b.count if b.count is not None else len(b.rows),
                 "active": current == key,
-                "href": f"{base}?board={key}" + (f"&{period_query}" if period_query else ""),
+                "href": f"{base}?board={key}" + (f"&{period_query}" if period_query else "") + suffix,
             }
         )
     return items
@@ -680,6 +710,7 @@ def _boards_context(
     now: datetime,
     show_sidebar: bool,
     board: str | None = None,
+    hide_tagged: bool = False,
 ) -> dict:
     """榜单四页共用的上下文装配：榜单（含首期空态降级）→ 元信息 → 期次控件 → 边栏。
 
@@ -689,6 +720,9 @@ def _boards_context(
     board（T-026 §13.1）：board 查询参数解析结果——"all" 全量 17 榜；具体榜 key 单榜模式
     （当前榜查全内容，其余 15 榜只 count 喂边栏徽标）；缺省/非法已静默降级为默认首榜；
     首期空态降级页维持全量现状（不单榜化），board 参数忽略、当前边栏项为"全部"。
+
+    hide_tagged（T-038 §18）：True 时在展示装配层过滤已打标行（三区统一，不动榜单计算与
+    board_cache），页内导航（边栏/期次控件/开关互跳）链接携带 hide_tagged=1。
 
     DB 连接请求级获取/关闭（不持全局长连接）；WAL 下读榜单不阻塞每日采集写入。
     """
@@ -782,6 +816,13 @@ def _boards_context(
             lang_boards = [view] if target.kind == "language" else []
             topic_boards = [view] if target.kind == "topic" else []
 
+        # T-038 §18：hide_tagged=1 → 装配层过滤已打标行（首期降级判定已在上方跑完过滤前的
+        # boards 上，不受隐藏影响；降级渲染的总星榜行同样在此被过滤）；N＝本次渲染被隐藏行数合计
+        hidden_total = 0
+        if hide_tagged:
+            for view in (*lang_boards, *topic_boards):
+                hidden_total += _filter_board_view(view)
+
         # T-026 边栏整页链接（§13.1）：历史周页携带 week=、季页携带 quarter=、最新周与总星页不带期次
         period_query = ""
         if period == "week" and label != _week_label(now.date()):
@@ -789,18 +830,22 @@ def _boards_context(
         elif period == "quarter":
             period_query = f"quarter={label}"
         base = {"week": "/", "quarter": "/quarter", "total": "/total"}[period]
-        sidebar = _sidebar_items(boards, base=base, period_query=period_query, current=board_key)
+        sidebar = _sidebar_items(boards, base=base, period_query=period_query, current=board_key, hide_tagged=hide_tagged)
 
         switcher = None
         if period in _NOMINAL_DAYS:
             earliest = _earliest_labels(conn)
             earliest_label = (earliest[0] if period == "week" else earliest[1]) if earliest else label
-            switcher = _switcher(period, label, now, earliest_label)
+            switcher = _switcher(period, label, now, earliest_label, hide_tagged=hide_tagged)
 
         if period == "week" and label != _week_label(now.date()):
             title = f"历史周报 {label}"
         else:
             title = {"week": "本周报告", "quarter": "季度回顾", "total": "总星榜"}[period]
+        # T-038 §18.2 开关互跳链接（页内 GET，保留当前 board=/期次参数）：开态 URL 追加
+        # hide_tagged=1，关态链接一律不带；board_key 为解析后的真实当前视图（降级页 = all）
+        toggle_params = f"board={board_key}" + (f"&{period_query}" if period_query else "")
+        hide_off_url = f"{base}?{toggle_params}"
         return {
             "request": request,
             "page": period,  # 顶栏 active 态：历史周次仍归属"本周报告"
@@ -814,6 +859,11 @@ def _boards_context(
             "sidebar": sidebar,  # T-026 §13.1：边栏项整页链接（含"全部"项、服务端 active）
             "lang_boards": lang_boards,
             "topic_boards": topic_boards,
+            # T-038 §18：开关态、互跳链接与隐藏计数提示（N=0 时模板不出计数）
+            "hide_tagged": hide_tagged,
+            "hide_on_url": f"{hide_off_url}&hide_tagged=1",
+            "hide_off_url": hide_off_url,
+            "hidden_total": hidden_total,
         }
     finally:
         conn.close()
@@ -823,11 +873,12 @@ def _boards_context(
 
 
 @router.get("/", response_class=HTMLResponse)
-def weekly(request: Request, week: str | None = None, board: str | None = None) -> HTMLResponse:
+def weekly(request: Request, week: str | None = None, board: str | None = None, hide_tagged: str | None = None) -> HTMLResponse:
     """P1 本周报告（=最新一期）；?week=2026-W32 回看历史周次（P2 与 P1 同页换期次，流程说明 §1）。
 
     T-021 §12.1（v2.1）：榜单四页边栏 = True（首期空态降级为 total 榜单时页面仍是周报语境，边栏保留）。
     T-026 §13.1：?board=xxx 单榜整页（缺省/非法静默降级默认首榜；board=all 全量；历史周携带 week=）。
+    T-038 §18：?hide_tagged=1 隐藏已打标行（仅 "1" 为开，其余取值静默按关，与 board 非法降级同风格）。
     """
     now = datetime.now(timezone.utc)
     label, as_of, as_of_date = _resolve_week(week, now)
@@ -843,15 +894,19 @@ def weekly(request: Request, week: str | None = None, board: str | None = None) 
             now=now,
             show_sidebar=True,
             board=board,
+            hide_tagged=hide_tagged == "1",
         ),
     )
 
 
 @router.get("/quarter", response_class=HTMLResponse)
-def quarterly(request: Request, quarter: str | None = None, board: str | None = None) -> HTMLResponse:
+def quarterly(
+    request: Request, quarter: str | None = None, board: str | None = None, hide_tagged: str | None = None
+) -> HTMLResponse:
     """P3 季度回顾（90 天增量榜）；?quarter=2026-Q3 回看往期。T-021：边栏 = True（同周报页）。
 
     T-026 §13.1：?board=xxx 单榜整页（携带当前 quarter=）。
+    T-038 §18：?hide_tagged=1 隐藏已打标行（仅 "1" 为开）。
     """
     now = datetime.now(timezone.utc)
     label, as_of, as_of_date = _resolve_quarter(quarter, now)
@@ -867,17 +922,19 @@ def quarterly(request: Request, quarter: str | None = None, board: str | None = 
             now=now,
             show_sidebar=True,
             board=board,
+            hide_tagged=hide_tagged == "1",
         ),
     )
 
 
 @router.get("/total", response_class=HTMLResponse)
-def total(request: Request, board: str | None = None) -> HTMLResponse:
+def total(request: Request, board: str | None = None, hide_tagged: str | None = None) -> HTMLResponse:
     """P4 总星榜：最新快照总星数降序 Top 50/榜（T-028：默认 top_n 30→50），无期次概念。
 
     T-021 §12.1（v2.1 修订）：P4 纳入边栏（实测同为 17 榜长页、HTML 1.7MB 全站最重），
     其顶部 chips 区与榜头回顶部随边栏到位同步移除（与 P1/P2/P3 一致）。
     T-026 §13.1：?board=xxx 单榜整页（无期次参数）。
+    T-038 §18：?hide_tagged=1 隐藏已打标行（仅 "1" 为开）。
     """
     now = datetime.now(timezone.utc)
     return templates.TemplateResponse(
@@ -892,6 +949,7 @@ def total(request: Request, board: str | None = None) -> HTMLResponse:
             now=now,
             show_sidebar=True,
             board=board,
+            hide_tagged=hide_tagged == "1",
         ),
     )
 
@@ -1164,6 +1222,43 @@ def _tag_cloud(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def _tag_groups(conn: sqlite3.Connection) -> tuple[list[dict], list[str]]:
+    """T-039 §19.1/§19.4 /tags 总页分组装配（一条 usage 查询＋一条映射查询，内存分组）：
+
+    - 分类全集 = tag_category 中出现的 category（含空分类占位行贡献），按分类名字典序；
+    - 装配以 tags 表去重集合为准 JOIN 映射：悬空映射行（标签已无任何打标记录）跳过不显示、不报错；
+      `tag=''` 占位行只贡献分类全集，不参与装配与使用次数统计；
+    - 组内标签按使用次数降序、同数按标签名（沿用 _tag_cloud 口径）；一标签属多分类时在多组各出现一次；
+    - 无映射标签进底部"未分类"组（category=None；仅有未分类标签时该组才渲染）；
+    - 映射表空（无任何分类）→ 返回空 groups（模板退化平铺云，与本变更前一致）。
+
+    返回 (groups, categories)：categories 为分类全集（归类多选下拉数据源，字典序同组序）。
+    """
+    usage = {r["tag"]: r["n"] for r in conn.execute("SELECT tag, COUNT(*) AS n FROM tags GROUP BY tag")}
+    mappings = conn.execute("SELECT tag, category FROM tag_category").fetchall()
+    categories = sorted({m["category"] for m in mappings})
+    if not categories:
+        return [], []
+    tag_cats: dict[str, set[str]] = {}
+    for m in mappings:
+        if m["tag"] == "":  # 空分类占位行：跳过（§19.4）
+            continue
+        tag_cats.setdefault(m["tag"], set()).add(m["category"])
+
+    def chip(t: str) -> dict:
+        # cats = 该标签已属分类（归类多选下拉打勾数据源，SSR 注入 chip 属性）
+        return {"tag": t, "n": usage[t], "href": f"/tags/{quote(t, safe='')}", "cats": sorted(tag_cats.get(t, ()))}
+
+    groups = []
+    for cat in categories:
+        chips = sorted((chip(t) for t in usage if cat in tag_cats.get(t, ())), key=lambda c: (-c["n"], c["tag"]))
+        groups.append({"category": cat, "tags": chips})
+    uncategorized = sorted((chip(t) for t in usage if t not in tag_cats), key=lambda c: (-c["n"], c["tag"]))
+    if uncategorized:
+        groups.append({"category": None, "tags": uncategorized})  # None → 模板渲染"未分类"组头（恒底部）
+    return groups, categories
+
+
 def _tag_row_view(
     rank: int,
     row: sqlite3.Row,
@@ -1209,10 +1304,15 @@ def _tag_row_view(
 
 @router.get("/tags", response_class=HTMLResponse)
 def tags_page(request: Request) -> HTMLResponse:
-    """P5 标签筛选总页（流程说明 §1）：全部标签云；空库渲染空态（引导打标入口）。"""
+    """P5 标签筛选总页（流程说明 §1）：全部标签云；空库渲染空态（引导打标入口）。
+
+    T-039 §19：有分类时改分组展示（分类组字典序＋底部"未分类"组，装配在 _tag_groups）；
+    零分类退化平铺云（与本变更前一致）；管理控件（新建/归类/改名/删除）只在本页。
+    """
     conn = get_conn()
     try:
         follow_count = conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0]
+        groups, categories = _tag_groups(conn)
         return templates.TemplateResponse(
             request=request,
             name="tags.html",
@@ -1222,6 +1322,8 @@ def tags_page(request: Request) -> HTMLResponse:
                 "title": "标签筛选",
                 "tag": None,  # None → 模板渲染云视图（结果页才传 tag）
                 "tags": _tag_cloud(conn),
+                "groups": groups,  # T-039：非空 → 分组云视图；空 → 平铺
+                "categories": categories,  # 归类多选下拉数据源（字典序）
                 "follow_count": follow_count,
             },
         )
@@ -1283,6 +1385,106 @@ def tag_page(request: Request, tag: str) -> HTMLResponse:
                 "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
             },
         )
+    finally:
+        conn.close()
+
+
+# ===== 标签分类 API（T-039，§19.3/§19.4；校验/幂等/错误码口径对齐既有 /api/tags） =====
+# 分类只是标签页的展示/管理层概念：打标流程不写 tag_category，榜单/P6/打标下拉/AI 一概不读本表。
+
+
+async def _json_body(request: Request, hint: str) -> dict:
+    """JSON 请求体解析：非 JSON/非 dict → 400（fail-loud，同 /api/follows 口径）。"""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail=hint) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=hint)
+    return payload
+
+
+@router.post("/api/tag-categories")
+async def api_create_category(request: Request) -> dict:
+    """新建分类（§19.2 第 1 步）：写 (tag='', category) 占位行表达空分类；同名幂等 created=false。"""
+    payload = await _json_body(request, '请求体须为 JSON：{"category": "..."}')
+    category = _parse_tag(payload.get("category"))  # 分类名同打标约束：去首尾空格、1~20 字符
+    conn = get_conn()
+    try:
+        cur = conn.execute("INSERT OR IGNORE INTO tag_category (tag, category) VALUES ('', ?)", (category,))
+        conn.commit()
+        return {"created": cur.rowcount > 0, "category": category}
+    finally:
+        conn.close()
+
+
+@router.post("/api/tag-categories/rename")
+async def api_rename_category(request: Request) -> dict:
+    """分类改名（§19.2 第 3 步）：该分类下全部映射换名（含占位行）；from 不存在 → 404；
+    新名与既有分类撞名时合并（先 INSERT OR IGNORE 到新名去重、再删旧名行），不报错。"""
+    payload = await _json_body(request, '请求体须为 JSON：{"from": "...", "to": "..."}')
+    src = _parse_tag(payload.get("from"))
+    dst = _parse_tag(payload.get("to"))
+    conn = get_conn()
+    try:
+        if conn.execute("SELECT 1 FROM tag_category WHERE category = ? LIMIT 1", (src,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail=f"分类不存在：{src}")
+        if src != dst:  # 同名改名：幂等无操作（否则合并语句会把旧名行删空）
+            conn.execute(
+                "INSERT OR IGNORE INTO tag_category (tag, category) SELECT tag, ? FROM tag_category WHERE category = ?",
+                (dst, src),
+            )
+            conn.execute("DELETE FROM tag_category WHERE category = ?", (src,))
+            conn.commit()
+        return {"renamed": True, "from": src, "to": dst}
+    finally:
+        conn.close()
+
+
+@router.delete("/api/tag-categories")
+def api_delete_category(category: str | None = None) -> dict:
+    """删除分类（§19.2 第 4 步）：只删 tag_category 中该分类全部行（含占位行），其下标签回落未分类；
+    tags 表与仓上打标记录不动（§19.4 级联边界钉死）；不存在幂等 removed=false。"""
+    category = _parse_tag(category)
+    conn = get_conn()
+    try:
+        cur = conn.execute("DELETE FROM tag_category WHERE category = ?", (category,))
+        conn.commit()
+        return {"removed": cur.rowcount > 0, "category": category}
+    finally:
+        conn.close()
+
+
+@router.post("/api/tag-categories/members")
+async def api_add_member(request: Request) -> dict:
+    """归类加入（§19.2 第 2 步）：tag 不在 tags 去重集合 → 404；category 不存在 → 404；
+    重复加入幂等 added=false（一标签可属多分类）。"""
+    payload = await _json_body(request, '请求体须为 JSON：{"category": "...", "tag": "..."}')
+    category = _parse_tag(payload.get("category"))
+    tag = _parse_tag(payload.get("tag"))
+    conn = get_conn()
+    try:
+        if conn.execute("SELECT 1 FROM tags WHERE tag = ? LIMIT 1", (tag,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail=f"标签不存在：{tag}")
+        if conn.execute("SELECT 1 FROM tag_category WHERE category = ? LIMIT 1", (category,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail=f"分类不存在：{category}")
+        cur = conn.execute("INSERT OR IGNORE INTO tag_category (tag, category) VALUES (?, ?)", (tag, category))
+        conn.commit()
+        return {"added": cur.rowcount > 0, "category": category, "tag": tag}
+    finally:
+        conn.close()
+
+
+@router.delete("/api/tag-categories/members")
+def api_remove_member(category: str | None = None, tag: str | None = None) -> dict:
+    """归类移出：只删映射行；映射/分类不存在均幂等 removed=false（§19.3）。"""
+    category = _parse_tag(category)
+    tag = _parse_tag(tag)
+    conn = get_conn()
+    try:
+        cur = conn.execute("DELETE FROM tag_category WHERE category = ? AND tag = ?", (category, tag))
+        conn.commit()
+        return {"removed": cur.rowcount > 0, "category": category, "tag": tag}
     finally:
         conn.close()
 

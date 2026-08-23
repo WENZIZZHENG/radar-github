@@ -14,6 +14,8 @@
 // T-029 手动同步接线（§14）：顶栏"立即同步"按钮手动触发 daily_job 全链路（独立后台任务不共用翻译/推荐批量的：
 // POST 202 → 2s 轮询 /api/sync/status；409 表示已在跑含调度器每日那轮）；完成 toast 带 run_daily 汇总数字
 // ＋"刷新页面查看最新榜单"提示；分支 toast 文案严格按 §14.2/§14.3。同步中按钮置灰"同步中…"防连点。
+// T-039 标签分类管理（§19，仅 /tags 总页）：新建/改名输入框复用打标输入框形态（回车提交/Escape 还原/非法红边），
+// 归类用 T-035 自绘下拉的多选形态（已属打勾、点选切换），删除即时生效＋toast；操作成功后整页刷新。
 const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
 
@@ -1001,6 +1003,219 @@ document.addEventListener("click", (e) => {
     .querySelectorAll(".tag-filter .fchip")
     .forEach((c) => c.classList.toggle("on", (c.dataset.tag || "") === activeFollowTag));
   applyFollowTagFilter();
+});
+
+// ---- T-039 标签分类管理（§19.2；仅 /tags 总页有控件，全部点选式不拖拽；成功后整页刷新重渲染分组结构） ----
+
+// 分类名输入框（新建/改名共用，打标输入框同款形态）：回车提交、Escape/blur 还原、非法红边＋内联提示；
+// submit 由调用方提供（成功路径整页刷新，见 §19.2 第 5 步），失败还原按钮＋报错 toast
+function startCategoryInput(btn, opts) {
+  const wrapper = document.createElement("span");
+  wrapper.className = "tag-input-wrap";
+  const input = document.createElement("input");
+  input.className = "tag-input";
+  input.maxLength = 20; // 与服务端 _parse_tag 同约束（1~20 字符）
+  input.placeholder = opts.placeholder;
+  input.value = opts.value || "";
+  input.setAttribute("aria-label", opts.label);
+  const hint = document.createElement("span");
+  hint.className = "tag-hint";
+  hint.hidden = true;
+  wrapper.append(input);
+  btn.replaceWith(wrapper);
+  wrapper.insertAdjacentElement("afterend", hint);
+  input.focus();
+  let submitting = false;
+  const restore = () => {
+    if (!input.isConnected) return; // 已随整页刷新离开文档 → 无操作
+    wrapper.replaceWith(btn);
+    hint.remove();
+  };
+  // 非法态清除：再次输入即恢复正常样式（同打标输入口径：红边＋内联提示是瞬时诊断）
+  input.addEventListener("input", () => {
+    if (input.classList.contains("invalid")) {
+      input.classList.remove("invalid");
+      hint.hidden = true;
+    }
+  });
+  input.addEventListener("keydown", async (ev) => {
+    if (ev.key === "Escape") {
+      if (!submitting) restore();
+      return;
+    }
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    if (submitting) return;
+    const name = input.value.trim();
+    if (!name || name.length > 20) {
+      // 非法输入：不提交（§19.3），红边＋内联提示
+      input.classList.add("invalid");
+      hint.textContent = name.length > 20 ? "分类名最长 20 字符" : "分类名不能为空";
+      hint.hidden = false;
+      return;
+    }
+    submitting = true;
+    input.disabled = true;
+    try {
+      await opts.submit(name);
+    } catch (err) {
+      restore();
+      toast(err.message, true);
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!submitting) restore();
+  });
+}
+
+// 新建分类（§19.2 第 1 步）：POST /api/tag-categories → 成功整页刷新（新分类组出现，空组）
+async function createCategory(name) {
+  const resp = await fetch("/api/tag-categories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category: name }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error("新建分类失败：" + (data.detail || "HTTP " + resp.status));
+  location.reload();
+}
+
+// 分类改名（§19.2 第 3 步）：POST rename → 成功整页刷新（撞名合并由服务端处理，不报错）
+async function renameCategory(from, to) {
+  const resp = await fetch("/api/tag-categories/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from, to }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error("改名失败：" + (data.detail || "HTTP " + resp.status));
+  location.reload();
+}
+
+// 删除分类（§19.2 第 4 步）：一次点击即时删除＋toast，无二次确认（只清映射、标签回落未分类）；
+// toast 短暂可见后整页刷新
+async function deleteCategory(btn) {
+  if (btn.disabled) return; // 防连点
+  const category = btn.dataset.catDelete;
+  if (!category) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/tag-categories?category=" + encodeURIComponent(category), { method: "DELETE" });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
+    toast("已删除分类「" + category + "」");
+    setTimeout(() => location.reload(), 900);
+  } catch (err) {
+    btn.disabled = false;
+    toast("删除分类失败：" + err.message, true);
+  }
+}
+
+// 归类多选下拉（复用 T-035 tag-suggestions 自绘下拉形态）：列出全部分类，已属分类打勾；
+// 点选即切换加入/移出（点一下加入、再点一下移出），成功后整页刷新
+function closeCatMenus() {
+  document.querySelectorAll(".cat-menu").forEach((m) => m.remove());
+}
+
+function toggleAssignMenu(btn) {
+  const host = btn.parentElement;
+  const existing = host.querySelector(".cat-menu");
+  if (existing) {
+    existing.remove(); // 再点归类钮：收起
+    return;
+  }
+  closeCatMenus(); // 同页只开一个下拉
+  const tag = btn.dataset.tag;
+  if (!tag) return;
+  let member = [];
+  try {
+    member = JSON.parse(btn.dataset.cats || "[]"); // data-cats = SSR 注入的已属分类 JSON 数组
+  } catch (err) {
+    member = [];
+  }
+  const dl = document.getElementById("all-categories");
+  const cats = dl ? Array.from(dl.options).map((o) => o.value) : [];
+  const menu = document.createElement("div");
+  menu.className = "tag-suggestions cat-menu";
+  cats.forEach((cat) => {
+    const item = document.createElement("div");
+    item.className = "tag-suggestion cat-option" + (member.includes(cat) ? " on" : "");
+    item.textContent = cat;
+    // 触控/鼠标点选即切换；preventDefault 抢在后续 click 前完成（click 委托会关闭菜单）
+    const pick = async (ev) => {
+      ev.preventDefault();
+      if (item.classList.contains("busy")) return; // 防连点
+      item.classList.add("busy");
+      try {
+        let resp;
+        if (member.includes(cat)) {
+          resp = await fetch(
+            "/api/tag-categories/members?category=" + encodeURIComponent(cat) + "&tag=" + encodeURIComponent(tag),
+            { method: "DELETE" },
+          );
+        } else {
+          resp = await fetch("/api/tag-categories/members", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ category: cat, tag }),
+          });
+        }
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
+        location.reload(); // §19.2 第 5 步：操作成功后整页刷新重渲染分组结构
+      } catch (err) {
+        closeCatMenus();
+        toast("归类失败：" + err.message, true);
+      }
+    };
+    item.addEventListener("mousedown", pick);
+    item.addEventListener("touchstart", pick, { passive: false });
+    menu.append(item);
+  });
+  host.append(menu);
+}
+
+document.addEventListener("click", (e) => {
+  // T-039 页头"＋新建分类"：按钮 → 输入框（打标输入框同款形态）
+  const catCreate = e.target.closest("#cat-create");
+  if (catCreate) {
+    startCategoryInput(catCreate, {
+      placeholder: "1~20 字符，回车确认",
+      label: "新分类名称",
+      submit: createCategory,
+    });
+    return;
+  }
+  // T-039 分类组头改名钮：按钮 → 输入框（预填现名）
+  const catRename = e.target.closest("[data-cat-rename]");
+  if (catRename) {
+    const from = catRename.dataset.catRename;
+    startCategoryInput(catRename, {
+      value: from,
+      placeholder: "1~20 字符，回车确认",
+      label: "分类改名",
+      submit: (to) => renameCategory(from, to),
+    });
+    return;
+  }
+  // T-039 分类组头删除钮：即时删除＋toast，无二次确认
+  const catDelete = e.target.closest("[data-cat-delete]");
+  if (catDelete) {
+    deleteCategory(catDelete);
+    return;
+  }
+  // T-039 标签 chip 旁归类钮：自绘多选下拉（已属分类打勾，点选切换）
+  const assignBtn = e.target.closest(".cat-assign");
+  if (assignBtn) {
+    toggleAssignMenu(assignBtn);
+    return;
+  }
+  if (!e.target.closest(".cat-menu")) closeCatMenus(); // 点下拉外任意处收起
+});
+
+// Escape 收起归类下拉（输入框自身的 Escape 归 startCategoryInput 管，互不干扰）
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeCatMenus();
 });
 
 // ---- T-034 P8 搜索提交（§17.2 加载态）：表单同步提交（服务端 SSR 结果页），提交瞬间按钮置灰

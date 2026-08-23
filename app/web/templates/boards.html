@@ -46,6 +46,17 @@
 {# 首期/缺席降级提示条（流程说明 §4）：增量榜全缺席时显示总星榜 + 明确提示 #}
 {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 
+{# T-038 §18.1 "隐藏已打标"开关：元信息行下、榜单区上一行；页内 GET 互跳（链接保留当前 board=/期次参数）。
+   开态：N>0 带计数"已隐藏 N 个已打标项目 · 显示全部"，N=0 只显示"显示全部"互跳；关态："隐藏已打标"。 #}
+<p class="hide-tagged">
+  {%- if hide_tagged -%}
+    {%- if hidden_total %}已隐藏 {{ hidden_total }} 个已打标项目 · {% endif -%}
+    <a href="{{ hide_off_url }}">显示全部</a>
+  {%- else -%}
+    <a href="{{ hide_on_url }}">隐藏已打标</a>
+  {%- endif -%}
+</p>
+
 {# 第 3/4 层：榜单区（board=all 全量 17 榜直出；单榜模式只渲染当前榜块，另一组 section 不渲染——§13.1）＋项目行 #}
 {% if lang_boards %}
 <section>

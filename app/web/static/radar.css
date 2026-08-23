@@ -718,3 +718,40 @@ nav.tabs { flex-wrap: wrap; }
   font-weight: 500;
   color: var(--text-3);
 }
+
+/* ===== T-038 追加（榜单"隐藏已打标"开关：页内链接＋计数提示小字，复用 meta 弱文字气质） ===== */
+.hide-tagged { font-size: 12px; color: var(--text-3); padding: var(--s1) 2px 0; margin: 0; }
+.hide-tagged a { color: var(--blue); text-decoration: none; }
+.hide-tagged a:hover { text-decoration: underline; }
+
+/* ===== T-039 追加（/tags 分组展示＋分类管理控件；复用 :root token 与 T-035 自绘下拉形态） ===== */
+
+/* 页头"＋新建分类"工具行（按钮复用 .tag-add 虚线 pill 形态） */
+.cat-toolbar { margin: var(--s1) 0 0; }
+
+/* 分类组头：复用 .sec 节标题；组内标签数徽标同标签云 chip 徽标语义 */
+.cat-head i {
+  font-style: normal; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3);
+  background: var(--muted); border-radius: var(--r-pill); padding: 1px 7px; margin-left: 6px;
+}
+/* 组头改名/删除小钮：虚线 pill 弱存在感（同 .tag-add 一族） */
+.cat-op {
+  font-size: 11px; color: var(--text-3); background: none; border: 1px dashed var(--line-strong);
+  border-radius: var(--r-pill); padding: 1px 9px; margin-left: 6px; cursor: pointer;
+  transition: color var(--t-fast) ease, border-color var(--t-fast) ease;
+}
+.cat-op:hover { color: var(--text-1); border-color: var(--text-3); }
+.cat-op:disabled { opacity: .55; cursor: default; }
+
+/* 标签项包裹：chip＋归类钮横排；相对定位承载归类多选下拉 */
+.tag-item { position: relative; display: inline-flex; align-items: center; gap: 2px; }
+.cat-assign {
+  font-size: 11px; color: var(--text-3); background: none; border: none; border-radius: 4px;
+  padding: 3px 5px; cursor: pointer;
+}
+.cat-assign:hover { color: var(--text-1); background: rgba(88,166,255,.14); }
+
+/* 归类多选下拉：容器复用 .tag-suggestions 形态；勾选项左侧 ✓（多选语义，点选即切换） */
+.cat-option::before { content: ""; display: inline-block; width: 15px; color: var(--accent); font-weight: 600; }
+.cat-option.on::before { content: "✓"; }
+.cat-option.busy { opacity: .55; }
