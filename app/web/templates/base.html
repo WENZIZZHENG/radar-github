@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" href="data:,">
 <title>GitHub 雷达 · {% block title %}{% endblock %}</title>
-<link rel="stylesheet" href="/static/radar.css">
+<link rel="stylesheet" href="/static/radar.css?v={{ static_v }}">
 </head>
 <body id="top">
 <header class="top">
@@ -55,7 +55,7 @@
   {% for t in all_tags %}<option value="{{ t }}"></option>{% endfor %}
 </datalist>
 {% endif %}
-<script src="/static/radar.js"></script>
+<script src="/static/radar.js?v={{ static_v }}"></script>
 {# toast 容器（T-009 关注/取消反馈；aria-live 不抢焦点，样式在 radar.css） #}
 <div id="toasts" aria-live="polite" role="status"></div>
 </body>

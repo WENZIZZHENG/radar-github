@@ -154,6 +154,14 @@ def test_three_pages_ok(client):
         assert "GitHub 雷达" in resp.text
 
 
+def test_static_assets_cache_busted(client):
+    """静态资源引用带 mtime 版本号（缓存破除）：StaticFiles 无 Cache-Control，浏览器启发式缓存会拿旧
+    JS/CSS（生产曾因此漏掉新功能样式/脚本），base.html 引用必须带 ?v= 查询串。"""
+    text = client.get("/").text
+    assert re.search(r'/static/radar\.css\?v=\d+', text)
+    assert re.search(r'/static/radar\.js\?v=\d+', text)
+
+
 def test_index_has_17_boards_and_sidebar(client):
     """T-021：17 榜齐备（语言 7 + 主题 10），空榜也渲染板块；左侧边栏 17 榜项一一对应（原顶部 chips 已由边栏替代）。
 

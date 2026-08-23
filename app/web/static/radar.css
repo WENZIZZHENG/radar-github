@@ -241,6 +241,13 @@ h2.sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
   transition: color var(--t-fast) ease, border-color var(--t-fast) ease;
 }
 .tag-add:hover { color: var(--text-1); border-color: var(--text-3); }
+/* T-039 新建分类按钮：复刻 .tag-add 虚线 pill（class 必须与 .tag-add 分离——tag-add 是打标入口，radar.js 点击委托先命中会误开绑 /api/tags 的输入框） */
+.cat-create {
+  font-size: 12px; color: var(--text-3); border: 1px dashed var(--line-strong); border-radius: var(--r-pill);
+  padding: 3px 12px; background: none; cursor: pointer;
+  transition: color var(--t-fast) ease, border-color var(--t-fast) ease;
+}
+.cat-create:hover { color: var(--text-1); border-color: var(--text-3); }
 .tag-input {
   font-family: var(--font-sans); font-size: 12.5px; color: var(--text-1);
   background: var(--bg); border: 1px solid var(--blue); border-radius: var(--r-m);

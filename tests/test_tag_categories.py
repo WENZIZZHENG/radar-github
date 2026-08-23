@@ -307,3 +307,12 @@ def test_tagging_does_not_write_category(client):
     text = c.get("/tags").text
     assert "未分类<i>1</i>" in text
     assert ">全新标签<i>1</i>" in text
+
+
+def test_cat_create_button_not_tag_add_class(client):
+    """回归（T-039 修复）：新建分类按钮不得带 tag-add 类——radar.js 点击委托 .tag-add 分支先命中会误开
+    绑 /api/tags 的打标输入框（full_name 缺省 → 400 '应为 owner/repo 形态'）。"""
+    c, _ = client
+    text = c.get("/tags").text
+    assert 'class="cat-create" id="cat-create"' in text
+    assert 'class="tag-add" id="cat-create"' not in text

@@ -23,7 +23,7 @@
 {# ---- 标签云总页 ---- #}
 <p class="meta">全部 {{ tags | length }} 个标签 · 从任意标签进入项目列表</p>
 {# T-039 §19.2 页头"＋新建分类"（打标输入框同款形态，交互在 radar.js；管理控件只在 /tags 总页） #}
-<p class="cat-toolbar"><button type="button" class="tag-add" id="cat-create">＋新建分类</button></p>
+<p class="cat-toolbar"><button type="button" class="cat-create" id="cat-create">＋新建分类</button></p>
 {% if groups %}
 {# T-039 §19.1 分组云视图：分类组（组头＝分类名＋组内标签数，组间字典序、组内使用次数降序）＋底部"未分类"组；
    一标签属多分类时在多组各出现一次；归类钮自绘多选下拉数据源 = data-cats（已属分类）＋ #all-categories #}

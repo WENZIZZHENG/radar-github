@@ -80,6 +80,9 @@ TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"
 logger = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory=_WEB_DIR / "templates")
+# 静态资源缓存破除：mtime 版本号入模板全局（StaticFiles 无 Cache-Control，浏览器启发式缓存会拿旧 JS/CSS）
+_STATIC_V = str(int(max((_WEB_DIR / "static" / f).stat().st_mtime for f in ("radar.css", "radar.js"))))
+templates.env.globals["static_v"] = _STATIC_V
 router = APIRouter()
 
 # 标签 chip 链接的 path 段编码（quote safe=""：标签可含 / 与空格，全量百分号编码；Jinja 内置 urlencode
