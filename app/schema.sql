@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS recommendations (
     text TEXT NOT NULL,
     readme_sha TEXT,                        -- README blob sha：未拉取过保持 NULL
     generated_week TEXT NOT NULL,           -- 生成时所在 ISO 周，格式如 2026-W32
+    source TEXT NOT NULL DEFAULT 'ai',      -- 文本来源：ai＝自动路径生成（缺省，存量行同值）/ manual＝本地工具回填写入；
+                                            -- manual 行不受半月窗口重生影响（见 ai.py recommend_missing 三处守卫）
     PRIMARY KEY (repo_id, dimension, period_label)
 );
 -- 按维度×期次取全量推荐理由（周报页按周取、季页按季取、总星/关注页取 total/'all'）

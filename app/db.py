@@ -115,6 +115,20 @@ def _migrate_recommendations_summary(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_recommendations_source(conn: sqlite3.Connection) -> None:
+    """local-ai-relay 幂等迁移：recommendations 补 source 列（'ai' 自动路径 / 'manual' 本地回填）。
+
+    检测口径：PRAGMA table_info 已含 source → 跳过；表不存在（新装库走 schema.sql）→ 跳过；
+    否则 ALTER TABLE ADD COLUMN（SQLite 的 O(1) 元数据操作，存量行按 DEFAULT 'ai' 补齐，语义不变）。
+    必须排在 _migrate_recommendations_summary 之后：summary 迁移整表重建（新表结构不含本列），
+    先加列会被那次重建丢掉。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(recommendations)")}
+    if not cols or "source" in cols:
+        return  # 表不存在或已有 source 列：幂等跳过
+    conn.execute("ALTER TABLE recommendations ADD COLUMN source TEXT NOT NULL DEFAULT 'ai'")
+
+
 def init_db(db_path: str | Path | None = None) -> None:
     """执行 schema.sql 建表；schema 全量 IF NOT EXISTS，重复执行安全。
 
@@ -123,11 +137,14 @@ def init_db(db_path: str | Path | None = None) -> None:
     T-024：顺序为 _migrate_recommendations → _migrate_recommendations_summary → executescript——
     summary 迁移把 3 值 CHECK 表升级为 4 值（schema.sql 的 CREATE TABLE IF NOT EXISTS 不改既有
     表约束，只能重建）；旧结构库先经 T-017 迁移直接建 4 值最终结构，summary 迁移检测跳过。
+    local-ai-relay：source 列迁移排在这两条之后、executescript 之前——summary 迁移整表重建会丢掉
+    先加的列，故必须等它跑完再补列。
     """
     conn = get_conn(db_path)
     try:
         _migrate_recommendations(conn)
         _migrate_recommendations_summary(conn)
+        _migrate_recommendations_source(conn)
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.commit()
     finally:

@@ -21,6 +21,9 @@ from app.ai import (
     DeepSeekClient,
     DeepSeekError,
     _refresh_window_open,
+    build_recommend_prompt,
+    build_summary_prompt,
+    build_translate_prompt,
     ensure_daily_ai,
     has_cjk,
     recommend_missing,
@@ -1256,6 +1259,285 @@ def test_client_recommend_rising_pool_context():
     main_user, main_sys = bodies[1]["messages"][1]["content"], bodies[1]["messages"][0]["content"]
     assert "本周新增星数：150" in main_user
     assert "必须明确写出本周新增星数（150 星）" in main_sys
+
+
+# ---------- local-ai-relay：prompt 构造抽取为模块级纯函数（逐字回归，防抽取时改字） ----------
+
+
+def test_build_translate_prompt_matches_frozen_literal():
+    """抽取回归：translate prompt 与抽取前方法内字面量逐字一致（system/user/温度 0.2）。"""
+    system, user, temperature = build_translate_prompt("A fast web framework")
+    assert system == (
+        "你是开源项目简介翻译器。把用户给出的 GitHub 仓库英文简介翻译成自然简洁的中文，"
+        "只输出译文本体：不要加引号包裹，不要加“翻译：”等任何前缀，不要解释。"
+        "项目名、品牌名、技术专有名词保留原文。"
+    )
+    assert user == "A fast web framework"
+    assert temperature == 0.2
+
+
+def test_build_recommend_prompt_week_with_delta_frozen_literal():
+    """抽取回归：week 带增量的 system/user 与抽取前字面量逐字一致（含"必须明确写出本周新增星数"钉死句）。"""
+    system, user, temperature = build_recommend_prompt(
+        full_name="a/one",
+        description="desc",
+        language="Python",
+        categories=["Python", "AI与智能"],
+        dimension="week",
+        delta=150,
+        stars=1100,
+    )
+    assert system == (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 周榜上榜项目的推荐理由。"
+        "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+        "其余说明为什么本周值得关注：必须明确写出本周新增星数（150 星）这个数字，"
+        "并结合总星数与上榜分类分析增长背后的原因；有选型参考价值时点明。"
+        "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+    )
+    assert user == "仓库：a/one\n简介：desc\n主语言：Python\n本周新增星数：150\n总星数：1100\n上榜分类：Python、AI与智能"
+    assert temperature == 0.3
+
+
+def test_build_recommend_prompt_week_without_delta_frozen_literal():
+    """抽取回归：delta 缺席（历史期次无增量行）退回软要求，措辞与抽取前一致（不写死数字）。"""
+    system, user, temperature = build_recommend_prompt(
+        full_name="a/one",
+        description="desc",
+        language="Python",
+        categories=["Python"],
+        dimension="week",
+        stars=1100,
+        readme="readme body",
+    )
+    assert system == (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 周榜上榜项目的推荐理由。"
+        "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+        "其余说明为什么本周值得关注（结合本周增星、总星数与上榜分类）；有选型参考价值时点明。"
+        "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+    )
+    assert user == "仓库：a/one\n简介：desc\n主语言：Python\nREADME 要点：\nreadme body\n总星数：1100\n上榜分类：Python"
+    assert temperature == 0.3
+
+
+def test_build_recommend_prompt_rising_pool_context_frozen_literal():
+    """抽取回归：新崛起区仓（pool_days 非 None）的"入池 N 天新增"语境与抽取前一致；主榜措辞不受影响。"""
+    system, user, _ = build_recommend_prompt(
+        full_name="a/one",
+        description="desc",
+        language="Go",
+        categories=["Go"],
+        dimension="week",
+        delta=600,
+        stars=1100,
+        pool_days=3.0,
+    )
+    assert system == (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 周榜上榜项目的推荐理由。"
+        "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+        "其余说明为什么入池 3 天值得关注：必须明确写入池 3 天新增星数（600 星）这个数字，"
+        "并结合总星数与上榜分类分析增长背后的原因；有选型参考价值时点明。"
+        "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+    )
+    assert user == "仓库：a/one\n简介：desc\n主语言：Go\n入池 3 天新增星数：600\n总星数：1100\n上榜分类：Go"
+    # 季维度新区仓同构（board_word=季榜）：只换词，不换句式
+    quarter_system, quarter_user, _ = build_recommend_prompt(
+        full_name="a/one",
+        description="desc",
+        language="Go",
+        categories=["Go"],
+        dimension="quarter",
+        pool_days=4.0,
+    )
+    assert quarter_system == (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 季榜上榜项目的推荐理由。"
+        "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+        "其余说明为什么入池 4 天值得关注（结合入池 4 天增星、总星数与上榜分类）；有选型参考价值时点明。"
+        "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+    )
+    assert quarter_user == "仓库：a/one\n简介：desc\n主语言：Go\n上榜分类：Go"
+
+
+def test_build_recommend_prompt_total_frozen_literal():
+    """抽取回归：total 维度输入不含任何数字、system 禁止引用数字——与抽取前逐字一致。"""
+    system, user, temperature = build_recommend_prompt(
+        full_name="a/one",
+        description="（无简介）",
+        language="未知",
+        categories=[],
+        dimension="total",
+        readme="readme body",
+    )
+    assert system == (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的推荐理由。"
+        "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+        "其余说明它在所属领域中的地位（存量语境，写给长期关注的人看，不追热点）。"
+        "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
+        "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+    )
+    assert user == "仓库：a/one\n简介：（无简介）\n主语言：未知\nREADME 要点：\nreadme body\n上榜分类："
+    assert temperature == 0.3
+
+
+def test_build_summary_prompt_frozen_literal():
+    """抽取回归：AI 概要 prompt 与抽取前字面量逐字一致（文档视角、不引用数字、温度 0.3）。"""
+    system, user, temperature = build_summary_prompt(
+        full_name="a/one", description="desc", language="Python", readme="readme body"
+    )
+    assert system == (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的 AI 概要。"
+        "根据给出的仓库信息，从 README 文档视角写一段 3~5 句的中文概要：这个项目是什么、"
+        "由什么组成（核心模块/组件）。"
+        "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
+        "只输出概要本体：不要加引号包裹，不要加“AI 概要：”等前缀，不要用列表或标题。"
+    )
+    assert user == "仓库：a/one\n简介：desc\n主语言：Python\nREADME 要点：\nreadme body"
+    assert temperature == 0.3
+    # README 缺席退化：省略 README 段落（与 recommend 同口径）
+    assert build_summary_prompt(full_name="a/one", description="desc", language="Python")[1] == (
+        "仓库：a/one\n简介：desc\n主语言：Python"
+    )
+
+
+def test_client_methods_delegate_to_build_prompt():
+    """接线回归：三个方法发出的 payload 必须等于 build_* 纯函数输出（防方法内再拼一套第二实现）。"""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "文本"}}]})
+
+    client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
+    recommend_kwargs = {
+        "full_name": "a/one",
+        "description": "desc",
+        "language": "Python",
+        "categories": ["Python"],
+        "dimension": "week",
+        "delta": 150,
+        "stars": 1100,
+        "readme": "readme body",
+    }
+    asyncio.run(client.translate("english text"))
+    asyncio.run(client.recommend(**recommend_kwargs))
+    asyncio.run(client.summarize(full_name="a/one", description="desc", language="Python", readme="readme body"))
+    asyncio.run(client.aclose())
+
+    expected = [
+        build_translate_prompt("english text"),
+        build_recommend_prompt(**recommend_kwargs),
+        build_summary_prompt(full_name="a/one", description="desc", language="Python", readme="readme body"),
+    ]
+    for body, (system, user, temperature) in zip(bodies, expected):
+        assert body["messages"] == [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        assert body["temperature"] == temperature
+
+
+def test_build_recommend_prompt_rejects_unknown_dimension():
+    """非法维度在纯函数内即失败（与抽取前方法内校验同姿态），调用方拿到的仍是 ValueError。"""
+    with pytest.raises(ValueError, match="dimension 非法"):
+        build_recommend_prompt(
+            full_name="a/one", description="desc", language="Python", categories=[], dimension="month"
+        )
+
+
+# ---------- local-ai-relay：source='manual' 人工行对自动路径的豁免（窗口重生守卫） ----------
+
+WINDOW_DAY = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)  # 半月窗口日（15 号），所在周 = W33
+
+
+def _add_manual_row(conn, repo_id, dimension, period_label, text, *, sha=None, generated_week=WEEK1):
+    """插一条本地回填写入形态的行（source='manual'），模拟 local-ai-relay 人工行。"""
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week, source)"
+        " VALUES (?, ?, ?, ?, ?, ?, 'manual')",
+        (repo_id, dimension, period_label, text, sha, generated_week),
+    )
+    conn.commit()
+
+
+def _rec_rows_full(conn):
+    """(dimension, period_label, text, readme_sha, generated_week, source) 列表（人工行豁免断言用）。"""
+    return [
+        (r["dimension"], r["period_label"], r["text"], r["readme_sha"], r["generated_week"], r["source"])
+        for r in conn.execute(
+            "SELECT dimension, period_label, text, readme_sha, generated_week, source FROM recommendations"
+            " ORDER BY dimension, period_label"
+        )
+    ]
+
+
+def test_window_day_manual_total_row_not_regenerated(conn):
+    """窗口日人工 total 行不重生：不替换文本、不改指纹；同仓缺失的 summary 照常补缺（source='ai'）。"""
+    repo_id = _add_repo(conn, "a/one", description_en="first project")
+    _add_manual_row(conn, repo_id, "total", "all", "人工总星文本", sha="sha-v1")
+    github = FakeGitHubClient(readmes={"a/one": ("v2 readme", "sha-v2")})  # README 已变，ai 行本会重生
+    fake = FakeDeepSeekClient()
+    _run_ensure(conn, fake, now=WINDOW_DAY, github_client=github)
+
+    assert all(c["dimension"] != "total" for c in fake.recommend_calls)  # total 不调用 AI
+    total_row = next(r for r in _rec_rows_full(conn) if r[0] == "total")
+    assert total_row == ("total", "all", "人工总星文本", "sha-v1", WEEK1, "manual")  # 文本/指纹原地不动
+    assert any(c["full_name"] == "a/one" for c in fake.summarize_calls)  # 缺失维度照常补缺
+    summary_row = next(r for r in _rec_rows_full(conn) if r[0] == "summary")
+    assert summary_row[5] == "ai"
+
+
+def test_window_day_manual_quarter_row_not_regenerated(conn):
+    """窗口日人工 quarter 行（generated_week ≠ 当周）不重生：文本、generated_week、指纹全部保持。"""
+    repo_id = _add_repo(conn, "a/one", description_en="first project", quarter=True)
+    _add_manual_row(conn, repo_id, "quarter", QUARTER1, "人工季榜文本", sha=None, generated_week=WEEK1)
+    fake = FakeDeepSeekClient()
+    _run_ensure(conn, fake, now=WINDOW_DAY, github_client=FakeGitHubClient())
+
+    assert all(c["dimension"] != "quarter" for c in fake.recommend_calls)
+    quarter_row = next(r for r in _rec_rows_full(conn) if r[0] == "quarter")
+    assert quarter_row == ("quarter", QUARTER1, "人工季榜文本", None, WEEK1, "manual")
+
+
+def test_window_day_manual_summary_row_not_regenerated(conn):
+    """窗口日人工 summary 行不重生：不调用 summarize、指纹保持（README 已变的场景）。"""
+    repo_id = _add_repo(conn, "a/one", description_en="first project")
+    _add_manual_row(conn, repo_id, "summary", "all", "人工概要文本", sha="sha-v1")
+    github = FakeGitHubClient(readmes={"a/one": ("v2 readme", "sha-v2")})
+    fake = FakeDeepSeekClient()
+    _run_ensure(conn, fake, now=WINDOW_DAY, github_client=github)
+
+    assert fake.summarize_calls == []
+    summary_row = next(r for r in _rec_rows_full(conn) if r[0] == "summary")
+    assert summary_row == ("summary", "all", "人工概要文本", "sha-v1", WEEK1, "manual")
+
+
+def test_missing_dimensions_backfilled_with_ai_source_despite_manual(conn):
+    """人工周行只挡住"周维度重生"：同仓缺失的 quarter/total/summary 照常补缺并写 source='ai'。"""
+    repo_id = _add_repo(conn, "a/one", description_en="first project")
+    _add_manual_row(conn, repo_id, "week", WEEK1, "人工周文本", generated_week=WEEK1)
+    fake = FakeDeepSeekClient()
+    _run_ensure(conn, fake)  # 非窗口日
+
+    assert _rec_rows_full(conn) == [
+        ("quarter", QUARTER1, "推荐语-a/one-quarter", None, WEEK1, "ai"),
+        ("summary", "all", "概要-a/one", None, WEEK1, "ai"),
+        ("total", "all", "推荐语-a/one-total", None, WEEK1, "ai"),
+        ("week", WEEK1, "人工周文本", None, WEEK1, "manual"),
+    ]
+
+
+def test_new_week_row_generated_despite_manual_previous_week(conn):
+    """人工周行不影响下期次：新一周照常生成新周行（source='ai'），上周人工行原样保留。"""
+    repo_id = _add_repo(conn, "a/one", description_en="first project")
+    _add_manual_row(conn, repo_id, "week", WEEK1, "人工周文本", generated_week=WEEK1)
+    conn.execute(
+        "INSERT INTO star_snapshots (repo_id, captured_at, stars) VALUES (?, ?, ?)",
+        (repo_id, _iso(AS_OF_DT + timedelta(days=7)), 1500),
+    )
+    conn.commit()
+    fake = FakeDeepSeekClient()
+    _run_ensure(conn, fake, now=AS_OF_DT + timedelta(days=7))
+
+    assert [r for r in _rec_rows_full(conn) if r[0] == "week"] == [
+        ("week", WEEK1, "人工周文本", None, WEEK1, "manual"),
+        ("week", WEEK2, "推荐语-a/one-week", None, WEEK2, "ai"),
+    ]
 
 
 # ---------- daily_job 接线：AI 失败永不阻断快照主流程 ----------

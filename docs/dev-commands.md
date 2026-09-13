@@ -86,7 +86,32 @@ $SSH 'for u in "/" "/?board=all" "/total" "/total?board=all"; do
 #    （对密码 200 只能本人实测：明文密码不落任何文件，AI 侧只有 hash 没法测）
 ```
 
-### 4.4 收尾与回滚
+### 4.4 本地 AI 生成回传（local-ai-relay，T-040）
+
+生产 AI 段停用后，文本改由"本地工具生成 + 接口回填"。两个端点：导出 `GET /api/local-ai/tasks`、回填 `POST /api/local-ai/fill`；判定与写入语义见 `docs/sop/交互流程/20-本地AI生成回传.md`，接口契约见 `openspec/specs/local-ai-relay/`。
+
+本机/服务器回环形态（已实测跑通，2026-09-13 预演）：
+
+```bash
+# 导出作业单（text 形态，整段粘贴给本地工具）：limit 默认 20、上限 50；kind 可 all|translate|week|quarter|total|summary
+curl -s "http://127.0.0.1:8000/api/local-ai/tasks?limit=20&format=text" -o sheet.txt
+# 导出结构化清单（脚本消费）：字段 as_of/week_label/quarter_label/window_open/remaining/probe_skipped/probe_truncated/items
+curl -s "http://127.0.0.1:8000/api/local-ai/tasks?limit=20&format=json" -o tasks.json
+# 回填（体可为 {"items":[...],"overwrite":false} 或裸数组；条目前后可有围栏，服务端会剥）
+curl -s -X POST "http://127.0.0.1:8000/api/local-ai/fill" -H "Content-Type: application/json" --data-binary @result.json
+```
+
+公网形态（带 Basic Auth；部署后由本人执行，AI 侧无密码）：
+
+```bash
+curl -s -u "<用户>:<密码>" "https://radar.example.com/api/local-ai/tasks?limit=20&format=text" -o sheet.txt
+curl -s -u "<用户>:<密码>" -X POST "https://radar.example.com/api/local-ai/fill" -H "Content-Type: application/json" --data-binary @result.json
+```
+
+回填条目形状：`{"repo":"owner/name","kind":"week","period_label":"2026-W37","text":"正文"}`；`translate` 条目另须原样回带 `src`（作业单「回填字段」行给出，原文变更会被拒收）。错误码：`400`（JSON 非法/kind、format 非法/单批超 200 条/期次过期等按条计 errors）、`413`（请求体超 1MB）。响应形如 `{"written":n,"skipped":n,"failed":n,"errors":[{"repo":...,"kind":...,"reason":...}]}`。
+提示：窗口日（每月 1/15 号）导出会按段拉 README 比对，单次实际约 200~400 次 GitHub 调用、可能耗时 1~3 分钟，**期间站点（榜单页面）短暂无响应属预期**；`probe_skipped>0` 只是"本轮还有候选未判定"的告警（探测无服务端状态，重复导出不会清零、不代表剩余工作量），继续"导出→回填"逐批推进即可；**窗口日的收工判据＝本次导出没有任何 total/概要重生任务**（非窗口日＝`remaining` 归零）。
+
+### 4.5 收尾与回滚
 
 - 表结构变更无需手工迁移：lifespan 的 `init_db()` 全量 IF NOT EXISTS 自动建表。
 - 首次启用榜单预计算（T-027 类）可手跑一轮立即生效，不等次日 05:00：

@@ -18,6 +18,10 @@
   总星/关注/标签页→总星文本），缺则该行无推荐语块（AI 降级形态）；
 - AI 概要（T-024，§11）：展示映射固定取 dimension='summary' 且 period_label='all'（文档视角、无维度概念、
   全页面同一条，S 全集覆盖），缺则该行无概要块（AI 降级形态，不留空框）；无任何手动生成入口。
+- 本地 AI 导出/回填端点（local-ai-relay）：GET /api/local-ai/tasks（只读导出待生成任务，text/json 两形态）
+  与 POST /api/local-ai/fill（回填写入，一律 source='manual'）——判定/清洗/写入语义全部在 app/local_ai.py
+  （与每日 ensure 同一套判定与 prompt 构造），本层只做入参校验、体量上限与形态转换；不依赖 AI client
+  （AI_ENABLED=0 下两个端点照常可用），只注入 GitHub client（README 输入与 total/summary 指纹拉取）。
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app.ai import (
@@ -58,6 +62,8 @@ from app.config import BASE_DIR, get_settings
 from app.db import get_conn
 from app.follows import follow_repo, unfollow_repo
 from app.jobs import sync_status, try_start_sync
+from app.local_ai import KINDS as LOCAL_AI_KINDS
+from app.local_ai import apply_fill, build_export, parse_fill_payload, render_export_text
 from app.report import (
     OTHER_TOPIC_KEY,
     Board,
@@ -2246,3 +2252,82 @@ async def api_sync_status() -> dict:
     """手动同步状态查询（§14.2 第 2 步）：前端每 2s 轮询；不依赖外部 API，无任务史（服务刚重启/
     从未跑过）时 running=False 且各字段为 None。"""
     return sync_status()
+
+
+# ===== 本地 AI 导出/回填 API（local-ai-relay）=====
+# 用途：生产 AI 段停用（AI_ENABLED=0）后不再直接调远端模型，改为"导出待生成任务 → 本地对话式 AI 工具生成
+# → 回填写库"。判定、prompt 构造、清洗与写入语义全部在 app/local_ai.py（与每日 ensure 同一套口径，不复制
+# 第二套）；本层只做入参校验、体量上限与 text/json 两形态转换，且不注入 AI client——两个端点只要 GitHub
+# client（README 作 prompt 输入；total/summary 回填时重取指纹），AI 停用状态下照常可用。
+
+_LOCAL_AI_KINDS = ("all", *LOCAL_AI_KINDS)  # 导出 kind 白名单：all + 五类任务
+_LOCAL_AI_FORMATS = ("text", "json")
+_EXPORT_LIMIT_MIN = 1
+_EXPORT_LIMIT_MAX = 50  # 单批导出上限（设计决策 8）
+_FILL_MAX_ITEMS = 200  # 回填单批条目上限（同一决策：超限整批拒绝）
+_FILL_MAX_BODY_BYTES = 1024 * 1024  # 回填请求体上限 1MB（同上）
+
+
+@router.get("/api/local-ai/tasks")
+async def api_local_ai_tasks(
+    limit: int = 20,
+    kind: str = "all",
+    format: str = "text",
+    github: GitHubClient = Depends(_github_client),
+) -> Response:
+    """导出待生成任务（只读：不写库、不占运行锁、不影响每日跑批）。
+
+    - limit：单批任务数，夹取 1..50（越界按边界截断，不报错）；
+    - kind：all（缺省）/ translate / week / quarter / total / summary，非法 → 400；
+    - format：text（缺省，自包含作业单，含输出格式要求与逐条 prompt，可直接整段粘贴给本地工具）/
+      json（结构化清单），非法 → 400；两形态任务集合一致（同一份判定结果渲染）。
+    """
+    if kind not in _LOCAL_AI_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind 应为 {'/'.join(_LOCAL_AI_KINDS)}，收到：{kind!r}")
+    if format not in _LOCAL_AI_FORMATS:
+        raise HTTPException(status_code=400, detail=f"format 应为 {'/'.join(_LOCAL_AI_FORMATS)}，收到：{format!r}")
+    limit = max(_EXPORT_LIMIT_MIN, min(limit, _EXPORT_LIMIT_MAX))
+    conn = get_conn()
+    try:
+        payload = await build_export(
+            conn, limit=limit, kind=kind, github_client=github, now=datetime.now(timezone.utc), log=logger
+        )
+    finally:
+        conn.close()
+    if format == "json":
+        return JSONResponse(payload)
+    return PlainTextResponse(render_export_text(payload), media_type="text/plain; charset=utf-8")
+
+
+@router.post("/api/local-ai/fill")
+async def api_local_ai_fill(request: Request, github: GitHubClient = Depends(_github_client)) -> dict:
+    """回填本地工具产出（写入：一律 source='manual'，自动路径的半月窗口重生不再触碰）。
+
+    请求体兼容 {"items": [...], "overwrite": false} 与裸数组 [...]（等价 overwrite=false），
+    允许 markdown 围栏与前后夹带的说明文字（本地工具输出可整段粘贴）；
+    上限：请求体 1MB（超出 413）、单批 200 条（超出 400），超限整批拒绝、不写库；
+    逐条校验（repo 在库/kind 合法/期次与当期一致/text 清洗后非空且不超长）与写入语义见 app/local_ai.apply_fill：
+    坏条进 errors 计数不阻断同批，响应 {"written", "skipped", "failed", "errors"}。
+    """
+    raw = await request.body()
+    if len(raw) > _FILL_MAX_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"请求体超过 {_FILL_MAX_BODY_BYTES // (1024 * 1024)}MB 上限：请按批拆分后重试",
+        )
+    try:
+        items, overwrite = parse_fill_payload(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if len(items) > _FILL_MAX_ITEMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单批条目上限 {_FILL_MAX_ITEMS} 条，收到 {len(items)} 条：请按批拆分后重试",
+        )
+    conn = get_conn()
+    try:
+        return await apply_fill(
+            conn, items=items, overwrite=overwrite, github_client=github, now=datetime.now(timezone.utc), log=logger
+        )
+    finally:
+        conn.close()

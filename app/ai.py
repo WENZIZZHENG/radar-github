@@ -25,6 +25,9 @@
     prompt 不引用任何星数/增星/排名数字；
   * README sha 比对仅每日 ensure 且在半月窗口日对 S 内仓进行；sha NULL 仓后续出现 README 视为变更自愈；
     周/季维度不随 README 触发；
+  * source 列（local-ai-relay）：'ai'＝本模块自动路径写入（缺省）/ 'manual'＝本地回填通道
+    （app/local_ai.py）写入；'manual' 行不受半月窗口重生影响——quarter/total/summary 三处窗口守卫遇
+    人工行直接跳过（不拉 README、不比 sha、不调用 AI、不覆盖），缺失补缺不受影响，周榜每期次新行也不受影响；
 - 降级：DEEPSEEK_API_KEY 未配置 → 记 INFO 返回零统计，服务照常；单条 translate/recommend 失败 →
   记 WARNING 跳过该条计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额/账户权限 401/402/403）
   直通整轮 handler；403 内容审核拦截（content_policy）属单仓失败，按 DeepSeekError 跳过该条；
@@ -186,6 +189,123 @@ def _parse_suggested_topics(content: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+# ---------- prompt 构造（local-ai-relay 抽取为模块级纯函数） ----------
+# 三条口径的唯一实现：DeepSeekClient 对应方法与本地导出（app/local_ai.py）共用同一份，
+# 保证"导出的任务与线上 AI 生成的一模一样"；改动 prompt 文本即同时改两条路径，不做第二套。
+
+
+def build_translate_prompt(text: str) -> tuple[str, str, float]:
+    """简介翻译 prompt（返回 system/user/temperature；user 即待译原文）。"""
+    system = (
+        "你是开源项目简介翻译器。把用户给出的 GitHub 仓库英文简介翻译成自然简洁的中文，"
+        "只输出译文本体：不要加引号包裹，不要加“翻译：”等任何前缀，不要解释。"
+        "项目名、品牌名、技术专有名词保留原文。"
+    )
+    return system, text, 0.2  # 低温度：翻译求稳不求花
+
+
+def build_recommend_prompt(
+    *,
+    full_name: str,
+    description: str,
+    language: str,
+    categories: list[str],
+    dimension: str,
+    delta: int | None = None,
+    stars: int | None = None,
+    readme: str | None = None,
+    pool_days: float | None = None,
+) -> tuple[str, str, float]:
+    """维度感知推荐语 prompt（T-017，返回 system/user/temperature）。
+
+    输入行：仓库/简介/主语言，readme 非空时附 README 要点（调用方已截断，本函数不重复截断）；
+    week/quarter 再附当期增星（delta 非空）与总星数（stars 非空）与上榜分类，total 只附上榜分类。
+    prompt 两条钉死口径（本人拍板）：周/季输入必须带当期增量（"本周/本季新增 X 星，为什么火"）；
+    total 维度不引用任何具体星数/排名数字（数字由页面行内数据展示，防 evergreen 陈旧）。
+    分化钉死（2026-08-12 本人复验反馈）：周/季有增量时必须明确写出当期增星数字——与 total
+    "不引用数字"形成肉眼可见的稳定差异（两套文本不再"看起来一样"）。
+    T-018 分化：pool_days 非 None（新崛起区仓）时增量语境为"入池 N 天新增"（输入行与钉死句
+    同构分化），主榜仓措辞一字不动。
+    """
+    if dimension not in ("week", "quarter", "total"):
+        raise ValueError(f"dimension 非法：{dimension!r}")
+    lines = [f"仓库：{full_name}", f"简介：{description}", f"主语言：{language}"]
+    if readme:
+        lines.append(f"README 要点：\n{readme}")
+    if dimension == "total":
+        user = "\n".join(lines + [f"上榜分类：{'、'.join(categories)}"])
+        system = (
+            "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的推荐理由。"
+            "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+            "其余说明它在所属领域中的地位（存量语境，写给长期关注的人看，不追热点）。"
+            "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
+            "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+        )
+    else:
+        rising_days = pool_days_label(pool_days) if pool_days is not None else None
+        delta_word = "本周" if dimension == "week" else "本季"
+        if delta is not None:
+            lines.append(
+                f"入池 {rising_days} 天新增星数：{delta}" if rising_days is not None else f"{delta_word}新增星数：{delta}"
+            )
+        if stars is not None:
+            lines.append(f"总星数：{stars}")
+        lines.append(f"上榜分类：{'、'.join(categories)}")
+        user = "\n".join(lines)
+        board_word = "周榜" if dimension == "week" else "季榜"
+        # 分化钉死（2026-08-12 本人复验反馈）：增星语境必须写出具体数字——与 total 维度
+        # "不引用任何数字"形成肉眼可见的稳定差异；delta 缺席（历史期次无增量行）时退回软要求
+        if rising_days is not None:
+            # T-018 分化：新区仓增量语境是"入池 N 天新增"（与主榜"本周/本季新增"同构分化，主榜措辞一字不动）
+            why = (
+                f"其余说明为什么入池 {rising_days} 天值得关注：必须明确写入池 {rising_days} 天新增星数（{delta} 星）"
+                "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
+                if delta is not None
+                else f"其余说明为什么入池 {rising_days} 天值得关注（结合入池 {rising_days} 天增星、总星数与上榜分类）；"
+            )
+        else:
+            why = (
+                f"其余说明为什么{delta_word}值得关注：必须明确写出{delta_word}新增星数（{delta} 星）"
+                "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
+                if delta is not None
+                else f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类）；"
+            )
+        system = (
+            f"你是技术雷达的编辑，为一位资深开发者读者写 GitHub {board_word}上榜项目的推荐理由。"
+            f"根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
+            f"{why}有选型参考价值时点明。"
+            "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
+        )
+    return system, user, 0.3  # 低温度：推荐语允许一点措辞空间，但不许发散
+
+
+def build_summary_prompt(
+    *,
+    full_name: str,
+    description: str,
+    language: str,
+    readme: str | None = None,
+) -> tuple[str, str, float]:
+    """AI 概要 prompt（T-024，§11，返回 system/user/temperature）。
+
+    prompt 三条钉死口径（本人拍板）：不引用任何星数/增星/排名数字（防 evergreen 陈旧，
+    与 total 推荐语同理）；只输出概要本体（无前缀无列表无标题，与 recommend 同风格约束）；
+    temperature 0.3。README 正文截断入输入的口径与 recommend 一致（调用方 _ReadmeState
+    已按 README_HEAD_CHARS 截断，本函数不重复截断）。
+    """
+    lines = [f"仓库：{full_name}", f"简介：{description}", f"主语言：{language}"]
+    if readme:
+        lines.append(f"README 要点：\n{readme}")
+    system = (
+        "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的 AI 概要。"
+        "根据给出的仓库信息，从 README 文档视角写一段 3~5 句的中文概要：这个项目是什么、"
+        "由什么组成（核心模块/组件）。"
+        "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
+        "只输出概要本体：不要加引号包裹，不要加“AI 概要：”等前缀，不要用列表或标题。"
+    )
+    return system, "\n".join(lines), 0.3  # 低温度：概要求准不求发散（与推荐语同值）
+
+
 class DeepSeekClient:
     """OpenAI 官方 AsyncOpenAI 封装 OpenAI 兼容 chat/completions（缺省 DeepSeek，.env AI_BASE_URL/AI_MODEL 可换
     提供方；类名保留 DeepSeekClient 免大面积改名）；transport / sleep 可注入（单测 MockTransport 离线跑）。"""
@@ -230,16 +350,9 @@ class DeepSeekClient:
         await self.aclose()
 
     async def translate(self, text: str) -> str:
-        """英文简介 → 中文译文本体（一条一次；prompt 钉死只输出译文：无引号包裹、无"翻译："前缀）。"""
-        return await self._chat(
-            system=(
-                "你是开源项目简介翻译器。把用户给出的 GitHub 仓库英文简介翻译成自然简洁的中文，"
-                "只输出译文本体：不要加引号包裹，不要加“翻译：”等任何前缀，不要解释。"
-                "项目名、品牌名、技术专有名词保留原文。"
-            ),
-            user=text,
-            temperature=0.2,  # 低温度：翻译求稳不求花
-        )
+        """英文简介 → 中文译文本体（一条一次；prompt 见模块级 build_translate_prompt）。"""
+        system, user, temperature = build_translate_prompt(text)
+        return await self._chat(system=system, user=user, temperature=temperature)
 
     async def recommend(
         self,
@@ -256,68 +369,21 @@ class DeepSeekClient:
     ) -> str:
         """维度感知推荐语（T-017）：周/季增量语境（输入含当期增量）；总星存量语境"是什么＋领域地位"。
 
-        prompt 两条钉死口径（本人拍板）：周/季输入必须带当期增量（"本周/本季新增 X 星，为什么火"）；
-        total 维度不引用任何具体星数/排名数字（数字由页面行内数据展示，防 evergreen 陈旧）。
-        分化钉死（2026-08-12 本人复验反馈）：周/季有增量时必须明确写出当期增星数字——与 total
-        "不引用数字"形成肉眼可见的稳定差异（两套文本不再"看起来一样"）。
-        T-018 分化：pool_days 非 None（新崛起区仓）时增量语境为"入池 N 天新增"（输入行与钉死句
-        同构分化），主榜仓措辞一字不动。
-        README 正文截断入输入（无则省略该行）；只输出 2~3 句中文推荐语本体。
+        prompt 文本与口径见模块级 build_recommend_prompt（本地导出共用同一份，防两条路径漂移）；
+        本方法只负责调用。
         """
-        if dimension not in ("week", "quarter", "total"):
-            raise ValueError(f"dimension 非法：{dimension!r}")
-        lines = [f"仓库：{full_name}", f"简介：{description}", f"主语言：{language}"]
-        if readme:
-            lines.append(f"README 要点：\n{readme}")
-        if dimension == "total":
-            user = "\n".join(lines + [f"上榜分类：{'、'.join(categories)}"])
-            system = (
-                "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的推荐理由。"
-                "根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
-                "其余说明它在所属领域中的地位（存量语境，写给长期关注的人看，不追热点）。"
-                "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
-                "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
-            )
-        else:
-            rising_days = pool_days_label(pool_days) if pool_days is not None else None
-            delta_word = "本周" if dimension == "week" else "本季"
-            if delta is not None:
-                lines.append(
-                    f"入池 {rising_days} 天新增星数：{delta}" if rising_days is not None else f"{delta_word}新增星数：{delta}"
-                )
-            if stars is not None:
-                lines.append(f"总星数：{stars}")
-            lines.append(f"上榜分类：{'、'.join(categories)}")
-            user = "\n".join(lines)
-            board_word = "周榜" if dimension == "week" else "季榜"
-            # 分化钉死（2026-08-12 本人复验反馈）：增星语境必须写出具体数字——与 total 维度
-            # "不引用任何数字"形成肉眼可见的稳定差异；delta 缺席（历史期次无增量行）时退回软要求
-            if rising_days is not None:
-                # T-018 分化：新区仓增量语境是"入池 N 天新增"（与主榜"本周/本季新增"同构分化，主榜措辞一字不动）
-                why = (
-                    f"其余说明为什么入池 {rising_days} 天值得关注：必须明确写入池 {rising_days} 天新增星数（{delta} 星）"
-                    "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
-                    if delta is not None
-                    else f"其余说明为什么入池 {rising_days} 天值得关注（结合入池 {rising_days} 天增星、总星数与上榜分类）；"
-                )
-            else:
-                why = (
-                    f"其余说明为什么{delta_word}值得关注：必须明确写出{delta_word}新增星数（{delta} 星）"
-                    "这个数字，并结合总星数与上榜分类分析增长背后的原因；"
-                    if delta is not None
-                    else f"其余说明为什么{delta_word}值得关注（结合{delta_word}增星、总星数与上榜分类）；"
-                )
-            system = (
-                f"你是技术雷达的编辑，为一位资深开发者读者写 GitHub {board_word}上榜项目的推荐理由。"
-                f"根据给出的仓库信息写 2~3 句中文推荐语：第一句说清项目是做什么的，"
-                f"{why}有选型参考价值时点明。"
-                "只输出推荐语本体：不要加引号包裹，不要加“推荐理由：”等前缀，不要用列表或标题。"
-            )
-        return await self._chat(
-            system=system,
-            user=user,
-            temperature=0.3,  # 低温度：推荐语允许一点措辞空间，但不许发散
+        system, user, temperature = build_recommend_prompt(
+            full_name=full_name,
+            description=description,
+            language=language,
+            categories=categories,
+            dimension=dimension,
+            delta=delta,
+            stars=stars,
+            readme=readme,
+            pool_days=pool_days,
         )
+        return await self._chat(system=system, user=user, temperature=temperature)
 
     async def summarize(
         self,
@@ -331,26 +397,12 @@ class DeepSeekClient:
 
         与推荐语并存不混淆：推荐语＝为什么值得关注（营销视角，三维度分榜）；概要＝是什么
         （文档视角，段落级 3~5 句中文，无维度概念，全页面同一条）。
-        prompt 三条钉死口径（本人拍板）：不引用任何星数/增星/排名数字（防 evergreen 陈旧，
-        与 total 推荐语同理）；只输出概要本体（无前缀无列表无标题，与 recommend 同风格约束）；
-        temperature 0.3。README 正文截断入输入的口径与 recommend 一致（调用方 _ReadmeState
-        已按 README_HEAD_CHARS 截断，本方法不重复截断）。
+        prompt 文本与三条钉死口径见模块级 build_summary_prompt（本地导出共用同一份）；本方法只负责调用。
         """
-        lines = [f"仓库：{full_name}", f"简介：{description}", f"主语言：{language}"]
-        if readme:
-            lines.append(f"README 要点：\n{readme}")
-        system = (
-            "你是技术雷达的编辑，为一位资深开发者读者写 GitHub 项目的 AI 概要。"
-            "根据给出的仓库信息，从 README 文档视角写一段 3~5 句的中文概要：这个项目是什么、"
-            "由什么组成（核心模块/组件）。"
-            "不要引用任何具体数字（星数、增星、排名）——数字由页面行内数据展示。"
-            "只输出概要本体：不要加引号包裹，不要加“AI 概要：”等前缀，不要用列表或标题。"
+        system, user, temperature = build_summary_prompt(
+            full_name=full_name, description=description, language=language, readme=readme
         )
-        return await self._chat(
-            system=system,
-            user="\n".join(lines),
-            temperature=0.3,  # 低温度：概要求准不求发散（与推荐语同值）
-        )
+        return await self._chat(system=system, user=user, temperature=temperature)
 
     async def suggest_topics(self, terms: list[str], topic_names: list[str]) -> dict[str, str]:
         """候选词 → 建议主题（T-032，§15.2）：批量一次调用返回 {词: 主题名或"不建议收录"}。
@@ -683,6 +735,9 @@ async def recommend_missing(
     - 输入含 README 正文（截断；拉取失败/空退化元数据，不持久化）；README 拉取失败绝不抛出阻塞
       （GitHub token 缺失/无效 → 全量退化、readme_sha 保持 NULL）；README 复用同一 _ReadmeState 实例
       （逐仓缓存，同轮同仓只拉一次，total 段与 summary 段共享）；
+    - source='manual'（local-ai-relay 本地回填写入）的行为：quarter/total/summary 三处窗口重生守卫
+      遇人工行直接跳过（不拉 README、不比 sha、不调用 AI、不覆盖）；缺失行照常补缺（写入 source='ai'），
+      周榜每期次新行不受影响。手动单仓"生成/重新生成"（POST /api/recommend）属用户显式操作，不走本函数；
     - 单条失败记 WARNING 跳过计入统计，绝不抛出；DeepSeekAuthError（key 无效/余额/账户权限 401/402/403）
       直通整轮 handler；403 内容审核拦截（content_policy）属单仓失败，按 DeepSeekError 跳过该条；
     - 单条写入即 commit（崩溃不丢已花配额，重跑幂等补缺）。
@@ -714,9 +769,10 @@ async def recommend_missing(
     window_open = _refresh_window_open(now.date())  # 半月窗口：仅 1 号、15 号允许 quarter/total/summary 重生
 
     # 预取现有行（(repo_id, dimension, period_label) → 行），避免逐仓查询；手动 API 写入后本轮不重判
+    # source 一并取：窗口重生守卫要按 'manual'（本地回填写入）跳过，不拉 README、不比 sha（local-ai-relay）
     existing: dict[tuple[int, str, str], sqlite3.Row] = {}
     for row in conn.execute(
-        "SELECT repo_id, dimension, period_label, readme_sha, generated_week FROM recommendations"
+        "SELECT repo_id, dimension, period_label, readme_sha, generated_week, source FROM recommendations"
     ):
         existing[(row["repo_id"], row["dimension"], row["period_label"])] = row
 
@@ -774,7 +830,11 @@ async def recommend_missing(
             continue
         key = (info["id"], "quarter", quarter_label)
         cur = existing.get(key)
-        if cur is not None and (not refresh or not window_open or cur["generated_week"] == week_label):
+        # 已有行在非窗口日/手动批量（refresh=False）跳过；local-ai-relay：人工行（source='manual'）
+        # 不受窗口重生影响——任何日期都不拉 README、不比 generated_week、不调用 AI、不覆盖
+        if cur is not None and (
+            not refresh or not window_open or cur["generated_week"] == week_label or cur["source"] == "manual"
+        ):
             continue
         readme_text, _ = await readme_state.get(full_name, stats)
         # T-018：新区行带入池语境（在池增量/在池天数），主榜行保持既有增量参数
@@ -826,8 +886,9 @@ async def recommend_missing(
         rid = info["id"]
         key = (rid, "total", "all")
         cur = existing.get(key)
-        # 非窗口日或手动批量（refresh=False）：已有行直接跳过，不拉 README、不比 sha（省 GitHub API）
-        if cur is not None and (not refresh or not window_open):
+        # 非窗口日或手动批量（refresh=False）：已有行直接跳过，不拉 README、不比 sha（省 GitHub API）；
+        # local-ai-relay：人工行（source='manual'）任何日期都跳过，不拉 README、不比 sha、不覆盖
+        if cur is not None and (not refresh or not window_open or cur["source"] == "manual"):
             continue
         readme_text, sha = await readme_state.get(full_name, stats)
         # F2-1 修复：窗口日本次未拉到 sha（拉取失败/404/账户类停拉）不触发重生——保留旧行与旧指纹，
@@ -877,8 +938,9 @@ async def recommend_missing(
             rid = info["id"]
             key = (rid, "summary", "all")
             cur = existing.get(key)
-            # 非窗口日：已有 summary 行直接跳过，不拉 README、不比 sha（省 GitHub API）
-            if cur is not None and not window_open:
+            # 非窗口日：已有 summary 行直接跳过，不拉 README、不比 sha（省 GitHub API）；
+            # local-ai-relay：人工行（source='manual'）任何日期都跳过，不拉 README、不比 sha、不覆盖
+            if cur is not None and (not window_open or cur["source"] == "manual"):
                 continue
             readme_text, sha = await readme_state.get(full_name, stats)  # 复用同一 _ReadmeState：同轮同仓缓存命中
             if cur is not None and (sha is None or cur["readme_sha"] == sha):

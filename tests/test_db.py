@@ -289,3 +289,128 @@ def test_invalid_dimension_rejected_by_check(tmp_path):
             )
     finally:
         conn.close()
+
+
+# ---------- local-ai-relay：recommendations 补 source 列幂等迁移 ----------
+
+
+def _make_pre_source_recommendations(db):
+    """把新库的 recommendations 换成本变更之前的最终结构（4 值 CHECK，无 source 列）并塞存量行。"""
+    conn = get_conn(db)
+    conn.execute("DROP TABLE recommendations")
+    conn.execute(
+        "CREATE TABLE recommendations ("
+        "  repo_id INTEGER NOT NULL REFERENCES repos (id),"
+        "  dimension TEXT NOT NULL CHECK (dimension IN ('week', 'quarter', 'total', 'summary')),"
+        "  period_label TEXT NOT NULL,"
+        "  text TEXT NOT NULL,"
+        "  readme_sha TEXT,"
+        "  generated_week TEXT NOT NULL,"
+        "  PRIMARY KEY (repo_id, dimension, period_label)"
+        ")"
+    )
+    conn.execute("CREATE INDEX idx_recommendations_dim_period ON recommendations (dimension, period_label)")
+    conn.execute(
+        "INSERT INTO repos (full_name, node_id, source, created_at) VALUES (?, ?, ?, ?)",
+        ("octocat/pre-source", "node-pre-source", "initial", "2026-07-01T00:00:00Z"),
+    )
+    rid = conn.execute("SELECT id FROM repos WHERE full_name = 'octocat/pre-source'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'total', 'all', '存量文本', 'sha-old', '2026-W31')",
+        (rid,),
+    )
+    conn.commit()
+    conn.close()
+    return rid
+
+
+def test_source_column_on_fresh_db(tmp_path):
+    """新装库：source 列就位，缺省写入即 'ai'（不写该列的既有 INSERT 路径语义不变）。"""
+    db = tmp_path / "fresh.db"
+    init_db(db)
+    conn = get_conn(db)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(recommendations)")}
+        assert "source" in cols
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, source, created_at) VALUES (?, ?, ?, ?)",
+            ("octocat/fresh", "node-fresh", "initial", "2026-07-01T00:00:00Z"),
+        )
+        rid = conn.execute("SELECT id FROM repos WHERE full_name = 'octocat/fresh'").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+            " VALUES (?, 'total', 'all', '文本', NULL, '2026-W32')",
+            (rid,),
+        )
+        conn.commit()
+        assert conn.execute("SELECT source FROM recommendations").fetchone()["source"] == "ai"
+    finally:
+        conn.close()
+
+
+def test_source_migration_backfills_existing_rows_with_ai(tmp_path):
+    """旧库（无 source 列）经 init_db：列被补上，存量行 source='ai'（默认值回填），旧文本/指纹不丢。"""
+    db = tmp_path / "pre_source.db"
+    init_db(db)
+    rid = _make_pre_source_recommendations(db)
+    init_db(db)  # 触发 source 迁移
+
+    conn = get_conn(db)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(recommendations)")}
+        assert "source" in cols
+        row = conn.execute(
+            "SELECT repo_id, text, readme_sha, generated_week, source FROM recommendations"
+        ).fetchone()
+        assert (row["repo_id"], row["text"], row["readme_sha"], row["generated_week"], row["source"]) == (
+            rid,
+            "存量文本",
+            "sha-old",
+            "2026-W31",
+            "ai",
+        )
+    finally:
+        conn.close()
+
+
+def test_source_migration_idempotent(tmp_path):
+    """迁移后再次 init_db：不重复加列、行数与值不变（含已标记 manual 的行不被打回）。"""
+    db = tmp_path / "pre_source.db"
+    init_db(db)
+    _make_pre_source_recommendations(db)
+    init_db(db)
+    conn = get_conn(db)
+    conn.execute("UPDATE recommendations SET source = 'manual'")
+    conn.commit()
+    conn.close()
+
+    init_db(db)  # 第三次：已含 source 列再跑
+    init_db(db)  # 第四次
+
+    conn = get_conn(db)
+    try:
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(recommendations)")]
+        assert cols.count("source") == 1
+        assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 1
+        assert conn.execute("SELECT source FROM recommendations").fetchone()["source"] == "manual"
+    finally:
+        conn.close()
+
+
+def test_source_migration_runs_after_summary_rebuild(tmp_path):
+    """顺序回归（迁移链接入点）：3 值 CHECK 旧表先经 summary 迁移整表重建（新表不含 source），
+    随后 source 迁移补列——若顺序颠倒，列会在重建中被丢掉。"""
+    db = tmp_path / "three.db"
+    init_db(db)
+    _make_three_value_recommendations(db)
+    init_db(db)
+
+    conn = get_conn(db)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(recommendations)")}
+        assert "source" in cols  # 重建之后仍补上了
+        row = conn.execute("SELECT text, source FROM recommendations").fetchone()
+        assert (row["text"], row["source"]) == ("旧总星文本", "ai")
+    finally:
+        conn.close()
