@@ -82,6 +82,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 - 响应与错误：`{"written","skipped","failed","errors"}`；`400`（JSON/参数非法、单批超 200 条）、`413`（请求体超 1MB）；逐条失败不阻断同批。
 - 命令与公网形态（含 Basic Auth）见 `docs/dev-commands.md` §4.4；技术契约见 `openspec/specs/local-ai-relay/`（当前在 `openspec/changes/local-ai-relay/`，验收后归档）。
 
+## 数据快照
+
+生产库快照以 **GitHub Release 附件**发布，不进 git 历史（二进制文件会持续撑大仓库）：标签形如 `data-YYYYMMDD`，附件 `radar-YYYYMMDD.db.gz`；下载页 `https://github.com/WENZIZZHENG/radar-github/releases`。用法：`gunzip` 后作为 `data/radar.db` 放回即可被应用直接读取（WAL 模式，启动时 `init_db` 幂等建表/迁移）；发布与校验命令见 `docs/dev-commands.md` §4.6。
+
 ## 文档与协作约定
 
 产品层所有决策以 `docs/sop/` 为准（需求清单 / 功能闭环清单 / 交互流程说明 / 架构决策记录 / 任务拆解表 / 验收记录）；工程约定见根目录 `AGENTS.md`。数据硬约定：时间戳一律 UTC 定长 ISO（`YYYY-MM-DDTHH:MM:SSZ`），字典序即时间序。

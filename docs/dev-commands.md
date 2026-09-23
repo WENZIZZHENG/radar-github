@@ -120,3 +120,33 @@ curl -s -u "<用户>:<密码>" -X POST "https://radar.example.com/api/local-ai/f
 - 回滚：无 git remote，回滚 = 本地 `git checkout <旧 commit>` 重打 tar 重走 4.1~4.3；生产 data/ 与 .env.prod 不受影响。
 - 部署结果回填《任务拆解表》对应任务详情卡（含耗时对比留痕）。
 
+### 4.6 数据快照发布（GitHub Release）
+
+生产库快照作为 GitHub Release 附件发布，**不进 git 历史**（二进制文件会持续撑大仓库）。2026-09-23 实跑固化，tag `data-20260923`。前置：gh 已登录（身份 WENZIZZHENG），仓库远端 `WENZIZZHENG/radar-github`。
+
+> 踩坑记录（2026-09-23）：① gh 装在 `"/c/Program Files/GitHub CLI/gh.exe"`，**不在 PATH，必须全路径调用**；② **所有 gh 命令必须带代理环境变量**，github.com 及 uploads 域名直连不通，走本机 `127.0.0.1:7890`；③ 换机器/首次使用需先 `gh auth login --web` 走设备码授权（本次未重跑，已登录状态）。
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890
+GH="/c/Program Files/GitHub CLI/gh.exe"
+D=$(date +%Y%m%d)          # 本次实测用实值 20260923；下列命令按当日日期替换 $D
+
+# ① 打包（gzip -c 默认级别；-t 自检必须 OK；实测：解压后与 data/radar.db 逐字节一致）
+gzip -c data/radar.db > /tmp/radar-$D.db.gz && gzip -t /tmp/radar-$D.db.gz
+
+# ② 建 Release 并传附件（一条命令完成；--notes 里的统计值用当日库实值填，别照抄）
+"$GH" release create data-$D /tmp/radar-$D.db.gz --repo WENZIZZHENG/radar-github \
+  --title "数据快照 $D" \
+  --notes "生产 SQLite 库当日快照（gzip）。内容：repos=…、star_snapshots=…、max(captured_at)=…。用法：gunzip 后作为 data/radar.db 即可被应用直接读取（WAL 模式，init_db 幂等建表/迁移）。"
+# 输出即 release URL：https://github.com/WENZIZZHENG/radar-github/releases/tag/data-20260923
+
+# ③ 查看（asset 行有附件即成功）＋下载核对（两侧 sha256 必须一致）
+"$GH" release view data-$D --repo WENZIZZHENG/radar-github
+"$GH" release download data-$D --repo WENZIZZHENG/radar-github -p 'radar-*.db.gz' -D /tmp/radar-dl
+sha256sum /tmp/radar-$D.db.gz /tmp/radar-dl/radar-$D.db.gz
+# ④ 附件链接可达性（302 → release-assets.githubusercontent.com，末段 200）
+curl -sIL "https://github.com/WENZIZZHENG/radar-github/releases/download/data-$D/radar-$D.db.gz" | grep -Ei "^HTTP/|^location:"
+```
+
+备注：`gh release view` 实测输出含 `asset: radar-20260923.db.gz`；`gh release create` 一次成功、无重试，上传 9.3MB 约 2 秒；附件 sha256 与本地打包文件一致，解压后 `PRAGMA quick_check` 为 `ok`。
+
