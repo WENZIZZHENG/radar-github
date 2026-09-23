@@ -90,7 +90,7 @@ $SSH 'for u in "/" "/?board=all" "/total" "/total?board=all"; do
 
 生产 AI 段停用后，文本改由"本地工具生成 + 接口回填"。两个端点：导出 `GET /api/local-ai/tasks`、回填 `POST /api/local-ai/fill`；判定与写入语义见 `docs/sop/交互流程/20-本地AI生成回传.md`，接口契约见 `openspec/specs/local-ai-relay/`。
 
-本机/服务器回环形态（已实测跑通，2026-09-13 预演）：
+服务器回环形态（**仅服务器上可用**，免鉴权，排障/冒烟用；2026-09-13 预演实测）：
 
 ```bash
 # 导出作业单（text 形态，整段粘贴给本地工具）：limit 默认 20、上限 50；kind 可 all|translate|week|quarter|total|summary
@@ -101,7 +101,7 @@ curl -s "http://127.0.0.1:8000/api/local-ai/tasks?limit=20&format=json" -o tasks
 curl -s -X POST "http://127.0.0.1:8000/api/local-ai/fill" -H "Content-Type: application/json" --data-binary @result.json
 ```
 
-公网形态（带 Basic Auth；部署后由本人执行，AI 侧无密码）：
+公网形态（**本人在自己机器上用的形态**：`https://radar.example.com` ＋ Basic Auth；密码本人持有，AI 侧只有 hash 无法代跑）：
 
 ```bash
 curl -s -u "<用户>:<密码>" "https://radar.example.com/api/local-ai/tasks?limit=20&format=text" -o sheet.txt

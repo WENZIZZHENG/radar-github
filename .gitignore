@@ -34,3 +34,6 @@ Thumbs.db
 
 # 原型截图产物（机器预演产物不入库，原型 HTML 本体入库）
 docs/sop/原型-T021-shots/
+
+# .workbuddy
+.workbuddy/
