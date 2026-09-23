@@ -51,7 +51,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 
 ## 生产部署
 
-无 git remote，走 tar+scp 覆盖 `/opt/radar` + `systemctl restart radar`，完整手册（含 SSH 私钥路径、排除清单红线、验证三道、回滚）见 `docs/dev-commands.md` §4。
+生产部署不走 git pull，走 tar+scp 覆盖 `/opt/radar` + `systemctl restart radar`，完整手册（含 SSH 私钥路径、排除清单红线、验证三道、回滚）见 `docs/dev-commands.md` §4。
 
 ## 本地 AI 生成回传（local-ai-relay，T-040）
 
