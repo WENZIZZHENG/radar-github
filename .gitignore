@@ -37,3 +37,11 @@ docs/sop/原型-T021-shots/
 
 # .workbuddy
 .workbuddy/
+
+# 公开前防误提交：部署私钥与临时产物一律不入库
+*.pem
+*.key
+sheet.txt
+result.json
+tasks.json
+radar-deploy.tar.gz

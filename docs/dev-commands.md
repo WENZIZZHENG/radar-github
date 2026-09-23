@@ -28,7 +28,7 @@ uv venv .venv && uv pip install -r pyproject.toml --extra dev
 ## 4. 生产部署（tar+scp，2026-08-14 实跑固化）
 
 > 服务器：root@<SERVER_IP>（CentOS 9）；应用 /opt/radar 归 radar 用户；systemd 单元 radar.service；
-> Caddy 反代 radar.example.com → 127.0.0.1:8000（Basic Auth）。**没有 git remote，部署不走 git pull。**
+> Caddy 反代 radar.example.com → 127.0.0.1:8000（Basic Auth）。**本地仓库有 origin remote（GitHub），但生产部署不走 git pull，走下方 tar+scp 流程。**
 
 ### 4.0 前置：SSH 私钥（本次踩坑点，必先核对）
 
