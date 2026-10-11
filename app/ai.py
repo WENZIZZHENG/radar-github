@@ -57,7 +57,7 @@ from openai import (
     PermissionDeniedError,
 )
 
-from app.classify import load_topics
+from app.classify import LANGUAGES, load_topics
 from app.collector.github import GitHubAuthError, GitHubClient
 from app.config import (
     BASE_DIR,
@@ -439,12 +439,15 @@ class DeepSeekClient:
         调用失败抛 DeepSeekError/DeepSeekAuthError（spec 口径：调用方按"搜索暂不可用"处理）——
         None 与异常的分界即"有响应但内容烂"与"根本调不动"的分界。
         """
+        # 语言枚举从 classify.LANGUAGES 动态拼接（给 LLM 的是 GitHub 精确名＝dict 键集，非榜单 key）：
+        # prompt 与语言分类单一事实源保持同步，语言榜扩容时意图理解面自动跟随（spec R4 派生一致性）
+        lang_names = "/".join(LANGUAGES)
         if prev_intent is None:
             system = (
                 "你是 GitHub 项目雷达的搜索意图理解器。把用户的中文自然语言搜索需求翻译成结构化查询。"
                 "只输出一个 JSON 对象，不要输出任何其他内容："
                 '{"keywords": [3~6 个英文关键词，小写，覆盖需求的核心技术/领域，如 "crawler", "scraping", "spider"],'
-                '"languages": [相关编程语言名数组，取值只能来自 Java/Go/Rust/TypeScript/JavaScript/Python，'
+                f'"languages": [相关编程语言名数组，取值只能来自 {lang_names}，'
                 "不锁单个，拿不准就空],"
                 '"topics": [相关主题词数组，小写 kebab-case，可空],'
                 '"filters": {"created_within_days": 创建至今天数上限（正整数，可选）, "min_stars": 最新星数下限（正整数，可选）},'
@@ -459,7 +462,7 @@ class DeepSeekClient:
                 "你会收到上一轮意图 JSON 和本轮新输入。请把两者合并成一个新意图（同一 JSON 契约），"
                 "只输出一个 JSON 对象，不要输出任何其他内容："
                 '{"keywords": [3~6 个英文关键词，小写，覆盖合并后需求的核心技术/领域],'
-                '"languages": [相关编程语言名数组，取值只能来自 Java/Go/Rust/TypeScript/JavaScript/Python，'
+                f'"languages": [相关编程语言名数组，取值只能来自 {lang_names}，'
                 "不锁单个，拿不准就空],"
                 '"topics": [相关主题词数组，小写 kebab-case，可空],'
                 '"filters": {"created_within_days": ..., "min_stars": ...},'

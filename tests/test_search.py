@@ -161,6 +161,12 @@ def test_intent_build_filters_invalid_languages():
     assert intent.languages == []
 
 
+def test_intent_build_normalizes_new_languages():
+    """P8 新合法值（语言榜扩容）：C++/C# 等新增语言大小写不敏感归一到 GitHub 精确名，不再被丢弃。"""
+    intent = _build_intent("x", {"keywords": ["k"], "languages": ["c++", "C#"], "topics": []})
+    assert intent.languages == ["C++", "C#"]
+
+
 def test_intent_build_degraded_on_bad_shapes():
     """非法 JSON 退化（spec：以原输入为单一关键词继续检索，不当场失败）：非对象/缺键/关键词空/元素非 str。"""
     bad_parsed = (

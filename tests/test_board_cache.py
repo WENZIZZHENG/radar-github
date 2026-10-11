@@ -140,7 +140,7 @@ def test_round_trip_preserves_all_fields(conn, topic_table):
     conn.commit()
     for period in PERIODS:
         real = compute_boards(conn, topic_table, period=period, as_of=AS_OF)
-        assert len(real) == 17  # 全量 17 榜
+        assert len(real) == 28  # 全量 28 榜
         labels = {"week": week_label(date.fromisoformat(AS_OF[:10])), "quarter": "2026-Q3", "total": "all"}
         save_board_cache(conn, period=period, label=labels[period], as_of=AS_OF, boards=real)
         conn.commit()
@@ -276,10 +276,10 @@ def test_precompute_writes_three_rows_with_labels(conn, topic_table):
     assert summary == {
         # 跨榜重复计数（命中多主题/多榜各算一行）：a/attend 出席 2 行（python 语言榜＋ai 主题榜）、
         # a/no-lang 2 行（other 语言榜＋other 主题榜）；a/rising 缺席进新区 2 行
-        "week": {"boards": 17, "rows": 4, "rising": 2},
+        "week": {"boards": 28, "rows": 4, "rising": 2},
         # 快照跨度 7 天 < 86：季窗口全缺席，三个仓都进新区（各 2 榜）→ 主榜 0 行
-        "quarter": {"boards": 17, "rows": 0, "rising": 6},
-        "total": {"boards": 17, "rows": 6, "rising": 0},
+        "quarter": {"boards": 28, "rows": 0, "rising": 6},
+        "total": {"boards": 28, "rows": 6, "rising": 0},
     }
     # 落表内容与同 as_of 实时算逐字段一致
     _assert_boards_equal(load_board_cache(conn, period="week", label="2026-W32"), compute_boards(conn, topic_table, period="week", as_of=AS_OF))

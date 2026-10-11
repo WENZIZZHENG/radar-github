@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS board_cache (
     period TEXT PRIMARY KEY,             -- 'week'/'quarter'/'total'
     label TEXT NOT NULL,                 -- 周/季期次标签（2026-W33/2026-Q3）；total 固定 'all'
     as_of TEXT NOT NULL,                 -- 预计算口径端点（UTC 定长 ISO，schema 硬约定）
-    payload TEXT NOT NULL,               -- compute_boards 全量 17 榜的 JSON 序列化（字段白名单手工展开）
+    payload TEXT NOT NULL,               -- compute_boards 全量 28 榜的 JSON 序列化（字段白名单手工展开）
     computed_at TEXT NOT NULL            -- 落表时刻（UTC 定长 ISO）
 );
 

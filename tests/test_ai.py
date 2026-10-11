@@ -28,6 +28,7 @@ from app.ai import (
     has_cjk,
     recommend_missing,
 )
+from app.classify import LANGUAGES
 from app.collector.github import GitHubAuthError
 from app.db import get_conn, init_db
 from app.jobs import daily_job
@@ -255,6 +256,37 @@ def test_client_recommend_prompt_dimension_divergence():
     assert "新增星数" not in total_user and "总星数" not in total_user  # total 输入不带数字
     soft_sys = bodies[3]["messages"][0]["content"]
     assert "必须明确写出" not in soft_sys and "结合本周增星" in soft_sys  # delta 缺席退回软要求
+
+
+def test_client_intent_prompt_languages_follow_classifier():
+    """P8 意图理解 prompt 语言枚举从 classify.LANGUAGES 动态生成（单一事实源，spec R4）：
+    首搜/追问两套 system 的枚举值 = GitHub 精确名键集（非榜单 key）、含新增五语言——
+    枚举写死时 LLM 永不产出新语言，归一能力再宽也无输入（2026-10-11 主 agent 裁定修复，防回归锁）。"""
+    bodies = []
+    canned = '{"keywords": ["k"], "languages": [], "topics": []}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": canned}}]})
+
+    client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
+    asyncio.run(client.understand_intent("爬虫工具"))
+    asyncio.run(
+        client.understand_intent(
+            "换成 C++ 的",
+            prev_intent={"keywords": ["crawler"], "languages": [], "topics": [], "filters": {}, "unsupported": []},
+        )
+    )
+    asyncio.run(client.aclose())
+
+    expected = "取值只能来自 " + "/".join(LANGUAGES) + "，"
+    assert len(bodies) == 2  # 首搜＋追问各一次
+    for body in bodies:
+        system = body["messages"][0]["content"]
+        assert expected in system  # 枚举与 LANGUAGES 键集逐字一致（顺序即 dict 顺序）
+        assert all(name in system for name in ("C++", "C#", "Kotlin", "Swift"))
+    assert bodies[0]["messages"][1]["content"] == "爬虫工具"  # 首搜 user = 原查询（prompt 其余文案不变）
+    assert "上一轮意图：" in bodies[1]["messages"][1]["content"]  # 追问 user 携带旧意图
 
 
 def test_client_retries_5xx_once_then_succeeds():

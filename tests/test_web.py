@@ -1,8 +1,8 @@
 """T-008 榜单页面测试：TestClient 打真实 app（lifespan 会跑 init_db），tmp_path 独立库（RADAR_DB_PATH 覆盖）+ 调度关闭。
 
 断言分两类：
-- 结构断言（时间稳健）：三页面 200、榜单区块数（T-026 起默认单榜 1 块、?board=all 17 块、降级页全量 17 块）、
-  P1/P2/P3/P4 边栏 18 项（17 榜项 + 1 "全部"项，T-026 §13.1 起 P4 纳入边栏替代 chips）、
+- 结构断言（时间稳健）：三页面 200、榜单区块数（T-026 起默认单榜 1 块、?board=all 28 块、降级页全量 28 块）、
+  P1/P2/P3/P4 边栏 29 项（28 榜项 + 1 "全部"项，T-026 §13.1 起 P4 纳入边栏替代 chips）、
   默认展开态、空态降级提示、期次参数 200/400；
   周/季出席数据随"今天"推移会滑出窗口，故不做数据内容断言（口径语义归 tests/test_report.py）。
 - 内容断言全走 /total?board=all（最新快照降序，无窗口概念，时间稳健）与首期空态（快照仅同一天）；
@@ -162,11 +162,11 @@ def test_static_assets_cache_busted(client):
     assert re.search(r'/static/radar\.js\?v=\d+', text)
 
 
-def test_index_has_17_boards_and_sidebar(client):
-    """T-021：17 榜齐备（语言 7 + 主题 10），空榜也渲染板块；左侧边栏 17 榜项一一对应（原顶部 chips 已由边栏替代）。
+def test_index_has_28_boards_and_sidebar(client):
+    """T-021：28 榜齐备（语言 12 + 主题 16），空榜也渲染板块；左侧边栏 28 榜项一一对应（原顶部 chips 已由边栏替代）。
 
     T-026 §13.1：无 board 参数 → 默认单榜（默认首榜 language-java，_seed_full 无 Java 仓 → 空态），
-    只渲染 1 个榜块；board=all 才全量 17 榜块。边栏恒为 18 项 = 17 榜项（class="sb-item"，与既有计数
+    只渲染 1 个榜块；board=all 才全量 28 榜块。边栏恒为 29 项 = 28 榜项（class="sb-item"，与既有计数
     兼容）+ 1 "全部"项（class="sb-item sb-all" 独立 class 防混淆）。
     """
     text = client.get("/").text
@@ -175,21 +175,21 @@ def test_index_has_17_boards_and_sidebar(client):
     assert text.count('id="b-language-') == 1 and text.count('id="b-topic-') == 0  # 单榜：语言榜块 1、主题榜块 0
     assert "本期暂无数据" in text  # _seed_full 无 Java 仓 → 当前榜空态文案
     assert '<aside class="sidebar"' in text
-    assert _sb_item_count(text) == 17  # 边栏榜项 = 语言 7 + 主题 10（"全部"项是 sb-all 独立 class）
+    assert _sb_item_count(text) == 28  # 边栏榜项 = 语言 12 + 主题 16（"全部"项是 sb-all 独立 class）
     assert _sb_all_count(text) == 1  # "全部"项（board=all 全量入口，§13.1）
     assert text.count('<a class="chip" href="#b-') == 0  # 顶部 chips 区不再渲染（边栏替代）
-    # board=all 全量 17 榜块（保留全量入口）
+    # board=all 全量 28 榜块（保留全量入口）
     text_all = client.get("/?board=all").text
-    assert text_all.count('class="board"') == 17
-    assert _sb_item_count(text_all) == 17 and _sb_all_count(text_all) == 1
+    assert text_all.count('class="board"') == 28
+    assert _sb_item_count(text_all) == 28 and _sb_all_count(text_all) == 1
     assert 'class="sb-item sb-all active"' in text_all  # 全量模式当前为"全部"项（服务端渲染 active）
 
 
 def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
     """首期降级判定变更（T-018）：主榜全空但新区有行 → 不降级（无 notice 无总星榜降级）；
-    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；17 板块仍在、边栏仍 17 项。
+    主榜区显示既有空态"本期暂无数据"＋新区小节照常渲染；28 板块仍在、边栏仍 28 项。
 
-    T-026 适配：board=all 显式全量语境断言（默认单榜只渲染当前榜块，17 板块的全量断言归 board=all；
+    T-026 适配：board=all 显式全量语境断言（默认单榜只渲染当前榜块，28 板块的全量断言归 board=all；
     降级判定本身在单榜模式同样成立——?board=language-java 时全库新区有行 → 不降级，见新增测试）。"""
     resp = fresh_client.get("/?board=all")
     assert resp.status_code == 200
@@ -197,9 +197,9 @@ def test_first_week_page_keeps_boards_when_rising_has_rows(fresh_client):
     assert "初始总星榜" not in resp.text  # 不降级到总星榜
     assert "a/new" in resp.text  # 新区行确实渲染
     assert "新崛起 · 入池未满一个统计窗口" in resp.text
-    assert resp.text.count("本期暂无数据") == 17  # 主榜全空：每榜空态照常
-    assert resp.text.count('class="board"') == 17
-    assert _sb_item_count(resp.text) == 17  # T-021：顶部 chips 已由左侧边栏替代（17 项）
+    assert resp.text.count("本期暂无数据") == 28  # 主榜全空：每榜空态照常
+    assert resp.text.count('class="board"') == 28
+    assert _sb_item_count(resp.text) == 28  # T-021：顶部 chips 已由左侧边栏替代（28 项）
     assert "follows-sec" not in resp.text  # v1.3：P1 顶部关注区已移出为独立页 P6
     # 默认全部展开（D1/D3 v1.1）：行即展开态、面板 open、aria 同步
     assert 'class="row expanded"' in resp.text
@@ -828,7 +828,7 @@ def test_datalist_sorted_by_frequency_then_name(tmp_path, monkeypatch):
 
 
 def test_sidebar_on_week_and_quarter_pages(client):
-    """P1/P2/P3 榜单页：左侧边栏就位（标题/收起钮/语言+主题两组 17 项/榜内数量徽标）；
+    """P1/P2/P3 榜单页：左侧边栏就位（标题/收起钮/语言+主题两组 28 项/榜内数量徽标）；
     顶部 chips 区与榜头"回顶部"移除（§12.1 拍板：边栏 sticky 常驻后回顶部冗余）。"""
     for path in ("/", f"/?week={WEEK_LABEL}", "/quarter"):
         resp = client.get(path)
@@ -838,7 +838,7 @@ def test_sidebar_on_week_and_quarter_pages(client):
         assert '<span class="sb-title">榜单直达</span>' in text
         assert 'class="sb-toggle"' in text
         assert 'class="sb-grp">语言' in text and 'class="sb-grp">主题' in text
-        assert _sb_item_count(text) == 17  # 语言 7 + 主题 10，顺序 = 榜块顺序
+        assert _sb_item_count(text) == 28  # 语言 12 + 主题 16，顺序 = 榜块顺序
         assert '<div class="chips"' not in text  # 顶部 chips 区已由边栏替代
         assert '<a class="chip" href="#b-' not in text
         assert '<a class="top" href="#top">' not in text  # 榜头回顶部移除
@@ -846,11 +846,11 @@ def test_sidebar_on_week_and_quarter_pages(client):
 
 
 def test_total_page_keeps_chips_and_top_links(client):
-    """P4 总星榜（§12.1 v2.1 修订，T-026 落地）：纳入边栏——边栏就位（17 榜项＋1 全部项）、
+    """P4 总星榜（§12.1 v2.1 修订，T-026 落地）：纳入边栏——边栏就位（28 榜项＋1 全部项）、
     顶部 chips 区移除、每榜头"回顶部"移除（与 P1/P2/P3 一致）。"""
     text = client.get("/total").text
     assert '<aside class="sidebar"' in text
-    assert _sb_item_count(text) == 17
+    assert _sb_item_count(text) == 28
     assert _sb_all_count(text) == 1
     assert text.count('class="board"') == 1  # 默认单榜（language-java 空榜）
     assert 'id="b-language-java"' in text
@@ -940,7 +940,7 @@ def test_follows_filter_comma_tag_json_encoding(follows_comma_client):
 
 def _sb_item_count(text: str) -> int:
     """边栏榜项数（T-026 起 active 由服务端渲染）：纯 `class="sb-item"` 项 + `class="sb-item active"` 项
-    （两形态精确子串互斥：active 项不落入纯形态计数），任一 active 组合下总数恒 = 17 榜项。"""
+    （两形态精确子串互斥：active 项不落入纯形态计数），任一 active 组合下总数恒 = 28 榜项。"""
     return text.count('class="sb-item"') + text.count('class="sb-item active"')
 
 
@@ -950,7 +950,7 @@ def _sb_all_count(text: str) -> int:
 
 
 def test_board_param_renders_only_that_board(client):
-    """指定 board 只渲染该榜内容（行＋新区＋空态），其余 15 榜只供边栏徽标（17 项仍在）；
+    """指定 board 只渲染该榜内容（行＋新区＋空态），其余 27 榜只供边栏徽标（28 项仍在）；
     单榜主题榜同样只渲染当前主题榜块（另一组 section 不渲染）。"""
     text = client.get(f"/?week={WEEK_LABEL}&board=language-python").text
     assert text.count('class="board"') == 1
@@ -959,7 +959,7 @@ def test_board_param_renders_only_that_board(client):
     assert "a/py" in text  # 历史周出席行
     assert "a/go" not in text  # Go 仓不在 Python 榜：不渲染
     assert "新崛起" not in text  # python 榜无新区（a/rise 属 Rust＋cli）
-    assert _sb_item_count(text) == 17  # 其余 15 榜徽标照常（只计数）
+    assert _sb_item_count(text) == 28  # 其余 27 榜徽标照常（只计数）
     assert _sb_all_count(text) == 1
     # 单榜主题榜：只渲染 ai 主题榜块
     text_ai = client.get(f"/?week={WEEK_LABEL}&board=topic-ai").text
@@ -1029,7 +1029,7 @@ def test_sidebar_active_rendered_server_side(client):
 
 
 def test_single_board_sidebar_badges_match_full(client):
-    """单榜模式边栏徽标与全量模式一致（其余 15 榜只 count，不因单榜化失真）：
+    """单榜模式边栏徽标与全量模式一致（其余 27 榜只 count，不因单榜化失真）：
     _seed_full 历史周——Java 0 行、Python 1 行、ai 主题 1 行、后端/云原生 0 行、other 主题 1 行（a/go）。"""
     text = client.get(f"/?week={WEEK_LABEL}&board=language-python").text
     assert (
@@ -1046,7 +1046,7 @@ def test_single_board_sidebar_badges_match_full(client):
 
 
 def test_fallback_page_ignores_board_param(tmp_path, monkeypatch):
-    """首期降级页维持全量现状（§13.1：不单榜化）：带 board 参数仍全量 17 榜＋notice＋当前边栏项="全部"。"""
+    """首期降级页维持全量现状（§13.1：不单榜化）：带 board 参数仍全量 28 榜＋notice＋当前边栏项="全部"。"""
 
     def _get_page(db_name):
         db = tmp_path / db_name
@@ -1063,8 +1063,8 @@ def test_fallback_page_ignores_board_param(tmp_path, monkeypatch):
     resp = _get_page("web-fallback-board.db")
     assert resp.status_code == 200
     assert 'class="notice"' in resp.text and "暂无可展示数据" in resp.text
-    assert resp.text.count('class="board"') == 17  # 降级页全量（board 参数忽略，不单榜化）
-    assert _sb_item_count(resp.text) == 17
+    assert resp.text.count('class="board"') == 28  # 降级页全量（board 参数忽略，不单榜化）
+    assert _sb_item_count(resp.text) == 28
     assert 'class="sb-item sb-all active"' in resp.text  # 当前边栏项="全部"（降级页非单榜）
 
 
@@ -1104,7 +1104,7 @@ def test_single_board_fallback_equivalence_partial_boards(tmp_path, monkeypatch)
         text_all = c.get(f"/?week={WEEK_LABEL}&board=all").text
         assert 'class="notice"' not in text_all  # 对照：同期全量模式本就不降级
         assert "a/py" in text_all
-        assert text_all.count('class="board"') == 17
+        assert text_all.count('class="board"') == 28
 
 
 # ---------- T-029：手动同步 API（§14.2/§14.3；后台任务形态，锁与状态在 app.jobs——真全链路在 test_jobs，

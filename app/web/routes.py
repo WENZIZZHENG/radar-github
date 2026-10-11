@@ -112,6 +112,9 @@ LANG_COLORS = {
     "Java": "#c9842a",
     "C++": "#f34b7d",
     "C": "#9aa7b8",
+    "C#": "#178600",
+    "Kotlin": "#A97BFF",
+    "Swift": "#F05138",
     "CSS": "#a074c4",
     "Ruby": "#e15b4c",
     "Zig": "#ec915c",
@@ -373,7 +376,7 @@ def _follow_cards(conn: sqlite3.Connection, follow_rows: list[sqlite3.Row], as_o
 
 
 def _follow_groups(cards: list[dict], reasons: dict, zh: dict, tags: dict, summaries: dict) -> list[dict]:
-    """P6 分组区（流程说明 §2A）：按语言分 7 组（classify_language 同口径；空组不进结果即不渲染）。
+    """P6 分组区（流程说明 §2A）：按语言分 12 组（classify_language 同口径；空组不进结果即不渲染）。
 
     组内三态排序：正常行按当周增量降序 → 无增量行（"—— 下周起有数据"）→ dead 行（灰显"已失效"）沉尾；
     组间按组内最大当周增量降序（全是无增量/dead 的组按 0 沉后，稳定排序保持关注先后）。
@@ -636,13 +639,13 @@ def _filter_board_view(view: dict) -> int:
 
 # ===== T-026 单榜整页（§13.1）：board 查询参数解析与边栏整页链接 =====
 
-_BOARD_ALL = "all"  # board=all → 全量 17 榜（保留全量入口，边栏顶部"全部"项）
+_BOARD_ALL = "all"  # board=all → 全量 28 榜（保留全量入口，边栏顶部"全部"项）
 
 
 def _board_key_whitelist(topic_table: dict) -> frozenset[str]:
-    """17 榜 key 白名单（§13.1）：语言 7 + 主题（词表数 + 1），与 compute_boards 返回的 kind-key 同形态。
+    """28 榜 key 白名单（§13.1）：语言 12 + 主题（词表数 + 1），与 compute_boards 返回的 kind-key 同形态。
 
-    词表增删主题时榜数随之变化，白名单动态跟随（不写死 17）。
+    词表/语言集增删时榜数随之变化，白名单动态跟随（不写死 28）。
     """
     keys = [f"language-{k}" for k in (*LANGUAGES.values(), OTHER_LANGUAGE_KEY)]
     keys += [f"topic-{k}" for k in (*topic_table, OTHER_TOPIC_KEY)]
@@ -669,7 +672,7 @@ def _sidebar_items(
     - base/period_query：整页 URL 形态——P1/P2 `/?board=xxx`（历史周携带 `week=...`）、
       P3 `/quarter?board=xxx`（携带 `quarter=...`）、P4 `/total?board=xxx`（无期次）；
     - current：当前榜 key 或 "all"（全量/降级页当前为全部项）；
-    - 结构：顶部"全部"项（样式同 sb-item，灰点色，徽标=榜总数）→ 语言组头 + 7 项 → 主题组头 + 10 项；
+    - 结构：顶部"全部"项（样式同 sb-item，灰点色，徽标=榜总数）→ 语言组头 + 12 项 → 主题组头 + 16 项；
     - 徽标 = 单榜模式非当前榜用 Board.count（只计数不建行），全量模式 len(rows)——两边栏数据同源同语义；
     - hide_tagged（T-038 §18.2）：开关开启时链接追加 hide_tagged=1（跨榜导航不丢开关），关态不带。
     """
@@ -726,8 +729,8 @@ def _boards_context(
     show_sidebar（T-021 §12.1，v2.1 修订）：榜单四页全部 True → 模板以左侧边栏替代顶部 chips 区
     （P4 总星页 v2.1 起纳入，其顶部 chips 与榜头回顶部随之移除）。
 
-    board（T-026 §13.1）：board 查询参数解析结果——"all" 全量 17 榜；具体榜 key 单榜模式
-    （当前榜查全内容，其余 15 榜只 count 喂边栏徽标）；缺省/非法已静默降级为默认首榜；
+    board（T-026 §13.1）：board 查询参数解析结果——"all" 全量 28 榜；具体榜 key 单榜模式
+    （当前榜查全内容，其余 27 榜只 count 喂边栏徽标）；缺省/非法已静默降级为默认首榜；
     首期空态降级页维持全量现状（不单榜化），board 参数忽略、当前边栏项为"全部"。
 
     hide_tagged（T-038 §18）：True 时在展示装配层过滤已打标行（三区统一，不动榜单计算与
@@ -741,7 +744,7 @@ def _boards_context(
     try:
         # T-027 榜单预计算：仅当前期次尝试读缓存（week 时 label==当前周标签、quarter 时 label==当前季标签、
         # total 恒当前）；历史期次永远实时算、不查表（其 as_of 与缓存采集时刻不同口径）。
-        # 命中缓存（全量 17 榜、Board.count 恒 None）直接反序列化使用，跳过 compute_boards 全池逐仓 seek；
+        # 命中缓存（全量 28 榜、Board.count 恒 None）直接反序列化使用，跳过 compute_boards 全池逐仓 seek；
         # load 返回 None（三条降级判定任一不过）→ 走原 compute_boards 路径（含 full_keys 单榜收窄），代码保持原样。
         # 单榜模式不需要补 count：模板边栏徽标取 b.count if b.count is not None else len(b.rows)，
         # 缓存 rows 已截 top_n，len(rows)=min(出席数,top_n) 与单榜实时路径的 count 同值，徽标不漂移。
@@ -940,7 +943,7 @@ def quarterly(
 def total(request: Request, board: str | None = None, hide_tagged: str | None = None) -> HTMLResponse:
     """P4 总星榜：最新快照总星数降序 Top 50/榜（T-028：默认 top_n 30→50），无期次概念。
 
-    T-021 §12.1（v2.1 修订）：P4 纳入边栏（实测同为 17 榜长页、HTML 1.7MB 全站最重），
+    T-021 §12.1（v2.1 修订）：P4 纳入边栏（实测同为 28 榜长页、HTML 1.7MB 全站最重），
     其顶部 chips 区与榜头回顶部随边栏到位同步移除（与 P1/P2/P3 一致）。
     T-026 §13.1：?board=xxx 单榜整页（无期次参数）。
     T-038 §18：?hide_tagged=1 隐藏已打标行（仅 "1" 为开）。

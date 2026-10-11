@@ -1,6 +1,6 @@
 """分类器纯函数：语言成榜 + 主题词表匹配（《架构决策记录》§3 决策 3：分类全部本地计算）。
 
-- 语言：6 个指定语言各自成榜（共识文档 §6），其余（含无语言）进"其它语言"；
+- 语言：11 个指定语言各自成榜（共识文档 §6 列举顺序＋新增五语言 C++/C/C#/Kotlin/Swift），其余（含无语言）进"其它语言"；
   匹配用 GitHub primaryLanguage.name 的精确值（首字母大写，如 "TypeScript"），不做模糊匹配；
 - 主题：封闭词表（config/topics.yaml）匹配 repositoryTopics 值（小写 kebab-case）；命中判定带单复数归一
   （决策 3 v2）：词条精确命中、或 topics 值 == 词条＋尾"s" 亦命中——词表只写单数即可覆盖复数 topics；
@@ -16,8 +16,8 @@ from typing import TypedDict
 
 import yaml
 
-# 6 个指定语言：键是 GitHub primaryLanguage.name 的精确匹配名（API 固定首字母大写，故可直接作键），
-# 值是榜单 key（小写）；dict 顺序即榜单展示顺序，与共识文档 §6 列举顺序（Java/Go/Rust/TypeScript/JavaScript/Python）一致。
+# 11 个指定语言：键是 GitHub primaryLanguage.name 的精确匹配名（API 固定首字母大写，故可直接作键），
+# 值是榜单 key（小写）；dict 顺序即榜单展示顺序：共识文档 §6 列举顺序＋新增五语言（C++/C/C#/Kotlin/Swift）。
 LANGUAGES: dict[str, str] = {
     "Java": "java",
     "Go": "go",
@@ -25,6 +25,11 @@ LANGUAGES: dict[str, str] = {
     "TypeScript": "typescript",
     "JavaScript": "javascript",
     "Python": "python",
+    "C++": "cpp",
+    "C": "c",
+    "C#": "csharp",
+    "Kotlin": "kotlin",
+    "Swift": "swift",
 }
 
 OTHER_LANGUAGE_KEY = "other"  # 其它语言榜：未列出的语言与无语言仓库都归这里
@@ -56,7 +61,7 @@ def load_topics(path: Path) -> dict[str, TopicSpec]:
 
 
 def classify_language(language: str | None) -> str:
-    """语言分类：精确匹配 6 个指定语言名返回其小写 key，其余与 None 返回 OTHER_LANGUAGE_KEY。
+    """语言分类：精确匹配 11 个指定语言名返回其小写 key，其余与 None 返回 OTHER_LANGUAGE_KEY。
 
     不做 lower 归一：GitHub 固定返回首字母大写名，出现小写变体说明数据源异常，
     宁可落"其它语言"也不误进指定榜。

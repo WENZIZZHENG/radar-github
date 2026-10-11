@@ -177,14 +177,14 @@ def test_zero_topic_hit_goes_to_other_board(conn, topic_table):
 
 
 def test_other_language_grouping(conn, topic_table):
-    """未列出语言与无语言仓库都归"其它语言"榜，不进 6 个指定语言榜。"""
-    _add_repo(conn, "a/kotlin-app", language="Kotlin", snapshots=[(_iso(7), 100), (_iso(0), 300)])
+    """未列出语言与无语言仓库都归"其它语言"榜，不进 11 个指定语言榜。"""
+    _add_repo(conn, "a/php-app", language="PHP", snapshots=[(_iso(7), 100), (_iso(0), 300)])
     _add_repo(conn, "a/no-lang", language=None, snapshots=[(_iso(7), 100), (_iso(0), 200)])
     _add_repo(conn, "a/java-app", language="Java", snapshots=[(_iso(7), 100), (_iso(0), 150)])
 
     boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
     other_names = [r.full_name for r in _board(boards, "language", "other").rows]
-    assert set(other_names) == {"a/kotlin-app", "a/no-lang"}
+    assert set(other_names) == {"a/php-app", "a/no-lang"}
     for key in LANGUAGES.values():
         rows = _board(boards, "language", key).rows
         expected = ["a/java-app"] if key == "java" else []
@@ -219,12 +219,12 @@ def test_quarter_window(conn, topic_table):
 
 
 def test_boards_structure_and_order(conn, topic_table):
-    """17 张榜齐备、顺序固定：语言 7 张（LANGUAGES 序+其它收尾）后接主题 10 张（词表序+其他收尾）。"""
+    """28 张榜齐备、顺序固定：语言 12 张（LANGUAGES 序+其它收尾）后接主题 16 张（词表序+其他收尾）。"""
     boards = compute_boards(conn, topic_table, period="week", as_of=AS_OF)
-    assert len(boards) == 17
-    assert [(b.kind, b.key) for b in boards[:7]] == [("language", k) for k in (*LANGUAGES.values(), "other")]
-    assert [(b.kind, b.key) for b in boards[7:]] == [("topic", k) for k in (*topic_table, "other")]
-    assert boards[6].label == "其它语言" and boards[-1].label == "其他"
+    assert len(boards) == 28
+    assert [(b.kind, b.key) for b in boards[:12]] == [("language", k) for k in (*LANGUAGES.values(), "other")]
+    assert [(b.kind, b.key) for b in boards[12:]] == [("topic", k) for k in (*topic_table, "other")]
+    assert boards[11].label == "其它语言" and boards[-1].label == "其他"
     # 空库/全缺席时榜仍齐备、行为空列表（页面空态靠它，不抛异常）
     assert all(isinstance(b.rows, list) for b in boards)
 
