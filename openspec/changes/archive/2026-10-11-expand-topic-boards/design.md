@@ -72,6 +72,7 @@
 
 ### 决策 10：增带 language-boards MODIFIED delta，归档顺序钉死三链（2026-10-11 主 agent 拍板，收起草存疑点 2）
 本 change 附 `specs/language-boards/spec.md` MODIFIED delta：把 expand-language-boards 引入的"语言榜集合与展示顺序"要求中"共 22 张/主题组 10 张"更新为"共 28 张/主题组 16 张"（Scenario 同步）。理由：主题榜 10→16 是本 change 的直接后果，language-boards 中引用主题榜数量的表述应随本 change 更新。归档顺序钉死：**topic-wordlist-cleanup → expand-language-boards → expand-topic-boards**——本 change 的两个 MODIFIED delta 分别依赖前两者沉淀的 topic-classification / language-boards 主规格，乱序 archive 会被拒（fail-loud）。
+归档实操留痕：archive 的 MODIFIED 语义按 Scenario 标题集合校验（不许增删 scenario 防静默丢失），change2 的 scenario 标题"22 榜齐备顺序固定"把易变数字写进了标题，导致数字演进时必触发拦截；处置＝主规格与本 delta 的该 scenario 标题同步改为中性"榜齐备顺序固定"（主规格标题改名是文档级小修，正文数字由归档机制从 delta 刷入），此后榜数演进不再触发该校验。
 
 ## Risks / Trade-offs
 
