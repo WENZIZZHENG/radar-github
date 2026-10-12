@@ -40,7 +40,9 @@
 
 ## 3. 子 agent 模型
 
-子 agent 一律继承主会话模型，无模型路由规则；本项目无额外加严或覆盖。
+子 agent 模型路由按全局 `AGENTS.md`「子 agent 路由与执行口径」执行：实施类一律 secondary 起手（当前 `command-code/deepseek-v4.1-flash`），评审与设计类起草一律 primary（k3）；派单绑定核验（wire.jsonl 的 modelAlias/thinkingEffort）、异常切换、并行派单（AgentSwarm）、评审轮次与驮知识库三行等细则均以全局该节为单点。本项目无额外加严或覆盖。
+
+（2026-10-13 本人拍板：由"一律继承主会话模型"改为按全局路由执行。）
 
 ## 4. 验证与评审门禁
 
