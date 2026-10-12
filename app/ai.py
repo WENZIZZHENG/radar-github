@@ -420,7 +420,12 @@ class DeepSeekClient:
             "只输出一个 JSON 对象：键为候选标签原样，值为主题名或“不建议收录”，不要输出其他内容。"
         )
         user = "候选标签：\n" + "\n".join(f"- {t}" for t in terms) + "\n\n现有主题：\n" + "、".join(topic_names)
-        content = await self._chat(system=system, user=user, temperature=0.2)  # 低温度：归类求稳不求发散
+        content = await self._chat(  # 低温度：归类求稳不求发散
+            system=system,
+            user=user,
+            temperature=0.2,
+            response_format={"type": "json_object"},  # 协议层 JSON 约束（第一道防线）
+        )
         parsed = _parse_suggested_topics(content)
         if parsed is None:
             raise DeepSeekError(f"候选主题建议响应解析失败（期望 JSON 对象）：{content[:200]}")
@@ -473,7 +478,12 @@ class DeepSeekClient:
                 "白名单外条件必须放入 unsupported，不得塞进 keywords。"
             )
             user = f"上一轮意图：{json.dumps(prev_intent, ensure_ascii=False)}\n本轮新输入：{query}"
-        content = await self._chat(system=system, user=user, temperature=0.2)  # 低温度：解析求稳
+        content = await self._chat(  # 低温度：解析求稳
+            system=system,
+            user=user,
+            temperature=0.2,
+            response_format={"type": "json_object"},  # 协议层 JSON 约束（第一道防线）
+        )
         return _parse_suggested_topics(content)  # 复用 JSON 容错解析（剥 markdown 围栏 + 大括号截取）；None = 内容非法
 
     async def select_and_reason(self, *, intent_summary: str, candidates: list[dict]) -> dict | None:
@@ -502,11 +512,19 @@ class DeepSeekClient:
             system=system,
             user=f"用户搜索意图：{intent_summary}\n\n候选清单（只许从中选择）：\n" + "\n".join(lines),
             temperature=0.3,  # 与推荐语同值：允许一点措辞空间，但不许发散
+            response_format={"type": "json_object"},  # 协议层 JSON 约束（第一道防线）
         )
         return _parse_suggested_topics(content)
 
-    async def _chat(self, *, system: str, user: str, temperature: float) -> str:
-        """一次 chat/completions 调用：超时/传输错误/5xx/响应畸形重试一次后仍失败 → 抛清晰异常。"""
+    async def _chat(
+        self, *, system: str, user: str, temperature: float, response_format: dict | None = None
+    ) -> str:
+        """一次 chat/completions 调用：超时/传输错误/5xx/响应畸形重试一次后仍失败 → 抛清晰异常。
+
+        response_format 非 None 时透传给 chat.completions.create（JSON 产出方法的协议层约束，
+        第一道防线）；None（缺省）时不传该字段——纯文本方法请求体逐字节不变。端点对该参数报
+        400 时走既有 4xx fail-fast 链，不去参重发（拍板口径，生产网关已实测支持）。
+        """
         # key 在使用点校验（与 GitHubClient 同姿态）：config 层不报错，这里第一刀拦住空 key
         if not self._api_key:
             raise DeepSeekAuthError(
@@ -515,6 +533,9 @@ class DeepSeekClient:
             )
         for attempt in range(self._max_retries + 1):
             try:
+                kwargs: dict = {}
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
                 response = await self._client.chat.completions.create(
                     model=self._model,
                     messages=[
@@ -522,6 +543,7 @@ class DeepSeekClient:
                         {"role": "user", "content": user},
                     ],
                     temperature=temperature,
+                    **kwargs,
                 )
             except AuthenticationError as exc:
                 raise DeepSeekAuthError(

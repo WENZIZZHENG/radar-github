@@ -450,6 +450,128 @@ def test_client_empty_key_fails_before_any_request():
     asyncio.run(client.aclose())
 
 
+# ---------- ai-json-response-format：JSON 产出方法的 response_format 协议层约束（第一道防线） ----------
+
+_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+
+
+def _json_stub_client(captured: list, content: str) -> DeepSeekClient:
+    """构造返回固定 content 的 DeepSeekClient（MockTransport 离线），captured 收集请求 payload。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    return DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
+
+
+def test_suggest_topics_posts_json_response_format():
+    """suggest_topics 请求带 response_format={"type":"json_object"}（协议层 JSON 约束，第一道防线）。"""
+    bodies = []
+    client = _json_stub_client(bodies, '{"fastapi": "Web框架", "python": "Python"}')
+    assert asyncio.run(client.suggest_topics(["fastapi", "python"], ["Web框架", "Python"])) == {
+        "fastapi": "Web框架",
+        "python": "Python",
+    }
+    assert bodies[0]["response_format"] == _JSON_RESPONSE_FORMAT
+    asyncio.run(client.aclose())
+
+
+def test_understand_intent_posts_json_response_format():
+    """understand_intent 请求带 response_format={"type":"json_object"}（首搜与追问同姿态）。"""
+    bodies = []
+    canned = '{"keywords": ["crawler"], "languages": ["Python"], "topics": []}'
+    client = _json_stub_client(bodies, canned)
+    assert asyncio.run(client.understand_intent("爬虫工具")) == {
+        "keywords": ["crawler"],
+        "languages": ["Python"],
+        "topics": [],
+    }
+    assert bodies[0]["response_format"] == _JSON_RESPONSE_FORMAT
+    asyncio.run(client.aclose())
+
+
+def test_select_and_reason_posts_json_response_format():
+    """select_and_reason 请求带 response_format={"type":"json_object"}。"""
+    bodies = []
+    client = _json_stub_client(bodies, '{"results": [{"id": 1, "reason": "匹配意图"}]}')
+    candidates = [{"full_name": "a/one", "description_en": "desc", "language": "Python", "stars": 100}]
+    assert asyncio.run(client.select_and_reason(intent_summary="爬虫", candidates=candidates)) == {
+        "results": [{"id": 1, "reason": "匹配意图"}]
+    }
+    assert bodies[0]["response_format"] == _JSON_RESPONSE_FORMAT
+    asyncio.run(client.aclose())
+
+
+def test_translate_payload_has_no_response_format():
+    """纯文本方法请求体逐字节不变：translate payload 不含 response_format 字段（缺省不传）。"""
+    bodies = []
+    client = _json_stub_client(bodies, "译文本体")
+    assert asyncio.run(client.translate("A fast web framework")) == "译文本体"
+    assert "response_format" not in bodies[0]
+    asyncio.run(client.aclose())
+
+
+def test_suggest_topics_parses_fenced_json():
+    """第二道防线回归：stub 返回 markdown 围栏包裹的合法 JSON，suggest_topics 仍解析正确。"""
+    fenced = '```json\n{"fastapi": "Web框架"}\n```'
+    client = _json_stub_client([], fenced)
+    assert asyncio.run(client.suggest_topics(["fastapi"], ["Web框架"])) == {"fastapi": "Web框架"}
+    asyncio.run(client.aclose())
+
+
+def test_understand_intent_parses_fenced_json():
+    """第二道防线回归：围栏＋前后缀杂质包裹的合法 JSON，understand_intent 仍解析出意图。"""
+    fenced = '以下是结果：\n```json\n{"keywords": ["crawler"], "languages": [], "topics": []}\n```\n供参考'
+    client = _json_stub_client([], fenced)
+    assert asyncio.run(client.understand_intent("爬虫工具")) == {
+        "keywords": ["crawler"],
+        "languages": [],
+        "topics": [],
+    }
+    asyncio.run(client.aclose())
+
+
+def test_select_and_reason_parses_fenced_json():
+    """第二道防线回归：围栏＋前缀杂质包裹的合法 JSON，select_and_reason 仍解析出精选结果。"""
+    fenced = '好的，结果如下\n```\n{"results": [{"id": 1, "reason": "匹配意图"}]}\n```'
+    client = _json_stub_client([], fenced)
+    candidates = [{"full_name": "a/one", "description_en": "desc", "language": "Python", "stars": 100}]
+    assert asyncio.run(client.select_and_reason(intent_summary="爬虫", candidates=candidates)) == {
+        "results": [{"id": 1, "reason": "匹配意图"}]
+    }
+    asyncio.run(client.aclose())
+
+
+def test_response_format_400_fails_fast_without_stripping_param():
+    """端点对 response_format 报 400：按既有 4xx fail-fast 链抛 DeepSeekError，
+    不做"去掉参数重发"自动回退——请求计数 == 1 且首次请求带该参数（拍板口径）。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(400, text="response_format not supported")
+
+    client = DeepSeekClient("k", transport=httpx.MockTransport(handler), sleep=_no_sleep)
+    with pytest.raises(DeepSeekError, match="HTTP 400"):
+        asyncio.run(client.understand_intent("爬虫工具"))
+    assert len(calls) == 1  # 未发起第二次请求（无去参重发）
+    assert calls[0]["response_format"] == _JSON_RESPONSE_FORMAT
+    asyncio.run(client.aclose())
+
+
+def test_invalid_json_degradation_semantics_unchanged():
+    """降级语义回归：非法 JSON 时 understand_intent/select_and_reason 仍返回 None、
+    suggest_topics 仍抛 DeepSeekError（对外行为不变；此前无既有用例覆盖，本条新造）。"""
+    client = _json_stub_client([], "这不是 JSON，无法解析")
+    candidates = [{"full_name": "a/one", "description_en": "desc", "language": "Python", "stars": 100}]
+    assert asyncio.run(client.understand_intent("爬虫工具")) is None
+    assert asyncio.run(client.select_and_reason(intent_summary="爬虫", candidates=candidates)) is None
+    with pytest.raises(DeepSeekError, match="解析失败"):
+        asyncio.run(client.suggest_topics(["fastapi"], ["Web框架"]))
+    asyncio.run(client.aclose())
+
+
 # ---------- ensure_weekly_ai：懒翻译＋推荐理由＋幂等＋降级 ----------
 
 
