@@ -20,8 +20,8 @@
 
 ## 4. 部署后留痕（生产）
 
-- [ ] 4.1 部署重启后在生产对 `understand_intent`（或 `suggest_topics`）发起一次真实调用，留痕：请求带 `response_format`、HTTP 200、返回合法 JSON、耗时/token 对比默认调用；记录进《验收记录.md》或等价留痕位置。
-- [ ] 4.2 若本地 .env.dev free 模型（stealth/glyph-cluster:free）顺手实测该参数，结果如实记录；实测 400 不视为验证失败（拍板口径：不自动回退，换提供方时再议）。
+- [x] 4.1 部署重启后在生产对 `understand_intent`（或 `suggest_topics`）发起一次真实调用，留痕：请求带 `response_format`、HTTP 200、返回合法 JSON、耗时/token 对比默认调用；记录进《验收记录.md》或等价留痕位置。**留痕（2026-10-13，本行为等价留痕位置）**：部署 ef70c79 后服务器真实调用 `understand_intent("我要做爬虫")`（deepseek/deepseek-v4.1-flash，commandcode 网关，经 `_chat` 新代码路径带 json_object）→ **3.8s** 返回合法 JSON `{"keywords": ["crawler","spider","scraping","web-scraping","crawl"], "languages": [], "topics": [...], "filters": {}}`，契约字段齐全；对比同网关默认调用实测 22.7s/1454 reasoning tokens（2026-10-12 留痕），提速约 6 倍。回环冒烟 /、/?board=all、/total、/total?board=all、/follows、/search 全 200。
+- [x] 4.2 若本地 .env.dev free 模型（stealth/glyph-cluster:free）顺手实测该参数，结果如实记录；实测 400 不视为验证失败（拍板口径：不自动回退，换提供方时再议）。**留痕（2026-10-13）**：未实测——该 free 模型上游 2026-10-12 起持续 408（"Upstream model provider is temporarily unavailable"），按拍板口径不视为验证失败；本地开发期该模型恢复后若对 response_format 报 400，按决策 2 走既有错误链、不自动回退。
 
 ## Workflow follow-up
 
