@@ -349,7 +349,7 @@ def _seed_follows(conn):
             conn.execute("UPDATE repos SET dead = 1 WHERE id = ?", (repo_id,))
         conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, ?)", (repo_id, f"2026-08-0{i + 1}T00:00:00Z"))
     conn.execute("INSERT INTO tags (repo_id, tag) VALUES ((SELECT id FROM repos WHERE full_name = 'f/ts-hot'), '选型观察')")
-    # T-021 §12.2：未关注仓上的标签也进筛选 chips（0 计数，供空态演示）——不影响 P6 行集与关注计数
+    # T-021 §12.2（2026-10-12 收窄）：未关注仓上的标签不进筛选行——断言 'AI' chip 不出现
     repo_nf = _add_repo(
         conn, "f/nf", language="Rust", description_en="not followed",
         snapshots=[(_iso_ago(days=7), 10), (_iso_ago(hours=1), 12)],
@@ -864,15 +864,16 @@ def test_total_page_keeps_chips_and_top_links(client):
 
 
 def test_follows_filter_row_and_data_tags(follows_client):
-    """P6 筛选行（§12.2）：'全部'带关注总数（默认选中）；各标签 chip 带关注仓计数（0 也列出，字典序）；
-    行根带 data-tags 供客户端筛选；空态元素初始隐藏。"""
+    """P6 筛选行（§12.2，2026-10-12 收窄）：'全部'带关注总数（默认选中）；仅列出关注仓上实际打过、
+    计数 > 0 的标签 chip（字典序）；行根带 data-tags 供客户端筛选；空态元素初始隐藏。"""
     text = follows_client.get("/follows").text
     assert '<div class="tag-filter"' in text
     assert '<span class="grp">标签筛选</span>' in text
     assert '<button type="button" class="fchip on" data-tag="">全部<i>5</i></button>' in text
-    assert '<button type="button" class="fchip" data-tag="AI">AI<i>0</i></button>' in text  # 未关注仓标签：0 也列出
+    assert 'class="fchip" data-tag="AI"' not in text  # 未关注仓上的标签：0 计数不再列出
     assert '<button type="button" class="fchip" data-tag="选型观察">选型观察<i>1</i></button>' in text
-    assert text.index('data-tag="AI"') < text.index('data-tag="选型观察"')  # 字典序
+    # "全部"之后紧跟唯一标签 chip（只剩一个标签 chip，无字典序可断）
+    assert text.index('class="fchip on" data-tag=""') < text.index('class="fchip" data-tag="选型观察"')
     # f/ts-hot 行（客户端筛选数据源；tojson|forceescape JSON 数组编码——实测形态：中文 \uXXXX 转义、引号 &#34;）
     assert f'data-tags="{json.dumps(["选型观察"]).replace(chr(34), "&#34;")}"' in text
     assert text.count('data-tags="[]"') == 4  # 其余四行无标签

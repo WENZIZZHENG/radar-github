@@ -971,7 +971,8 @@ def follows_page(request: Request) -> HTMLResponse:
     """P6 我的关注（v1.3 独立页）：关注仓库按语言分组，增量与当期周报同窗口（as_of=now 周口径）。
 
     无期次概念（不跟周次切换走）；空关注时渲染空态引导（流程说明 §4），分组/排序口径在 _follow_groups。
-    T-021 §12.2：filter_tags = 我的全部标签（含 0 计数，字典序），供页内客户端筛选 chips。
+    T-021 §12.2（2026-10-12 收窄）：filter_tags = 关注仓上实际打过的标签（计数 > 0，字典序），
+    供页内客户端筛选 chips；0 计数不列出（页内取消关注联动致计数归零时的空态由 radar.js 处理）。
     """
     now = datetime.now(timezone.utc)
     conn = get_conn()
@@ -984,13 +985,13 @@ def follows_page(request: Request) -> HTMLResponse:
         # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块；
         # T-024：概要固定取 ('summary', 'all')（文档视角，全页面同一条），缺则该行无概要块
         reasons, zh, tags, summaries = _display_maps(conn, dimension="total", period_label="all")
-        # T-021 §12.2 筛选 chips：我的全部标签各自带"关注仓中打该标签的数量"（LEFT JOIN follows，
-        # 0 计数也要列出供空态演示）；按标签名字典序（与 _all_tags 同口径 ORDER BY tag）
+        # T-021 §12.2 筛选 chips（2026-10-12 收窄）：仅关注仓上实际打过的标签（INNER JOIN follows，
+        # 计数 > 0 才列出）；按标签名字典序（与 _all_tags 同口径 ORDER BY tag）
         filter_tags = [
             {"tag": r["tag"], "count": r["n"]}
             for r in conn.execute(
-                "SELECT t.tag AS tag, COUNT(f.repo_id) AS n FROM tags t"
-                " LEFT JOIN follows f ON f.repo_id = t.repo_id GROUP BY t.tag ORDER BY t.tag"
+                "SELECT t.tag AS tag, COUNT(*) AS n FROM tags t"
+                " JOIN follows f ON f.repo_id = t.repo_id GROUP BY t.tag ORDER BY t.tag"
             )
         ]
         return templates.TemplateResponse(
@@ -1002,7 +1003,7 @@ def follows_page(request: Request) -> HTMLResponse:
                 "title": "我的关注",
                 "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
                 "follow_count": len(follow_rows),
-                "filter_tags": filter_tags,  # T-021：标签筛选行数据（含 0 计数）
+                "filter_tags": filter_tags,  # T-021：标签筛选行数据（仅关注仓实际标签，计数 > 0）
                 "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
                 "groups": _follow_groups(cards, reasons, zh, tags, summaries),
             },
