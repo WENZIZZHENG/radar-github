@@ -15,6 +15,9 @@
   （created:>/stars:>=，不占 5 个布尔运算符预算）；池外行 external=True，展示 GitHub 原始描述、无增星/译文/概要；
   失败/限速/token 缺失 → 跳过补搜（池内照常，页面标注）；
 - 空结果如实说明，不硬编任何条目；候选集永远来自真实池子/GitHub 真实响应。
+- 流式加载态（T-041，§17.5）：`run_search` 增可选 `progress_cb`/`thinking_cb`（阶段事件与思维链
+  增量旁路观察），缺省 None 时行为与未插桩现状完全一致；同步 POST /search 与流式 POST /search/stream
+  跑同一本函数、渲染同一结果区 partial——两条路径结果语义唯一由构造保证。
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -296,13 +300,18 @@ def recall_candidates(conn: sqlite3.Connection, intent: Intent) -> list[Candidat
 
 
 async def _select_with_ai(
-    ai_client: DeepSeekClient, intent: Intent, candidates: list[Candidate]
+    ai_client: DeepSeekClient,
+    intent: Intent,
+    candidates: list[Candidate],
+    *,
+    thinking_cb: Callable[[str], None] | None = None,
 ) -> list[PoolHit]:
     """LLM 精选（spec 决策 3）：候选 → 至多 20 条 + 理由，按 LLM 返回的匹配度顺序保持。
 
     解析失败/超范围编号/理由形态非法 → 整体退化按粗排顺序直出（无理由）记 WARNING——LLM 只许从
     候选清单中按编号选择，任何一个非法引用都说明本轮输出不可信（防幻觉口径，spec 钉死整体退化）。
     DeepSeekAuthError 直通（路由层映射"搜索暂不可用"）；其余调用失败同退化口径（任务书 2.3）。
+    thinking_cb（T-041）：缺省 None 走既有同步调用，非 None 由 ai_client 走流式变体（透传）。
     """
     if not candidates:
         return []
@@ -323,7 +332,12 @@ async def _select_with_ai(
         return [PoolHit(c, None) for c in candidates[:RESULT_LIMIT]]
 
     try:
-        parsed = await ai_client.select_and_reason(intent_summary=summary, candidates=payload)
+        select_kwargs: dict[str, Any] = {}
+        if thinking_cb is not None:
+            select_kwargs["thinking_cb"] = thinking_cb
+        parsed = await ai_client.select_and_reason(
+            intent_summary=summary, candidates=payload, **select_kwargs
+        )
     except DeepSeekAuthError:
         raise  # 账户类确定性错误：路由层映射"搜索暂不可用"（与意图理解段同姿态）
     except Exception as exc:  # DeepSeekError（超时/5xx/畸形响应）：任务书 2.3 精选失败退化粗排直出
@@ -421,6 +435,8 @@ async def run_search(
     *,
     prev_intent: Intent | None = None,
     log: logging.Logger | None = None,
+    progress_cb: Callable[[dict], None] | None = None,
+    thinking_cb: Callable[[str, str], None] | None = None,
 ) -> SearchResult:
     """完整检索链路（spec 决策 1/6）：意图理解 → 池内召回粗排 → LLM 精选 →（不足 20）池外补搜。
 
@@ -433,8 +449,21 @@ async def run_search(
       单关键词继续池内检索；
     - 精选段——AuthError 直通不可用；其余失败 → 粗排直出（无理由）记 WARNING；
     - 补搜段——任何异常 → 跳过补搜，external_failed=True（池内结果照常，页面如实标注）。
+
+    插桩（T-041，设计决策 6，均为旁路观察、不改链路语义）：
+    - progress_cb：阶段事件回调，四阶段边界各发一次——`{"type": "stage", "stage": "intent"|"recall"|
+      "select"|"external", "state": "start"|"done"|"skip"|"failed"}`；补搜阶段如实区分"跳过（池内已足
+      20 条）/执行/失败跳过"，不伪造进度；阶段回调抛出的异常直接上抛（调用方自行保证不抛）；
+    - thinking_cb：两段 LLM 调用的思维链增量，签名 `(stage, delta)`（stage 取 intent/select），
+      非 None 时两段调用走流式变体（传 None 的调用方请求形态逐字节不变）；
+    - 缺省 None 时本函数行为与未插桩现状完全一致（同步路由不传参，零回归面）。
     """
     log = log or logger
+
+    def emit(stage: str, state: str) -> None:
+        if progress_cb is not None:
+            progress_cb({"type": "stage", "stage": stage, "state": state})
+
     ai_kwargs: dict[str, Any] = {}
     if prev_intent is not None:
         ai_kwargs["prev_intent"] = {
@@ -444,13 +473,19 @@ async def run_search(
             "filters": prev_intent.filters,
             "unsupported": prev_intent.unsupported,
         }
+    if thinking_cb is not None:
+        ai_kwargs["thinking_cb"] = lambda delta: thinking_cb("intent", delta)
+    emit("intent", "start")
     try:
         parsed = await ai_client.understand_intent(raw_query, **ai_kwargs)
     except DeepSeekAuthError as exc:
+        emit("intent", "failed")
         return SearchResult(unavailable=True, unavailable_reason=str(exc))
     except DeepSeekError as exc:
+        emit("intent", "failed")
         log.warning("智能搜索意图理解调用失败，搜索暂不可用：%s", exc)
         return SearchResult(unavailable=True, unavailable_reason=str(exc))
+    emit("intent", "done")
     if parsed is None:
         log.warning(
             "智能搜索%s返回非法 JSON，退化为%s单关键词：%r",
@@ -462,15 +497,22 @@ async def run_search(
     else:
         intent = _build_intent(raw_query, parsed)
 
+    emit("recall", "start")
     candidates = recall_candidates(conn, intent)
+    emit("recall", "done")
+    emit("select", "start")
+    select_thinking = None if thinking_cb is None else lambda d: thinking_cb("select", d)
     try:
-        pool_hits = await _select_with_ai(ai_client, intent, candidates)
+        pool_hits = await _select_with_ai(ai_client, intent, candidates, thinking_cb=select_thinking)
     except DeepSeekAuthError as exc:
+        emit("select", "failed")
         return SearchResult(unavailable=True, unavailable_reason=str(exc))
+    emit("select", "done")
 
     external_hits: list[ExternalHit] = []
     external_failed = False
     if len(pool_hits) < RESULT_LIMIT:
+        emit("external", "start")
         try:
             external_hits = await search_external(
                 conn, github_client, intent, RESULT_LIMIT - len(pool_hits)
@@ -478,6 +520,11 @@ async def run_search(
         except Exception as exc:  # 限速/5xx/token 缺失等：跳过补搜，池内照常（spec 决策 4）
             log.warning("智能搜索池外补搜失败，跳过补搜（仅展示池内结果）：%s", exc)
             external_failed = True
+            emit("external", "failed")
+        else:
+            emit("external", "done")
+    else:
+        emit("external", "skip")  # 池内已足 20 条：如实标注跳过，不伪造成执行中/已完成
     return SearchResult(
         intent=intent,
         pool_hits=pool_hits,

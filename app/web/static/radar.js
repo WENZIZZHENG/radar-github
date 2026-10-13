@@ -1220,14 +1220,207 @@ document.addEventListener("keydown", (e) => {
 
 // ---- T-034 P8 搜索提交（§17.2 加载态）：表单同步提交（服务端 SSR 结果页），提交瞬间按钮置灰
 // "搜索中…"防连点——页面导航后无需恢复；输入为空由浏览器 required 拦截（此处防御不置灰） ----
+// T-041（§17.5）流式化：能力齐备时改为 fetch 读 NDJSON 流，进度面板实时渲染；无流式能力时本段
+// 不拦截（原生提交，现状行为）；流中途失败按设计决策 7 收敛回原生提交自动重跑一次。
+// 进度面板/思考区 HTML 由本段渲染（原型 T041 提案样式已迁 radar.css），结果区由服务端 SSR 片段
+// 整体替换（前端零行模板）；radar.js 行交互是 document 级事件委托，innerHTML 注入零重绑。
+const SEARCH_STAGE_LABELS = { intent: "理解意图", recall: "池内召回", select: "AI 精选", external: "补搜 GitHub" };
+// 服务端阶段态 → 步骤条 CSS 类（radar.css 的 .sp-step.active/.done/.skip/.failed 三态＋两退化态；
+// 服务端语义态名只走协议，类名映射在 JS 侧单点，二者一一对应——含未开始的空串态）
+const SEARCH_STEP_CLASS = { start: "active", done: "done", skip: "skip", failed: "failed" };
+
+function renderSearchProgress(box) {
+  box.textContent = "";
+  const panel = document.createElement("div");
+  panel.className = "search-progress";
+  panel.setAttribute("aria-live", "polite");
+  const steps = document.createElement("div");
+  steps.className = "sp-steps";
+  for (const stage of Object.keys(SEARCH_STAGE_LABELS)) {
+    const step = document.createElement("div");
+    step.className = "sp-step";
+    step.dataset.step = stage;
+    const dot = document.createElement("span");
+    dot.className = "sp-dot";
+    dot.textContent = String(steps.children.length + 1);
+    const label = document.createElement("span");
+    label.className = "sp-label";
+    label.textContent = SEARCH_STAGE_LABELS[stage];
+    step.append(dot, label);
+    steps.appendChild(step);
+  }
+  panel.appendChild(steps);
+  box.appendChild(panel);
+}
+
+function setSearchStep(box, stage, state) {
+  const step = box.querySelector(`.sp-step[data-step="${stage}"]`);
+  if (!step) return;
+  step.dataset.state = state || ""; // 记录服务端语义态：result 帧只补标"进行中未收尾"的阶段（不覆盖 skip/failed）
+  step.className = "sp-step" + (SEARCH_STEP_CLASS[state] ? " " + SEARCH_STEP_CLASS[state] : "");
+  step.querySelector(".sp-dot").textContent = state === "done" ? "✓" : state === "skip" ? "—" : String([...step.parentNode.children].indexOf(step) + 1);
+  const pre = box.querySelector(`.th-sec[data-stage="${stage}"] .th-text`);
+  if (pre && state !== "start") pre.classList.remove("streaming"); // 该段思考收尾：去流式光标
+}
+
+// 首条思维链增量才创建思考区（无 reasoning 字段 → 整区不渲染，不报错、不留空架）
+function appendSearchThinking(box, stage, delta) {
+  const panel = box.querySelector(".search-progress");
+  if (!panel) return;
+  let details = panel.querySelector("details.thinking");
+  if (!details) {
+    details = document.createElement("details");
+    details.className = "thinking";
+    details.open = true;
+    const summary = document.createElement("summary");
+    summary.textContent = "AI 思考过程 ";
+    const hint = document.createElement("span");
+    hint.className = "th-hint";
+    hint.textContent = "模型思维链英文原文，如实显示 · 完成后可折叠";
+    summary.appendChild(hint);
+    details.appendChild(summary);
+    panel.appendChild(details);
+  }
+  let sec = details.querySelector(`.th-sec[data-stage="${stage}"]`);
+  if (!sec) {
+    sec = document.createElement("div");
+    sec.className = "th-sec";
+    sec.dataset.stage = stage;
+    const title = document.createElement("div");
+    title.className = "th-sec-title";
+    title.textContent = stage === "intent" ? "意图理解" : "精选";
+    const pre = document.createElement("pre");
+    pre.className = "th-text streaming";
+    sec.append(title, pre);
+    details.appendChild(sec);
+  }
+  const pre = sec.querySelector(".th-text");
+  pre.textContent += delta;
+  pre.scrollTop = pre.scrollHeight; // 自动滚到底（原型口径）
+}
+
+// 追问隐藏字段写回（无状态回传口径不变）：首搜页面模板不渲染这两个 hidden（search.html 的
+// `{% if search %}` 条件块），而流式路径不整页重载——字段缺失时必须动态创建挂进表单，
+// 否则写回静默丢失、下一轮追问带不上上下文（同步路径靠整页 SSR 天然重渲染，不受此影响）。
+function writeSearchHidden(form, name, value) {
+  let input = form.querySelector(`input[name="${name}"]`);
+  if (!input) {
+    input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    form.appendChild(input);
+  }
+  input.value = value == null ? "" : String(value);
+}
+
+// 流失败收敛（决策 7）：如实提示＋原生表单提交重跑（自动重跑仅一次的结构性保证见下）；不渲染半成品结果
+function failSearchStream(form, btn, box, onManualRetry) {
+  box.textContent = "";
+  const fail = document.createElement("div");
+  fail.className = "stream-fail";
+  fail.setAttribute("role", "status");
+  fail.textContent = "流式连接中断，已自动以普通方式重跑本次搜索（结果不变，仅无过程显示）。";
+  const sub = document.createElement("div");
+  sub.className = "sf-sub";
+  sub.textContent = "再次失败时请手动重新提交 · 半成品结果不展示";
+  fail.appendChild(sub);
+  box.appendChild(fail);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "搜索中…";
+  }
+  try {
+    // 原生提交（form.submit() 不再触发 submit 监听）→ 整页导航走同步 POST：本页 JS 状态随之销毁，
+    // 同一页面不可能再发起第二次流式尝试——"自动重跑仅一次"由此结构性成立，无需重试计数
+    form.submit();
+  } catch (err) {
+    // 极端情况（原生提交不可用）：停留提示，由用户手动重试
+    toast("流式连接中断，请手动重新提交", true);
+    if (onManualRetry) onManualRetry();
+  }
+}
+
+async function* readNdjsonLines(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line) yield JSON.parse(line);
+    }
+  }
+  buffer += decoder.decode();
+  const tail = buffer.trim();
+  if (tail) yield JSON.parse(tail);
+}
+
 (() => {
   const form = document.getElementById("search-form");
   if (!form) return;
-  form.addEventListener("submit", () => {
-    const input = form.querySelector('input[name="q"]');
-    const btn = form.querySelector("#search-btn");
-    if (!btn || !input || !input.value.trim()) return; // 空输入（required 兜底）或不可用态：不置灰
+  const input = form.querySelector('input[name="q"]');
+  const btn = form.querySelector("#search-btn");
+  const progressBox = document.getElementById("search-progress");
+  const resultBox = document.getElementById("search-result");
+  const supportStream = typeof window.fetch === "function" && typeof window.ReadableStream === "function";
+
+  function restoreSubmitState() {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = "搜索";
+    if (input) input.disabled = false;
+  }
+
+  form.addEventListener("submit", (e) => {
+    // 降级②：无流式能力 / 无挂载点 / 输入为空（required 兜底）→ 不拦截，走原生提交（现状行为）
+    if (!supportStream || !progressBox || !resultBox || !input || !btn || !input.value.trim()) {
+      if (btn && input && input.value.trim()) {
+        btn.disabled = true;
+        btn.textContent = "搜索中…";
+      }
+      return;
+    }
+    e.preventDefault();
+    if (btn.disabled) return; // 防连点（按钮态与现状一致：提交即置灰"搜索中…"）
+    runStreamSearch();
+  });
+
+  async function runStreamSearch() {
     btn.disabled = true;
     btn.textContent = "搜索中…";
-  });
+    renderSearchProgress(progressBox);
+    let gotResult = false;
+    try {
+      const resp = await fetch("/search/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: new URLSearchParams(new FormData(form)).toString(),
+      });
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      for await (const ev of readNdjsonLines(resp.body)) {
+        if (ev.type === "stage") setSearchStep(progressBox, ev.stage, ev.state);
+        else if (ev.type === "thinking") appendSearchThinking(progressBox, ev.stage, ev.delta);
+        else if (ev.type === "result") {
+          gotResult = true;
+          resultBox.innerHTML = ev.html; // 服务端 SSR 片段（与同步路径同 partial），前端零行模板
+          writeSearchHidden(form, "prev_intent", ev.prev_intent); // 追问无状态回传口径不变
+          writeSearchHidden(form, "prev_results", ev.prev_results);
+          // 只补标"进行中未收尾"的步骤为已完成；skip（无需补搜）/failed（失败跳过）保持如实终态
+          for (const stage of Object.keys(SEARCH_STAGE_LABELS)) {
+            const step = progressBox.querySelector(`.sp-step[data-step="${stage}"]`);
+            if (step && step.dataset.state === "start") setSearchStep(progressBox, stage, "done");
+          }
+        }
+      }
+      if (!gotResult) throw new Error("结果事件未到达即断流");
+      restoreSubmitState();
+    } catch (err) {
+      failSearchStream(form, btn, progressBox, restoreSubmitState);
+    }
+  }
 })();

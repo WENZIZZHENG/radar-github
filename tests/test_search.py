@@ -46,24 +46,45 @@ class FakeSearchAI:
 
     intent：dict（正常）/ None（内容非法 JSON）；intent_error：异常（调用失败/Auth，正常时 None）；
     select：dict（正常）/ None（解析失败）；select_error：异常。记录调用供断言。
+    intent_thinking/select_thinking（T-041 流式）：非空时按段喂 thinking_cb 并记录
+    thinking_calls（"stage:文本" 序列），模拟真 client 的流式思维链下发。
     """
 
-    def __init__(self, intent=None, select=None, intent_error=None, select_error=None):
+    def __init__(
+        self,
+        intent=None,
+        select=None,
+        intent_error=None,
+        select_error=None,
+        intent_thinking=(),
+        select_thinking=(),
+    ):
         self._intent = intent
         self._select = select
         self._intent_error = intent_error
         self._select_error = select_error
+        self._intent_thinking = list(intent_thinking)
+        self._select_thinking = list(select_thinking)
         self.intent_calls: list[str] = []
         self.select_calls: list[dict] = []
+        self.thinking_calls: list[str] = []
 
-    async def understand_intent(self, query: str, *, prev_intent=None):
+    async def understand_intent(self, query: str, *, prev_intent=None, thinking_cb=None):
         self.intent_calls.append((query, prev_intent))
+        if thinking_cb is not None:
+            for delta in self._intent_thinking:
+                thinking_cb(delta)
+                self.thinking_calls.append("intent:" + delta)
         if self._intent_error is not None:
             raise self._intent_error
         return self._intent
 
-    async def select_and_reason(self, *, intent_summary, candidates):
+    async def select_and_reason(self, *, intent_summary, candidates, thinking_cb=None):
         self.select_calls.append(candidates)
+        if thinking_cb is not None:
+            for delta in self._select_thinking:
+                thinking_cb(delta)
+                self.thinking_calls.append("select:" + delta)
         if self._select_error is not None:
             raise self._select_error
         return self._select
@@ -1043,3 +1064,422 @@ def test_search_post_prev_intent_filters_parsed(search_env):
         # 合并调用携带的 prev_intent 含 filters/unsupported（即使为空对象/数组）
         assert follow_ai.intent_calls[0][1]["filters"] == {}
         assert follow_ai.intent_calls[0][1]["unsupported"] == []
+
+
+# ---------- T-041 搜索流式加载态：run_search 插桩时序（任务 2.4）与 /search/stream 端点（2.5/2.6） ----------
+
+
+def _stage_events(events: list[dict]) -> list[tuple[str, str]]:
+    """从回调事件序列筛出阶段事件（stage, state）——时序断言用。"""
+    return [(e["stage"], e["state"]) for e in events if e.get("type") == "stage"]
+
+
+def _seed_pool_one(conn):
+    """链路级用例种子：池内 1 仓（Python 爬虫，带翻译/标签/概要/关注态），供 page 层之外的 run_search 用例复用。"""
+    rid = _add_repo(conn, "a/crawler", description_en="web scraping framework", topics=["ai"], stars=1200)
+    conn.execute("UPDATE repos SET description_zh = '爬虫框架译文' WHERE id = ?", (rid,))
+    conn.execute("INSERT INTO tags (repo_id, tag) VALUES (?, '选型观察')", (rid,))
+    conn.execute(
+        "INSERT INTO recommendations (repo_id, dimension, period_label, text, readme_sha, generated_week)"
+        " VALUES (?, 'summary', 'all', '概要文本', NULL, '2026-W32')",
+        (rid,),
+    )
+    conn.execute("INSERT INTO follows (repo_id, created_at) VALUES (?, '2026-08-01T00:00:00Z')", (rid,))
+    conn.commit()
+
+
+def test_run_search_progress_events_execute_and_skip(tmp_path):
+    """阶段事件时序：执行补搜＝external start/done；池内已足 20 条＝external skip（如实标注不伪造成进行中）。"""
+    conn = _open_db(tmp_path)
+    _seed_pool_one(conn)
+    ai = FakeSearchAI(intent={"keywords": ["crawler"], "languages": [], "topics": []}, select={"results": [{"id": 1, "reason": "r"}]})
+    events: list[dict] = []
+    result = asyncio.run(
+        run_search(
+            conn,
+            ai,
+            FakeSearchGitHub(pages=[[make_search_item("b/outside")]]),
+            "爬虫",
+            progress_cb=events.append,
+        )
+    )
+    assert [e["type"] for e in events] == ["stage"] * 8  # 四阶段各起止（补搜执行）
+    assert _stage_events(events) == [
+        ("intent", "start"),
+        ("intent", "done"),
+        ("recall", "start"),
+        ("recall", "done"),
+        ("select", "start"),
+        ("select", "done"),
+        ("external", "start"),
+        ("external", "done"),
+    ]
+    assert result.pool_hits and result.external_hits  # 结果照常
+
+    # 池内已足 20 条：补搜跳过态（不出现 external start）
+    conn2 = _open_db(tmp_path / "two")
+    for i in range(20):
+        _add_repo(conn2, f"a/r{i:02d}", description_en="crawler framework")
+    conn2.commit()
+    ai20 = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": i, "reason": "r"} for i in range(1, 21)]},
+    )
+    events20: list[dict] = []
+    gh20 = FakeSearchGitHub(pages=[[make_search_item("b/outside")]])
+    result20 = asyncio.run(run_search(conn2, ai20, gh20, "爬虫", progress_cb=events20.append))
+    assert len(result20.pool_hits) == 20
+    assert gh20.calls == []  # 补搜未触发（真实跳过）
+    assert ("external", "skip") in _stage_events(events20)
+    assert ("external", "start") not in _stage_events(events20)
+    conn.close()
+    conn2.close()
+
+
+def test_run_search_progress_events_degraded_paths(tmp_path):
+    """降级路径事件如实：精选调用失败（粗排直出）仍 select done；补搜失败 external failed；
+    意图理解失败 intent failed 且不产生后续阶段事件。"""
+    conn = _open_db(tmp_path)
+    _seed_pool_one(conn)
+    ai_fallback = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []}, select_error=DeepSeekError("boom")
+    )
+    events: list[dict] = []
+    result = asyncio.run(run_search(conn, ai_fallback, FakeSearchGitHub(pages=[[]]), "爬虫", progress_cb=events.append))
+    assert result.pool_hits  # 粗排直出
+    assert result.pool_hits[0].reason is None
+    assert ("select", "done") in _stage_events(events)
+
+    events2: list[dict] = []
+    ai_ok = FakeSearchAI(intent={"keywords": ["crawler"], "languages": [], "topics": []}, select={"results": [{"id": 1, "reason": "r"}]})
+    result2 = asyncio.run(
+        run_search(conn, ai_ok, FakeSearchGitHub(error=GitHubError("限速")), "爬虫", progress_cb=events2.append)
+    )
+    assert result2.external_failed is True
+    assert ("external", "failed") in _stage_events(events2)
+
+    events3: list[dict] = []
+    ai_down = FakeSearchAI(intent_error=DeepSeekError("调用失败"))
+    result3 = asyncio.run(run_search(conn, ai_down, FakeSearchGitHub(pages=[[]]), "爬虫", progress_cb=events3.append))
+    assert result3.unavailable is True
+    assert _stage_events(events3) == [("intent", "start"), ("intent", "failed")]  # 不产生后续阶段事件
+
+    events4: list[dict] = []
+    ai_auth = FakeSearchAI(intent_error=DeepSeekAuthError("key 无效"))
+    result4 = asyncio.run(run_search(conn, ai_auth, FakeSearchGitHub(pages=[[]]), "爬虫", progress_cb=events4.append))
+    assert result4.unavailable is True
+    assert ("intent", "failed") in _stage_events(events4)
+    conn.close()
+
+
+def test_run_search_optional_callbacks_default_none_no_events(tmp_path):
+    """缺省 None 零回归（任务 2.4/决策 6）：不传 progress_cb/thinking_cb 时无事件产生、
+    thinking_cb 亦不进两段调用（假 client 未收到 thinking_cb，行为与插桩前一致）。"""
+    conn = _open_db(tmp_path)
+    _seed_pool_one(conn)
+    ai = FakeSearchAI(intent={"keywords": ["crawler"], "languages": [], "topics": []}, select={"results": [{"id": 1, "reason": "r"}]})
+    result = asyncio.run(run_search(conn, ai, FakeSearchGitHub(pages=[[]]), "爬虫"))
+    assert result.pool_hits and result.pool_hits[0].reason == "r"
+    assert ai.thinking_calls == []  # 缺省不触发流式路径
+
+
+def test_run_search_thinking_cb_wired_to_both_llm_stages(tmp_path):
+    """thinking_cb 透传两段调用：意图理解段标 intent、精选段标 select，增量原样上抛。"""
+    conn = _open_db(tmp_path)
+    _seed_pool_one(conn)
+    ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+        intent_thinking=["想关键词…"],
+        select_thinking=["挑第 1 条"],
+    )
+    seen: list[tuple[str, str]] = []
+    asyncio.run(
+        run_search(
+            conn,
+            ai,
+            FakeSearchGitHub(pages=[[]]),
+            "爬虫",
+            thinking_cb=lambda stage, delta: seen.append((stage, delta)),
+        )
+    )
+    assert seen == [("intent", "想关键词…"), ("select", "挑第 1 条")]
+
+
+def test_search_stream_ndjson_event_sequence(search_env):
+    """流式端点（任务 2.5）：NDJSON 逐行可解析；stage/thinking/result 次序正确；
+    result 事件 HTML 含意图透明行与结果行（_row.html 形态）、prev_intent/prev_results 合法 JSON。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    ai = FakeSearchAI(
+        intent={"keywords": ["crawler", "scraping"], "languages": ["Python"], "topics": []},
+        select={"results": [{"id": 1, "reason": "最成熟的 Python 爬虫框架。"}]},
+        intent_thinking=["The user wants ", "a crawler."],
+        select_thinking=["Candidate 1 fits best."],
+    )
+    gh = FakeSearchGitHub(pages=[[make_search_item("b/outside", description="external crawler", stars=8000)]])
+    with _web_client(search_env, ai, gh) as client:
+        resp = client.post("/search/stream", data={"q": "我要做爬虫"})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+    app.dependency_overrides.clear()
+    types = [e["type"] for e in events]
+    assert types[-1] == "result" and types.count("result") == 1
+    assert _stage_events(events) == [
+        ("intent", "start"),
+        ("intent", "done"),
+        ("recall", "start"),
+        ("recall", "done"),
+        ("select", "start"),
+        ("select", "done"),
+        ("external", "start"),
+        ("external", "done"),
+    ]
+    thinking = [e for e in events if e["type"] == "thinking"]
+    assert [(e["stage"], e["delta"]) for e in thinking] == [
+        ("intent", "The user wants "),
+        ("intent", "a crawler."),
+        ("select", "Candidate 1 fits best."),
+    ]
+    assert types.index("thinking") < types.index("result")  # 思维链先于结果帧
+    final = events[-1]
+    assert "理解为：" in final["html"] and "crawler" in final["html"]
+    assert 'title="a/crawler"' in final["html"] and 'class="row' in final["html"]
+    assert "最成熟的 Python 爬虫框架。" in final["html"] and "b/outside" in final["html"]
+    assert json.loads(final["prev_intent"])["keywords"] == ["crawler", "scraping"]
+    assert [row["full_name"] for row in json.loads(final["prev_results"])] == ["a/crawler", "b/outside"]
+
+
+def test_search_stream_no_thinking_events_when_model_lacks_reasoning(search_env):
+    """无 reasoning 字段退化（任务 2.5/决策 4）：零 thinking 事件，阶段与结果照常（前端因此不渲染思考区）。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        events = [json.loads(line) for line in client.post("/search/stream", data={"q": "爬虫"}).text.splitlines() if line.strip()]
+    app.dependency_overrides.clear()
+    assert [e for e in events if e["type"] == "thinking"] == []
+    assert events[-1]["type"] == "result"
+
+
+def test_search_stream_unavailable_renders_notice_fragment(search_env):
+    """执行期 AI 不可用：result 帧仍下发（走同一 partial 的"搜索暂不可用"分支），与同步路径同形态。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    ai = FakeSearchAI(intent_error=DeepSeekAuthError("key 无效"))
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        events = [json.loads(line) for line in client.post("/search/stream", data={"q": "爬虫"}).text.splitlines() if line.strip()]
+    app.dependency_overrides.clear()
+    assert ("intent", "failed") in _stage_events(events)
+    assert events[-1]["type"] == "result"
+    assert "搜索暂不可用：key 无效" in events[-1]["html"]
+
+
+def test_search_stream_follow_up_empty_keeps_previous_results(search_env):
+    """追问搜空：流式 result 帧与同步路径同分支——保留上一轮结果区＋意图对比，prev_* 与展示行一致。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    first_ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, first_ai, FakeSearchGitHub(pages=[[]])) as client:
+        first = client.post("/search/stream", data={"q": "爬虫"}).text
+    app.dependency_overrides.clear()
+    first_result = json.loads([line for line in first.splitlines() if line.strip()][-1])
+    # 追问：换成无命中查询（池内无、补搜空）→ 保留上一轮
+    follow_ai = FakeSearchAI(intent={"keywords": ["ghost"], "languages": [], "topics": []}, select={"results": []})
+    with _web_client(search_env, follow_ai, FakeSearchGitHub(pages=[[]])) as client:
+        follow = client.post(
+            "/search/stream",
+            data={"q": "更窄的", "prev_intent": first_result["prev_intent"], "prev_results": first_result["prev_results"]},
+        ).text
+    app.dependency_overrides.clear()
+    follow_result = json.loads([line for line in follow.splitlines() if line.strip()][-1])
+    assert "上一轮结果" in follow_result["html"] and "意图变化" in follow_result["html"]
+    assert "a/crawler" in follow_result["html"]
+    # prev_results 与同步路径同源同口径（= 本轮展示结果行；搜空轮为空列表，上一轮区靠上一轮回传值渲染）
+    assert follow_result["prev_results"] == "[]"
+
+
+def _result_fragment(text: str) -> str:
+    """从响应正文中取 #search-result 容器内容（同步页面用，做与流式 result 帧的片段比对）。"""
+    m = re.search(r'<div id="search-result">(.*)</div>\s*</section>', text, re.S)
+    assert m is not None, "同步页面未找到 #search-result 容器"
+    return m.group(1).strip()
+
+
+def test_search_stream_fragment_matches_sync_post(search_env):
+    """两路径一致性（任务 2.6）：同一 stub 下流式 result 片段与同步 POST 结果区内容一致
+    （同 partial 渲染，仅传输形态不同）；表单校验口径一致（空 q/超长 400，同文案）。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+
+    def canned_ai():
+        return FakeSearchAI(
+            intent={"keywords": ["crawler"], "languages": [], "topics": []},
+            select={"results": [{"id": 1, "reason": "r"}]},
+        )
+
+    gh_page = [make_search_item("b/outside", description="external crawler", stars=8000)]
+    with _web_client(search_env, canned_ai(), FakeSearchGitHub(pages=[gh_page])) as client:
+        sync_text = client.post("/search", data={"q": "爬虫"}).text
+    app.dependency_overrides.clear()
+    with _web_client(search_env, canned_ai(), FakeSearchGitHub(pages=[gh_page])) as client:
+        stream_text = client.post("/search/stream", data={"q": "爬虫"}).text
+    app.dependency_overrides.clear()
+    stream_result = json.loads([line for line in stream_text.splitlines() if line.strip()][-1])
+    assert stream_result["html"].strip() == _result_fragment(sync_text)
+
+    with _web_client(search_env, canned_ai(), FakeSearchGitHub(pages=[[]])) as client:
+        for payload in ({"q": ""}, {"q": "长" * 201}):
+            sync_resp = client.post("/search", data=payload)
+            stream_resp = client.post("/search/stream", data=payload)
+            assert sync_resp.status_code == stream_resp.status_code == 400
+            assert sync_resp.json()["detail"] == stream_resp.json()["detail"]
+        form_text = client.get("/search").text
+    app.dependency_overrides.clear()
+    assert 'action="/search"' in form_text  # 表单原生提交目标仍是同步路径（无 JS 降级成立）
+    assert 'id="search-result"' in form_text and 'id="search-progress"' in form_text  # 流式挂载点
+    assert "/search/stream" in open("app/web/static/radar.js", encoding="utf-8").read()  # 前端接线（零构建，直接 grep）
+
+
+def test_search_stream_prev_results_field_names_match_hidden_inputs(search_env):
+    """无状态回传口径不变（任务 2.6）：流式 result 帧的两个 JSON 值与同步路径隐藏字段值同源同形态
+    （可直接写回 prev_intent/prev_results 隐藏字段供下一问回传）。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+
+    def canned_ai():
+        return FakeSearchAI(
+            intent={"keywords": ["crawler"], "languages": ["Python"], "topics": []},
+            select={"results": [{"id": 1, "reason": "r"}]},
+        )
+
+    with _web_client(search_env, canned_ai(), FakeSearchGitHub(pages=[[]])) as client:
+        sync_text = client.post("/search", data={"q": "爬虫"}).text
+    app.dependency_overrides.clear()
+    with _web_client(search_env, canned_ai(), FakeSearchGitHub(pages=[[]])) as client:
+        stream_result = json.loads(
+            [line for line in client.post("/search/stream", data={"q": "爬虫"}).text.splitlines() if line.strip()][-1]
+        )
+    app.dependency_overrides.clear()
+    assert stream_result["prev_intent"] == _extract_hidden(sync_text, "prev_intent")
+    assert stream_result["prev_results"] == _extract_hidden(sync_text, "prev_results")
+
+
+# ---------- T-041 评审修复（agent-859）：前端契约锁（F1 / F2-2 / F2-3） ----------
+# 项目无 JS 测试运行器（统一验证入口只跑 ruff＋pytest），前端行为由 A 级浏览器走查实证；
+# 本组锁"跨文件契约"——正是三条 finding 的原形缺陷（写回静默丢失 / 类名与 CSS 不对齐 /
+# result 帧覆盖如实终态），任一条被改回去都会在此红。
+
+
+def _radar_js() -> str:
+    import pathlib
+
+    return (pathlib.Path(__file__).resolve().parents[1] / "app/web/static/radar.js").read_text(encoding="utf-8")
+
+
+def _radar_css() -> str:
+    import pathlib
+
+    return (pathlib.Path(__file__).resolve().parents[1] / "app/web/static/radar.css").read_text(encoding="utf-8")
+
+
+def test_search_page_has_no_prev_hidden_inputs_first_search(search_env):
+    """F1 前置条件（bug 成因）：首搜页面（GET /search）模板条件渲染，两个追问隐藏字段不存在——
+    流式路径不整页重载，故 JS 必须动态创建后才能写回；同步路径靠整页 SSR 重渲染不受影响。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    with _web_client(search_env, FakeSearchAI(), FakeSearchGitHub()) as client:
+        page = client.get("/search").text
+    app.dependency_overrides.clear()
+    assert 'id="search-result"' in page and 'id="search-progress"' in page
+    assert 'name="prev_intent"' not in page and 'name="prev_results"' not in page  # 首搜无隐藏字段
+
+
+def test_search_stream_result_carries_prev_values_for_writeback(search_env):
+    """F1 数据面：流式 result 帧恒携带两个字符串值（含 unavailable 退化帧），前端写回才有料可写；
+    写回目标字段缺失时由 JS 动态创建（JS 侧契约见 test_radar_js_*）。"""
+    conn = get_conn(search_env)
+    _seed_web(conn)
+    conn.close()
+    ai = FakeSearchAI(
+        intent={"keywords": ["crawler"], "languages": [], "topics": []},
+        select={"results": [{"id": 1, "reason": "r"}]},
+    )
+    with _web_client(search_env, ai, FakeSearchGitHub(pages=[[]])) as client:
+        events = [json.loads(line) for line in client.post("/search/stream", data={"q": "爬虫"}).text.splitlines() if line.strip()]
+    app.dependency_overrides.clear()
+    final = events[-1]
+    assert isinstance(final["prev_intent"], str) and json.loads(final["prev_intent"])["keywords"] == ["crawler"]
+    assert isinstance(final["prev_results"], str) and json.loads(final["prev_results"])[0]["full_name"] == "a/crawler"
+
+    ai_down = FakeSearchAI(intent_error=DeepSeekAuthError("key 无效"))
+    with _web_client(search_env, ai_down, FakeSearchGitHub(pages=[[]])) as client:
+        events_down = [
+            json.loads(line) for line in client.post("/search/stream", data={"q": "爬虫"}).text.splitlines() if line.strip()
+        ]
+    app.dependency_overrides.clear()
+    assert isinstance(events_down[-1]["prev_intent"], str) and isinstance(events_down[-1]["prev_results"], str)
+
+
+def test_radar_js_creates_missing_prev_hidden_inputs():
+    """F1 修复锁：writeSearchHidden 在字段缺失时 createElement 创建 hidden 并经 appendChild 挂进表单，
+    再赋值——否则首搜完成后的流式结果写回静默丢失，追问上下文断链（评审 F1）。"""
+    js = _radar_js()
+    m = re.search(r"function writeSearchHidden\(form, name, value\) \{(.*?)\n\}", js, re.S)
+    assert m is not None, "writeSearchHidden 未找到（函数被改名/删除？）"
+    body = m.group(1)
+    assert 'createElement("input")' in body, "缺 createElement 创建逻辑（F1 回归）"
+    assert 'input.type = "hidden"' in body and "input.name = name" in body, "动态创建的输入必须是同名 hidden"
+    assert "form.appendChild(input)" in body, "未挂进表单则 FormData 取不到（F1 回归）"
+    assert "input.value = value == null" in body, "赋值分支缺失"
+
+
+def test_radar_js_step_state_class_mapping_aligned_with_css():
+    """F2-2 修复锁：服务端阶段态 → CSS 类名映射在 JS 侧单点，且 JS 写入的每个类名 CSS 均有选择器
+    （曾写 `sp-step start` 而 radar.css 只有 `.sp-step.active`，进行中呼吸点永不渲染）。"""
+    js, css = _radar_js(), _radar_css()
+    m = re.search(r"const SEARCH_STEP_CLASS = \{([^}]*)\}", js)
+    assert m is not None, "步骤态→类名映射表未找到"
+    mapping = dict(re.findall(r"(\w+):\s*\"(\w+)\"", m.group(1)))
+    assert set(mapping) == {"start", "done", "skip", "failed"}, f"服务端四态未全覆盖：{sorted(mapping)}"
+    assert mapping["start"] == "active", "进行中态必须映射到 CSS 既有 .sp-step.active"
+    for cls in mapping.values():
+        assert f".sp-step.{cls}" in css, f"CSS 缺 .sp-step.{cls} 选择器（JS 写但样式不存在）"
+    assert '"sp-step" + (SEARCH_STEP_CLASS[state]' in js, "类名必须经映射表写入（不得回退直写服务端态名）"
+
+
+def test_radar_js_result_frame_preserves_skip_and_failed_states():
+    """F2-3 修复锁：result 帧只把"进行中未收尾"（dataset.state === 'start'）的步骤补标为已完成，
+    skip（无需补搜）/ failed（失败跳过）保持如实终态——不得再无条件全量置 done。"""
+    js = _radar_js()
+    assert 'step.dataset.state === "start"' in js, "result 帧未按已记录态补标（F2-3 回归）"
+    assert 'setSearchStep(progressBox, stage, "done")' in js, "补标动作缺失"
+    assert 'for (const stage of Object.keys(SEARCH_STAGE_LABELS)) setSearchStep(progressBox, stage, "done");' not in js, (
+        "无条件全量置 done 的旧写法仍在（会覆盖 skip/failed 如实态）"
+    )
+    assert 'step.dataset.state = state || ""' in js, "阶段态未记录到 dataset，result 帧无从判定"
+
+
+def test_radar_js_stream_failure_falls_back_to_native_submit():
+    """F3-5 修复锁：流失败收敛＝如实提示＋form.submit() 原生提交（整页导航销毁本页 JS 状态，
+    "自动重跑仅一次"结构性成立）；原生提交抛错时才停留提示由用户手动重试。"""
+    js = _radar_js()
+    m = re.search(r"function failSearchStream\((.*?)\) \{(.*?)\n\}", js, re.S)
+    assert m is not None, "failSearchStream 未找到"
+    assert "form.submit()" in m.group(2), "未走原生提交（降级收敛路径缺失）"
+    assert "onManualRetry" in m.group(2), "原生提交不可用时的停留提示分支缺失"
+    assert "searchStreamRetried" not in js, "重试计数变量已废弃（可达性由整页导航保证），不得残留"

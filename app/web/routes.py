@@ -34,12 +34,13 @@ import sqlite3
 import threading
 import urllib.parse
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from app.ai import (
@@ -1699,6 +1700,64 @@ def _search_view(conn: sqlite3.Connection, result) -> dict:
     }
 
 
+def _parse_search_body(body: bytes) -> tuple[str, Intent | None, list[dict]]:
+    """搜索表单体解析（urlencoded 手动解析：不引 python-multipart——新版本 starlette 的 request.form()
+    也强制要求该包，项目零依赖惯例照 config.py 自解析 dotenv 先例）：返回 (q, prev_intent, prev_results)。
+
+    同步 POST /search 与流式 POST /search/stream 共用本单点——两条路径的表单字段/长度校验口径
+    逐字一致（400 文案亦同），防双路径漂移。解码失败按空体处理（同现状）。
+    """
+    try:
+        params = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        params = {}
+    raw_q = params.get("q")
+    q = raw_q[0].strip() if raw_q else ""
+    if not q:
+        raise HTTPException(status_code=400, detail="搜索词不能为空")
+    if len(q) > _SEARCH_QUERY_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"搜索词长度不能超过 {_SEARCH_QUERY_MAX_LEN} 字符")
+    return q, _parse_prev_intent(params.get("prev_intent")), _parse_prev_results(params.get("prev_results"))
+
+
+def _search_result_context(
+    conn: sqlite3.Connection, result, prev_intent: Intent | None, prev_results: list[dict]
+) -> tuple[dict, str, str]:
+    """搜索结果视图＋追问隐藏字段两 JSON 值（同步页面与流式结果事件共用同一装配口径）。
+
+    追问搜空保留上一轮结果（T-036）：不额外调 LLM，直接用回传摘要重渲染——两条路径同分支。
+    返回 (search_view, prev_intent_json, prev_results_json)：后两者是"下一问要回传"的意图与结果摘要，
+    即本轮生效意图（含合并结果）与页面实际展示的结果行（搜空时为上一轮），与同步路径的隐藏字段同源。
+    """
+    search_view = _search_view(conn, result)
+    if prev_intent is not None and not result.unavailable and not search_view["rows"] and prev_results:
+        search_view["old_intent"] = prev_intent
+        search_view["previous_rows"] = prev_results
+    intent_json = json.dumps(result.intent.__dict__ if result.intent else None, ensure_ascii=False)
+    rows_json = json.dumps(search_view["rows"], ensure_ascii=False)
+    return search_view, intent_json, rows_json
+
+
+def _render_search_result(
+    conn: sqlite3.Connection, result, prev_intent: Intent | None, prev_results: list[dict]
+) -> tuple[str, str, str]:
+    """渲染结果区 SSR 片段（_search_result.html，与同步路径同 partial）＋两隐藏字段 JSON 值。
+
+    返回 (html, prev_intent_json, prev_results_json)：流式结束帧一次取齐三件产物（片段与两值同源
+    装配，避免二次计算）。模板自动转义照常，无额外转义层（设计决策 3"两条路径渲染同一段模板代码"
+    由构造保证）；同步路径走 `_search_result_context` 取视图渲染整页，本函数是其片段化出口。
+    """
+    search_view, intent_json, results_json = _search_result_context(conn, result, prev_intent, prev_results)
+    html = templates.env.get_template("_search_result.html").render(search=search_view)
+    return html, intent_json, results_json
+
+
+def _ndjson(event: dict) -> bytes:
+    """NDJSON 帧编码（设计决策 2）：每行一个 JSON 对象＋换行；ensure_ascii=False 保中文可读
+    （与项目既有 json.dumps(..., ensure_ascii=False) 惯例一致，前端逐行 JSON.parse）。"""
+    return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 @router.get("/search", response_class=HTMLResponse)
 def search_page(request: Request) -> HTMLResponse:
     """P8 智能搜索页（§17.1）：大输入框＋提交按钮，未搜索时无结果区。
@@ -1744,28 +1803,16 @@ async def search_submit(
     追问（T-036）：表单携带 prev_intent/prev_results 两个隐藏字段；prev_intent 有效时进入意图合并链路，
     缺失/非法按首搜处理；追问搜空且 prev_results 有效时，原样重渲染上一轮结果区并展示新旧意图对比，
     不额外调用 LLM。
+
+    T-041：本路径为无 JS/无流式能力/流中途失败三级降级的目标路径，行为一字不改；结果区抽为公共
+    partial 后与流式路径同源（同 run_search、同 _search_result.html）。
     """
     body = await request.body()
-    try:
-        params = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
-    except UnicodeDecodeError:
-        params = {}
-    raw_q = params.get("q")
-    q = raw_q[0].strip() if raw_q else ""
-    if not q:
-        raise HTTPException(status_code=400, detail="搜索词不能为空")
-    if len(q) > _SEARCH_QUERY_MAX_LEN:
-        raise HTTPException(status_code=400, detail=f"搜索词长度不能超过 {_SEARCH_QUERY_MAX_LEN} 字符")
-    prev_intent = _parse_prev_intent(params.get("prev_intent"))
-    prev_results = _parse_prev_results(params.get("prev_results"))
+    q, prev_intent, prev_results = _parse_search_body(body)
     conn = get_conn()
     try:
         result = await run_search(conn, ai, github, q, prev_intent=prev_intent, log=logger)
-        search_view = _search_view(conn, result)
-        # 追问搜空保留上一轮结果（spec T-036）：不额外调 LLM，直接用回传摘要重渲染
-        if prev_intent is not None and not result.unavailable and not search_view["rows"] and prev_results:
-            search_view["old_intent"] = prev_intent
-            search_view["previous_rows"] = prev_results
+        search_view, intent_json, results_json = _search_result_context(conn, result, prev_intent, prev_results)
         return templates.TemplateResponse(
             request=request,
             name="search.html",
@@ -1779,11 +1826,112 @@ async def search_submit(
                 "tracked": conn.execute("SELECT COUNT(*) FROM repos WHERE dead = 0").fetchone()[0],
                 "follow_count": conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0],
                 "all_tags": _all_tags(conn),
-                "prev_intent_json": json.dumps(result.intent.__dict__ if result.intent else None, ensure_ascii=False),
-                "prev_results_json": json.dumps(search_view["rows"], ensure_ascii=False),
+                "prev_intent_json": intent_json,
+                "prev_results_json": results_json,
             },
         )
     finally:
+        conn.close()
+
+
+@router.post("/search/stream")
+async def search_stream(
+    request: Request,
+    ai: DeepSeekClient = Depends(_ai_client),
+    github: GitHubClient = Depends(_github_client),
+) -> StreamingResponse:
+    """P8 搜索流式端点（T-041，§17.5，设计决策 1/2/6）：NDJSON 帧服务端流式推送搜索进度。
+
+    事件序列（每行一个 JSON 对象，`application/x-ndjson`）：
+    - `{"type": "stage", "stage": "intent"|"recall"|"select"|"external", "state": "start"|"done"|
+      "skip"|"failed"}`——四阶段边界如实上报（补搜"跳过（池内已足 20 条）"独立态，不伪造进度）；
+    - `{"type": "thinking", "stage": "intent"|"select", "delta": "…"}`——两段 LLM 调用思维链增量；
+    - `{"type": "result", "html": "…", "prev_intent": "…", "prev_results": "…"}`——结束帧，携带服务端
+      SSR 渲染好的结果区片段（同 partial）与追问隐藏字段两 JSON 值（无状态回传口径不变）。
+
+    与同步路径同 `run_search`（可选回调插桩，缺省行为零差异）、同结果区模板：结果语义唯一由构造保证；
+    结果片段经 JSON 字符串传输（换行/引号由 JSON 转义承载），前端 innerHTML 整体替换结果容器。
+    表单解析/长度校验复用 `_parse_search_body`（与同步路径同口径同文案）。本端点为纯新增：无 JS 或
+    浏览器不支持流式消费时表单原生提交仍走同步 POST；流中途失败由前端收敛回同步路径（设计决策 7）。
+
+    流式实现（设计决策 6）：`run_search` 作为独立 task 跑，事件经 asyncio.Queue 旁路按序 yield——
+    LLM 调用未返回时"进行中"事件已下发（真流式，非整链跑完再吐）；查询库用独立连接（请求级依赖
+    SQLite 连接默认单线程，不可跨线程/任务共享，与既有 GET 页 `get_conn()` 同姿态）。
+    """
+    body = await request.body()
+    q, prev_intent, prev_results = _parse_search_body(body)  # 校验失败在流建立前抛 400（不产生半截流）
+    return StreamingResponse(_search_stream(q, prev_intent, prev_results, ai, github), media_type="application/x-ndjson")
+
+
+async def _search_stream(
+    q: str,
+    prev_intent: Intent | None,
+    prev_results: list[dict],
+    ai: DeepSeekClient,
+    github: GitHubClient,
+) -> AsyncIterator[bytes]:
+    """流式搜索事件生成器（`/search/stream` 的响应体）：run_search 旁路事件 → NDJSON 帧。
+
+    队列旁路保证事件按发生顺序下发；`run_search` 正常结束即以 "result" 帧收尾（本端点不做整链
+    异常兜底——检索链路自身分段降级，异常路径已由 run_search 收敛为 unavailable/粗排/补搜跳过）。
+    客户端断开时取消未完成的检索 task 并关闭连接（AbortController 由页面导航天然触发，设计决策 7）。
+    """
+    conn = get_conn()
+    queue: asyncio.Queue = asyncio.Queue()
+    result_holder: dict[str, object] = {}
+
+    def progress_cb(event: dict) -> None:
+        queue.put_nowait({"type": "stage", **event})
+
+    def thinking_cb(stage: str, delta: str) -> None:
+        queue.put_nowait({"type": "thinking", "stage": stage, "delta": delta})
+
+    async def run() -> None:
+        try:
+            result_holder["result"] = await run_search(
+                conn,
+                ai,
+                github,
+                q,
+                prev_intent=prev_intent,
+                log=logger,
+                progress_cb=progress_cb,
+                thinking_cb=thinking_cb,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # 防御：run_search 分段降级已收敛异常，此类兜底不产生半成品结果
+            logger.exception("智能搜索流式链路异常：%s", exc)
+            result_holder["error"] = str(exc)
+        finally:
+            queue.put_nowait(None)  # 哨兵：事件流结束（正常/异常/取消都必达）
+
+    task = asyncio.create_task(run())
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield _ndjson(event)
+        if task.cancelled():
+            return
+        result = result_holder.get("result")
+        if result is None:  # run_search 兜底异常：不渲染半成品，前端按流失败收敛回同步路径
+            return
+        html, intent_json, results_json = _render_search_result(conn, result, prev_intent, prev_results)
+        yield _ndjson(
+            {
+                "type": "result",
+                "html": html,
+                "prev_intent": intent_json,
+                "prev_results": results_json,
+            }
+        )
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         conn.close()
 
 

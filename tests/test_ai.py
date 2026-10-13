@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
+from openai import APIConnectionError, AuthenticationError
 
 from app.ai import (
     DeepSeekAuthError,
@@ -1756,3 +1757,264 @@ def test_daily_job_with_empty_key_behaves_as_before(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+# ---------- T-041 搜索流式加载态：_chat_stream 流式变体与两段调用的思维链回调 ----------
+
+_INTENT_JSON = '{"keywords": ["crawler"], "languages": ["Python"], "topics": []}'
+_SELECT_JSON = '{"results": [{"id": 1, "reason": "匹配意图"}]}'
+
+
+def _sse(*chunks: dict) -> str:
+    """OpenAI 兼容流式响应体（SSE：data: 行 + [DONE] 终止）；chunk 即 choices[0].delta 内容。"""
+    lines = [f"data: {json.dumps({'choices': [{'delta': c}]}, ensure_ascii=False)}" for c in chunks]
+    lines.append("data: [DONE]")
+    return "\n\n".join(lines) + "\n\n"
+
+
+def _stream_stub_client(bodies: list, *responses: httpx.Response) -> DeepSeekClient:
+    """流式响应 stub：按调用次序返回预订响应体（重试用例给两个响应），bodies 收集请求 payload。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return responses[min(len(bodies) - 1, len(responses) - 1)]
+
+    return DeepSeekClient("test-key", transport=httpx.MockTransport(handler), sleep=_no_sleep)
+
+
+def _collect(client: DeepSeekClient, **kwargs) -> tuple[list[str], list[str]]:
+    """跑一遍 `_chat_stream`（thinking_cb 模式）：返回 (思维链增量回调序列, 正文增量序列)。"""
+    thinks: list[str] = []
+    pieces: list[str] = []
+
+    async def run() -> None:
+        async for piece in client._chat_stream(thinking_cb=thinks.append, **kwargs):
+            pieces.append(piece)
+
+    asyncio.run(run())
+    return thinks, pieces
+
+
+def test_chat_stream_reasoning_content_and_content_accumulate():
+    """流式变体（reasoning_content）：思维链增量逐段喂回调，content 增量累积为完整正文；
+    请求带 response_format（与同步路径同协议参数集）且带 stream=True。"""
+    bodies: list = []
+    client = _stream_stub_client(
+        bodies,
+        httpx.Response(
+            200,
+            text=_sse(
+                {"reasoning_content": "The user wants ", "content": ""},
+                {"reasoning_content": "a crawler.", "content": _INTENT_JSON},
+            ),
+            headers={"Content-Type": "text/event-stream"},
+        ),
+    )
+    thinks, pieces = _collect(
+        client, system="s", user="u", temperature=0.2, response_format=_JSON_RESPONSE_FORMAT
+    )
+    assert thinks == ["The user wants ", "a crawler."]  # 逐段喂回调（增量原样）
+    assert "".join(pieces) == _INTENT_JSON  # content 累积返回（解析契约不变）
+    assert bodies[0]["stream"] is True
+    assert bodies[0]["response_format"] == _JSON_RESPONSE_FORMAT
+    asyncio.run(client.aclose())
+
+
+def test_chat_stream_reasoning_details_array_form():
+    """本地 free 模型形态（reasoning_details 数组）：str 元素直取、dict 取 text/content 字段、
+    形态不识的元素跳过；content 照常累积——两种字段名兼容、缺失不报错。"""
+    client = _stream_stub_client(
+        [],
+        httpx.Response(
+            200,
+            text=_sse(
+                {"reasoning_details": ["first ", {"text": "second "}, {"content": "third"}, {"unknown": 1}, 42]},
+                {"reasoning_details": [{"text": "tail"}], "content": _INTENT_JSON},
+            ),
+            headers={"Content-Type": "text/event-stream"},
+        ),
+    )
+    thinks, pieces = _collect(client, system="s", user="u", temperature=0.2, response_format=None)
+    assert thinks == ["first second third", "tail"]  # 未知形态元素（{"unknown":1} 与 42）跳过，不报错
+    assert "".join(pieces) == _INTENT_JSON
+    asyncio.run(client.aclose())
+
+
+def test_chat_stream_without_reasoning_fields_degrades_silently():
+    """两字段皆缺：零思维链增量、不报错（退化为纯阶段进度口径），content 照常返回。"""
+    client = _stream_stub_client(
+        [],
+        httpx.Response(
+            200,
+            text=_sse({"content": _INTENT_JSON}, {"content": ""}),
+            headers={"Content-Type": "text/event-stream"},
+        ),
+    )
+    thinks, pieces = _collect(client, system="s", user="u", temperature=0.2, response_format=None)
+    assert thinks == []  # 无思维链事件
+    assert "".join(pieces) == _INTENT_JSON
+    asyncio.run(client.aclose())
+
+
+def test_chat_stream_retries_before_first_byte_then_succeeds():
+    """首字节前失败（连接层错误）：按既有口径重试一次——共 2 次请求，第二次成功返回；
+    重试期间零思维链/正文增量下发（无重复展示风险）。"""
+    bodies: list = []
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(
+            200, text=_sse({"reasoning_content": "think", "content": _INTENT_JSON}), headers={"Content-Type": "text/event-stream"}
+        )
+
+    client = DeepSeekClient("k", transport=httpx.MockTransport(handler), sleep=_no_sleep)
+    thinks, pieces = _collect(client, system="s", user="u", temperature=0.2, response_format=None)
+    assert len(calls) == 2
+    assert thinks == ["think"]
+    assert "".join(pieces) == _INTENT_JSON
+    assert bodies == []  # 本条 handler 未收集 payload（只关心重试次数与结果）
+    asyncio.run(client.aclose())
+
+
+def _interrupted_stream_client(error: Exception, calls: list) -> DeepSeekClient:
+    """构造"先吐出一个思维链增量、再抛 `error` 中断"的 client 骨架（断流形态无法用 MockTransport 表达）。"""
+
+    class _Chunk:
+        def __init__(self, delta):
+            self.choices = [type("_Choice", (), {"delta": delta})()]
+
+    class _BrokenStream:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._chunks:
+                return self._chunks.pop(0)
+            raise error
+
+        async def close(self):
+            return None
+
+    class _FakeOpenAI:
+        class chat:  # noqa: N801 - 骨架替身，只求 chat.completions.create 可取
+            class completions:
+                @staticmethod
+                async def create(**kwargs):
+                    calls.append(kwargs)
+                    return _BrokenStream([_Chunk({"reasoning_content": "thinking", "content": ""})])
+
+        async def close(self):  # aclose() 走同一出口（真 AsyncOpenAI 同姿态）
+            return None
+
+    client = DeepSeekClient("k", transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    client._client = _FakeOpenAI()
+    return client
+
+
+def test_chat_stream_interrupted_after_delta_raises_without_retry():
+    """已有增量下发后中断：按调用失败抛既有异常类型（DeepSeekError），不重试（防重复思维链）。"""
+    calls: list = []
+    client = _interrupted_stream_client(httpx.ReadError("stream broken"), calls)
+    with pytest.raises(DeepSeekError):
+        _collect(client, system="s", user="u", temperature=0.2, response_format=None)
+    assert len(calls) == 1  # 不重试（已有增量下发）
+    asyncio.run(client.aclose())
+
+
+def test_chat_stream_interrupted_after_delta_message_honest_no_retry_claim():
+    """F3-6：已有增量后中断的文案如实（真 SDK 形态的可重试类：APIConnectionError）——
+    必须说明"已产出增量，不重试"，不得出现"重试 N 次后放弃"这类未发生的动作（评审 finding）。
+    非可重试类（账户/4xx）仍走 `_handle_chat_error` 单点，文案与非流式路径逐字一致。"""
+    calls: list = []
+    client = _interrupted_stream_client(APIConnectionError(request=httpx.Request("POST", "https://x/v1")), calls)
+    with pytest.raises(DeepSeekError) as excinfo:
+        _collect(client, system="s", user="u", temperature=0.2, response_format=None)
+    message = str(excinfo.value)
+    assert "已产出增量，不重试" in message
+    assert "重试 1 次后放弃" not in message  # 未发生重试，不得声称
+    assert len(calls) == 1
+    asyncio.run(client.aclose())
+
+    # 非可重试类（401 账户类）：文案与同步路径完全一致（"AI 账户类错误（HTTP 401）"），不带流式专属措辞
+    calls2: list = []
+    client2 = _interrupted_stream_client(
+        AuthenticationError(
+            "401", response=httpx.Response(401, request=httpx.Request("POST", "https://x/v1")), body=None
+        ),
+        calls2,
+    )
+    with pytest.raises(DeepSeekAuthError) as excinfo2:
+        _collect(client2, system="s", user="u", temperature=0.2, response_format=None)
+    assert "AI 账户类错误（HTTP 401）" in str(excinfo2.value)
+    assert "已产出增量" not in str(excinfo2.value)  # 账户类文案逐字不变（单点共用口径）
+    assert len(calls2) == 1
+    asyncio.run(client2.aclose())
+
+
+def test_understand_intent_and_select_and_reason_thinking_cb_streams():
+    """两段调用的 thinking_cb 接入：非 None 走 `_chat_stream`（真正下发思维链增量且解析结果不变）；
+    本条用 _collect_stream 消费，覆盖 understand_intent/select_and_reason 到 _chat_stream 的完整接线。"""
+    bodies: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        payload = _INTENT_JSON if len(bodies) == 1 else _SELECT_JSON
+        return httpx.Response(
+            200,
+            text=_sse({"reasoning_content": "step-" + str(len(bodies)), "content": payload}),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler), sleep=_no_sleep)
+    intents: list[str] = []
+    parsed_intent = asyncio.run(client.understand_intent("爬虫工具", thinking_cb=intents.append))
+    selects: list[str] = []
+    candidates = [{"full_name": "a/one", "description_en": "desc", "language": "Python", "stars": 100}]
+    parsed_select = asyncio.run(
+        client.select_and_reason(intent_summary="爬虫", candidates=candidates, thinking_cb=selects.append)
+    )
+    assert parsed_intent == {"keywords": ["crawler"], "languages": ["Python"], "topics": []}
+    assert parsed_select == {"results": [{"id": 1, "reason": "匹配意图"}]}
+    assert intents == ["step-1"] and selects == ["step-2"]
+    assert all(b["stream"] is True for b in bodies)
+    assert all(b["response_format"] == _JSON_RESPONSE_FORMAT for b in bodies)  # 协议参数集不变
+    asyncio.run(client.aclose())
+
+
+def test_thinking_cb_default_keeps_sync_request_byte_identical():
+    """缺省零回归（任务 2.3）：不传 thinking_cb 时两段调用走既有 `_chat`——payload 带 response_format、
+    无 stream 字段（请求形态逐字节不变），且不产生任何思维链增量。"""
+    bodies = []
+    canned = _INTENT_JSON
+    client = _json_stub_client(bodies, canned)
+    asyncio.run(client.understand_intent("爬虫工具"))
+    candidates = [{"full_name": "a/one", "description_en": "desc", "language": "Python", "stars": 100}]
+    client2 = _json_stub_client(bodies, _SELECT_JSON)
+    asyncio.run(client2.select_and_reason(intent_summary="爬虫", candidates=candidates))
+    assert len(bodies) == 2
+    for body in bodies:
+        assert "stream" not in body  # 同步路径请求体不带 stream
+        assert body["response_format"] == _JSON_RESPONSE_FORMAT
+    asyncio.run(client.aclose())
+    asyncio.run(client2.aclose())
+
+
+def test_chat_stream_empty_content_retries_then_raises():
+    """流式响应零 content 增量（畸形响应）：按既有口径重试一次后仍失败 → 抛既有异常类型。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, text=_sse({"content": ""}), headers={"Content-Type": "text/event-stream"})
+
+    client = DeepSeekClient("k", transport=httpx.MockTransport(handler), sleep=_no_sleep)
+    with pytest.raises(DeepSeekError, match="流式响应畸形"):
+        _collect(client, system="s", user="u", temperature=0.2, response_format=None)
+    assert len(calls) == 2  # 重试一次
+    asyncio.run(client.aclose())
