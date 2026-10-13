@@ -790,6 +790,9 @@ nav.tabs { flex-wrap: wrap; }
 }
 .sp-label { font-size: 12px; color: var(--text-3); white-space: nowrap; }
 .sp-sub { font-size: 11px; color: var(--text-3); font-family: var(--font-mono); }
+/* 进行中步骤的已用时秒数（T-041 走查修复）：与 label 文案同行、间距 4px，muted 色不抢 label 主体 */
+.sp-time { margin-left: 4px; font-size: 11px; font-weight: 400; color: var(--text-3); font-family: var(--font-mono); }
+.sp-time:empty { display: none; } /* 未开始/已收尾：文本清空即收起（不占位、不引起步骤条位移） */
 /* 进行中：品牌绿呼吸点 */
 .sp-step.active .sp-dot { background: var(--accent); animation: sp-breath 1.2s ease-in-out infinite; }
 .sp-step.active .sp-label { color: var(--accent-hi); font-weight: 600; }

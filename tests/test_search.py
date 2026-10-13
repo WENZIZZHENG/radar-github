@@ -1483,3 +1483,41 @@ def test_radar_js_stream_failure_falls_back_to_native_submit():
     assert "form.submit()" in m.group(2), "未走原生提交（降级收敛路径缺失）"
     assert "onManualRetry" in m.group(2), "原生提交不可用时的停留提示分支缺失"
     assert "searchStreamRetried" not in js, "重试计数变量已废弃（可达性由整页导航保证），不得残留"
+
+
+def test_radar_js_step_elapsed_timer():
+    """T-041 走查打回修复锁（2026-10-13）：进行中步骤显示已用时秒数、每秒跳动——网关/模型首 token
+    静默 20~60s 里呼吸点之外再给一个存活信号。计时器 id 挂 box 属性：box.textContent="" 只销毁
+    DOM、停不掉 setInterval，故新 start 前先清旧的，且两个清箱入口清箱前必须停表（否则泄漏空转）。"""
+    js, css = _radar_js(), _radar_css()
+
+    def _fn(pattern, name):
+        m = re.search(pattern, js, re.S)
+        assert m is not None, f"{name} 未找到（函数被改名/删除？）"
+        return m.group(1)
+
+    render = _fn(r"function renderSearchProgress\(box\) \{(.*?)\n\}", "renderSearchProgress")
+    assert 'time.className = "sp-time"' in render, "步骤条未创建 .sp-time 计时元素（存活信号缺失）"
+    assert "label.appendChild(time)" in render, "计时元素未挂 label 内（直挂 .sp-step 会被纵排挤到下一行且高度跳动）"
+    assert "time.textContent" not in render, "计时元素必须初始为空（由 :empty 收起，不预置文本）"
+    assert 'time.setAttribute("aria-hidden", "true")' in render, "逐秒改文本须 aria-hidden（面板是 aria-live 区）"
+
+    setter = _fn(r"function setSearchStep\(box, stage, state\) \{(.*?)\n\}", "setSearchStep")
+    assert 'if (state === "start") startSearchStepTimer(box, step);' in setter, "进行中态未启动计时"
+    assert "else clearSearchStepTimer(box);" in setter, "终态（done/skip/failed）未停表并清空"
+
+    timer = _fn(r"function startSearchStepTimer\(box, step\) \{(.*?)\n\}", "startSearchStepTimer")
+    assert "clearSearchStepTimer(box);" in timer, "新 start 前未清旧表（同一 box 只许一个活动计时器）"
+    assert "box._spTimer = setInterval(tick, 1000);" in timer, "计时器未挂 box._spTimer 或非每秒节奏"
+    assert "`· ${Math.floor((Date.now() - t0) / 1000)}s`" in timer, "文本形态必须是 · Ns，且按起始时刻实算"
+
+    clear = _fn(r"function clearSearchStepTimer\(box\) \{(.*?)\n\}", "clearSearchStepTimer")
+    assert "clearInterval(box._spTimer)" in clear, "未 clearInterval（清箱后计时器空转＝泄漏）"
+    assert 'box._spTime.textContent = ""' in clear, "终态未清空计时文本（:empty 收起依赖清空）"
+
+    fail_body = _fn(r"function failSearchStream\(form, btn, box, onManualRetry\) \{(.*?)\n\}", "failSearchStream")
+    for name, text in (("renderSearchProgress", render), ("failSearchStream", fail_body)):
+        stop, wipe = text.index("clearSearchStepTimer(box)"), text.index('box.textContent = ""')
+        assert stop < wipe, f"{name} 必须先停表再清箱（顺序反了＝计时器泄漏）"
+
+    assert ".sp-time" in css and ".sp-time:empty" in css, "radar.css 缺 .sp-time 样式或空态收起规则"

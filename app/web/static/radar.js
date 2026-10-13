@@ -1229,7 +1229,30 @@ const SEARCH_STAGE_LABELS = { intent: "理解意图", recall: "池内召回", se
 // 服务端语义态名只走协议，类名映射在 JS 侧单点，二者一一对应——含未开始的空串态）
 const SEARCH_STEP_CLASS = { start: "active", done: "done", skip: "skip", failed: "failed" };
 
+// T-041 走查打回修复（§17.5）：进行中步骤显示已用时秒数、每秒跳动——网关/模型首 token 静默期
+// （实测 20~60s，不可控）里呼吸点之外再给一个存活信号，"像卡住了"的误判由此消除。
+// 计时器 id 与目标元素挂 progress box 属性上：box.textContent="" 只销毁 DOM、停不掉 setInterval，
+// 故两个清箱入口（renderSearchProgress 新一轮重建 / failSearchStream 断流）都必须先停表再清箱。
+function clearSearchStepTimer(box) {
+  if (box._spTimer) clearInterval(box._spTimer);
+  box._spTimer = null;
+  if (box._spTime) box._spTime.textContent = ""; // 清空 → CSS .sp-time:empty 收起（不占位）
+  box._spTime = null;
+}
+
+function startSearchStepTimer(box, step) {
+  clearSearchStepTimer(box); // 同一 box 同时只有一个活动计时器：新 start 前先清旧的
+  const time = step.querySelector(".sp-time");
+  if (!time) return;
+  const t0 = Date.now(); // 起始时刻挂在闭包里，每秒按真实差值重算（不累加、不漂移）
+  box._spTime = time;
+  const tick = () => { time.textContent = `· ${Math.floor((Date.now() - t0) / 1000)}s`; };
+  tick(); // 起步即显 · 0s：静默期第一秒内也有存活信号
+  box._spTimer = setInterval(tick, 1000);
+}
+
 function renderSearchProgress(box) {
+  clearSearchStepTimer(box); // 新一轮重建：清旧的（textContent="" 停不掉旧 setInterval → 泄漏）
   box.textContent = "";
   const panel = document.createElement("div");
   panel.className = "search-progress";
@@ -1246,6 +1269,12 @@ function renderSearchProgress(box) {
     const label = document.createElement("span");
     label.className = "sp-label";
     label.textContent = SEARCH_STAGE_LABELS[stage];
+    // 计时文本挂 label 内（而非直挂 step）：.sp-step 桌面端是 flex 纵排，直挂会被挤到下一行、
+    // 且步骤条高度随显隐跳动；挂 label 内与文案同行，收尾清空即由 :empty 收起、零布局位移
+    const time = document.createElement("span");
+    time.className = "sp-time";
+    time.setAttribute("aria-hidden", "true"); // 每秒改文本：面板整体是 aria-live 区，避免读屏逐秒刷播
+    label.appendChild(time);
     step.append(dot, label);
     steps.appendChild(step);
   }
@@ -1259,6 +1288,8 @@ function setSearchStep(box, stage, state) {
   step.dataset.state = state || ""; // 记录服务端语义态：result 帧只补标"进行中未收尾"的阶段（不覆盖 skip/failed）
   step.className = "sp-step" + (SEARCH_STEP_CLASS[state] ? " " + SEARCH_STEP_CLASS[state] : "");
   step.querySelector(".sp-dot").textContent = state === "done" ? "✓" : state === "skip" ? "—" : String([...step.parentNode.children].indexOf(step) + 1);
+  if (state === "start") startSearchStepTimer(box, step);
+  else clearSearchStepTimer(box); // 终态（done/skip/failed）与未开始态：停表并清空收起
   const pre = box.querySelector(`.th-sec[data-stage="${stage}"] .th-text`);
   if (pre && state !== "start") pre.classList.remove("streaming"); // 该段思考收尾：去流式光标
 }
@@ -1315,6 +1346,7 @@ function writeSearchHidden(form, name, value) {
 
 // 流失败收敛（决策 7）：如实提示＋原生表单提交重跑（自动重跑仅一次的结构性保证见下）；不渲染半成品结果
 function failSearchStream(form, btn, box, onManualRetry) {
+  clearSearchStepTimer(box); // 断流清箱：先停表再清（textContent="" 停不掉 setInterval）
   box.textContent = "";
   const fail = document.createElement("div");
   fail.className = "stream-fail";

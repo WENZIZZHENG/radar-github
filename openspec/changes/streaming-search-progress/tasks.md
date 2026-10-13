@@ -33,6 +33,7 @@
 
 ## 6. 收口验证
 
+- [x] 6.0 走查打回修复（2026-10-13 本人走查）：「思考过程不是实时的」——诊断四路对照实证端到端流式本身实时（httpx 增量平均 27ms、浏览器裸 fetch 平滑），体感卡顿来自网关/模型首 token 静默与抖动（实测 2s~60s，不可控；本人走查轮撞上一次 APITimeoutError 60s 超时重试）。修复＝进行中步骤显示已用时秒数每秒跳动（纯前端计时器，静默期存活信号）；spec「搜索流式加载态」需求与场景已同步该口径。验证：agent-872 实施，变异验证锁非空转、真网关冒烟计时逐秒跳动（间隔 0.91~1.23s）、`pytest tests/test_search.py tests/test_ai.py` 153 绿＋全量 575 绿＋ruff 绿；截图 `data/t041_rehearse/fix-timer-*.png`。
 - [x] 6.1 统一验证入口一次跑绿：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1`（ruff＋pytest 全量），输出留痕。——2026-10-13 跑绿：ruff All checks passed＋pytest 574 passed in 107s。
 - [x] 6.2 独立评审子 agent 复审（核心链路搜索变更，按项目 §4 评审门禁），findings 处置闭环。——2026-10-13 评审 agent-859（k3）两轮：初审 1F1＋2F2＋3F3，修复后增量复查全部清零判可收口；唯一留痕不修＝`failSearchStream` catch 分支文案矛盾（极端不可达角落，F3 级）。
 - [x] 6.3 A 级真实环境预演（真 uvicorn＋真 AI 网关流式调用）：页面走查对照原型 T041——阶段推进、思维链流式（或如实退化）、结果与同步路径一致、断流降级重跑；留档 data/。——2026-10-13 预演通过（agent-866 脚本段两轮 5/5 PASS＋主 agent 看图段 7 张截图全过）：真网关 `deepseek/deepseek-v4.1-flash`＋json_object 下思维链非空（114 事件/1128 字符，by_stage intent 46/select 68），**推翻 10-12 实测「json_object 下思维链近零」推论**，生产思维链区应正常渲染；阶段序列 intent→recall→select→external 次序正确；DOM 终态与 result 帧逐值一致；隐藏字段动态创建且与帧值逐字节相同；断流降级实证收敛（stream abort→原生 POST 整页 SSR）；产物 `data/t041_rehearse/`（rehearse.py/server.py/result.json/ndjson 抓包×2/截图×7/步骤卡.md）。
