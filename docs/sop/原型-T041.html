@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>原型 · T-041 搜索流式加载态（阶段进度＋AI 思考过程，新视觉元素提案）</title>
+<link rel="stylesheet" href="../../app/web/static/radar.css">
+<!--
+  T-041 同保真原型（2026-10-13，开发前本人确认用）：
+  - 依据：《交互流程说明》§17.5 流式加载态（v3.0 草案，待本人确认）＋ OpenSpec change streaming-search-progress
+  - 范围：四个视图锚点陈列 —— ① 桌面进行中（可重播流式动画） ② 桌面完成态（结果与现状一致） ③ 两退化态并排（无思维链/流失败收敛） ④ 移动端 375px 进行中
+  - 样式：既有视觉基线直接 link ../app/web/static/radar.css 复用；步骤条/思考过程区/呼吸点等
+    新组件样式在本文件 <style> 内定义（标注"提案样式，确认后迁 radar.css"）
+  - 红线遵守：仅本文件为新增；不改 app/、不改既有示意图.html；不引任何外部资源（无字体外链，系统字体栈），
+    静态 HTML＋少量 vanilla JS，零依赖零构建
+  - 假数据沿用示意图/搜索页风格（仓库名/星数真实风格，意图＝"我要做爬虫，Python 的"）
+-->
+<style>
+  /* ================= T-041 提案样式（确认后迁 radar.css；未确认前仅本原型生效） ================= */
+
+  /* 原型演示骨架：工具条 / 视图分区（非产品 UI，不迁移） */
+  .proto-bar {
+    position: sticky; top: 0; z-index: 60;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 20px;
+    background: rgba(11,18,32,.96); border-bottom: 1px solid rgba(34,197,94,.35);
+  }
+  .proto-bar .pb-title { font-size: 13px; font-weight: 600; color: var(--accent-hi); }
+  .proto-bar .pb-sub { font-size: 12px; color: var(--text-3); }
+  .proto-bar a.pb-jump, .proto-bar button.pb-jump {
+    font-size: 12px; color: var(--blue); border: 1px solid rgba(88,166,255,.35);
+    border-radius: var(--r-pill); padding: 3px 12px; text-decoration: none;
+    background: none; cursor: pointer; font-family: var(--font-sans);
+    transition: background var(--t-fast) ease;
+  }
+  .proto-bar a.pb-jump:hover, .proto-bar button.pb-jump:hover { background: rgba(88,166,255,.12); }
+  .proto-bar .pb-note { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
+
+  .view + .view { border-top: 1px dashed var(--line-strong); margin-top: 36px; padding-top: 26px; }
+  .view-label { max-width: 1440px; margin: 0 auto 12px; padding: 0 20px; font-size: 14px; color: var(--text-1); }
+  .view-label b { color: var(--accent); font-family: var(--font-mono); font-weight: 600; margin-right: 4px; }
+  .view-label .hint { margin-left: 12px; font-size: 12px; color: var(--text-3); }
+
+  .stage { position: relative; background: var(--bg); }
+  .stage-scroll { max-height: 860px; overflow-y: auto; }
+  .stage ::-webkit-scrollbar { width: 10px; }
+  .stage ::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 8px; border: 2px solid var(--bg); }
+  .stage ::-webkit-scrollbar-track { background: transparent; }
+
+  .two-col { display: flex; gap: 28px; align-items: flex-start; max-width: 1440px; margin: 0 auto; padding: 0 20px; }
+  .two-col > .col { flex: 1; min-width: 0; }
+  .col-tag { text-align: center; font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
+  .col-tag b { color: var(--text-2); font-weight: 600; }
+
+  .stage-m { width: 375px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 14px; margin: 0 auto; }
+  .stage-m .stage-inner { max-height: 700px; overflow-y: auto; }
+
+  /* ===== 提案① 阶段步骤条（搜索进度面板） ===== */
+  .search-progress {
+    margin-top: var(--s3);
+    background: var(--card); border: 1px solid var(--line-strong); border-radius: var(--r-l);
+    padding: 12px 14px;
+  }
+  .sp-steps { display: flex; align-items: flex-start; gap: 4px; }
+  .sp-step { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; position: relative; }
+  /* 连接线（步骤间横条） */
+  .sp-step:not(:last-child)::after {
+    content: ""; position: absolute; top: 8px; left: calc(50% + 14px); right: calc(-50% + 14px);
+    height: 2px; background: var(--line-strong); border-radius: 1px;
+  }
+  .sp-step.done:not(:last-child)::after { background: var(--accent); }
+  .sp-dot {
+    width: 16px; height: 16px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--muted); color: var(--text-3);
+    font-size: 10px; font-family: var(--font-mono);
+    transition: background var(--t-fast) ease;
+  }
+  .sp-label { font-size: 12px; color: var(--text-3); white-space: nowrap; }
+  .sp-sub { font-size: 11px; color: var(--text-3); font-family: var(--font-mono); }
+  /* 进行中：品牌绿呼吸点 */
+  .sp-step.active .sp-dot { background: var(--accent); animation: sp-breath 1.2s ease-in-out infinite; }
+  .sp-step.active .sp-label { color: var(--accent-hi); font-weight: 600; }
+  @keyframes sp-breath {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(34,197,94,.45); }
+    50% { box-shadow: 0 0 0 6px rgba(34,197,94,0); }
+  }
+  /* 已完成：绿勾 */
+  .sp-step.done .sp-dot { background: var(--accent); color: #04120a; font-weight: 700; }
+  .sp-step.done .sp-label { color: var(--text-2); }
+  /* 跳过（无需补搜）：灰字如实标注 */
+  .sp-step.skip .sp-dot { background: var(--muted); color: var(--text-3); }
+  .sp-step.skip .sp-label { color: var(--text-3); text-decoration: line-through; }
+
+  /* ===== 提案② AI 思考过程区（details 可折叠；英文原文流式追加） ===== */
+  details.thinking { margin-top: var(--s3); border-top: 1px dashed var(--line); padding-top: 8px; }
+  details.thinking summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px;
+    font-size: 12.5px; color: var(--text-2); user-select: none;
+  }
+  details.thinking summary::-webkit-details-marker { display: none; }
+  details.thinking summary::before {
+    content: ""; width: 0; height: 0;
+    border-left: 5px solid var(--text-3); border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+    transition: transform var(--t-fast) ease;
+  }
+  details.thinking[open] summary::before { transform: rotate(90deg); }
+  details.thinking summary .th-hint { font-size: 11px; color: var(--text-3); }
+  .th-sec + .th-sec { margin-top: 8px; }
+  .th-sec-title { font-size: 11px; color: var(--text-3); letter-spacing: .06em; margin-bottom: 2px; }
+  .th-text {
+    margin: 0; white-space: pre-wrap; word-break: break-word;
+    font-family: var(--font-mono); font-size: 11.5px; line-height: 1.7; color: var(--text-3);
+    max-height: 180px; overflow-y: auto;
+  }
+  /* 流式进行中的段落末尾光标 */
+  .th-text.streaming::after {
+    content: "▌"; color: var(--accent); animation: sp-caret 1s steps(1) infinite;
+  }
+  @keyframes sp-caret { 50% { opacity: 0; } }
+
+  /* ===== 提案③ 流失败收敛提示（复用 .notice 气质，附重跑说明） ===== */
+  .stream-fail {
+    margin-top: var(--s3);
+    background: var(--surface); border: 1px solid var(--line-strong); border-left: 3px solid var(--destructive);
+    border-radius: 10px; padding: 10px 14px;
+    font-size: 12.5px; color: var(--text-1);
+  }
+  .stream-fail .sf-sub { margin-top: 4px; font-size: 11.5px; color: var(--text-3); }
+
+  /* 窄屏（≤640px，断点与既有页面同值）：步骤条纵排 */
+  @media (max-width: 640px) {
+    .sp-steps { flex-direction: column; gap: 10px; }
+    .sp-step { flex-direction: row; align-items: center; gap: 10px; }
+    .sp-step:not(:last-child)::after { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="proto-bar" id="proto-top">
+  <span class="pb-title">原型 · T-041</span>
+  <span class="pb-sub">搜索流式加载态（§17.5）· 新视觉元素提案，确认后开发</span>
+  <a class="pb-jump" href="#v-running">① 进行中</a>
+  <a class="pb-jump" href="#v-done">② 完成态</a>
+  <a class="pb-jump" href="#v-degrade">③ 退化态</a>
+  <a class="pb-jump" href="#v-mobile">④ 移动端</a>
+  <button class="pb-jump" id="replay">▶ 重播流式演示</button>
+  <span class="pb-note">意图＝「我要做爬虫，Python 的」· 思维链为英文原文假数据（生产实测思维链为英文，如实显示）</span>
+</div>
+
+<!-- ============ 视图 1 · 桌面端搜索进行中（流式动画，可重播） ============ -->
+<section class="view" id="v-running">
+  <div class="view-label"><b>视图 1</b>桌面端 P8 搜索页 · <u>进行中</u>：阶段步骤条逐段点亮＋AI 思考过程流式追加
+    <span class="hint">点顶栏「▶ 重播流式演示」从头播放；典型全程 10~30 秒（本演示压缩到约 12 秒）</span>
+  </div>
+  <div class="stage stage-scroll" id="stage-v1">
+    <header class="top">
+      <div class="wrap">
+        <h1 class="logo">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" opacity=".45"/><circle cx="12" cy="12" r="5" opacity=".7"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><path d="M12 12 19 5"/><circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+          </svg>
+          GitHub 雷达
+        </h1>
+        <nav class="tabs" aria-label="主导航">
+          <a href="#">本周报告</a><a href="#">我的关注<i>6</i></a><a href="#">季度回顾</a><a href="#">总星榜</a><a href="#">标签</a>
+          <a href="#" class="active" aria-current="page">搜索</a>
+        </nav>
+        <button class="translate-all">补译全部缺失</button>
+        <button class="translate-all recommend-all">补齐推荐语</button>
+        <button class="translate-all sync-all">立即同步</button>
+      </div>
+    </header>
+
+    <div class="wrap">
+      <p class="meta">基于池内 <b class="mono">3024</b> 个仓库（≥1000 星）本地检索 · 池内不足 20 条时 GitHub Search 实时补搜（池内在前、池外在后） · 检索走本地 SQL / GitHub API，AI 只做意图理解与精选 · 不建搜索缓存</p>
+      <section>
+        <h2 class="sec">搜索</h2>
+        <form class="search-box" onsubmit="return false">
+          <input type="text" value="我要做爬虫，Python 的" aria-label="搜索输入" maxlength="200">
+          <button type="submit" id="v1-btn" disabled>搜索中…</button>
+        </form>
+
+        <div class="search-progress" id="v1-progress" aria-live="polite">
+          <div class="sp-steps" id="v1-steps">
+            <div class="sp-step" data-step="intent"><span class="sp-dot">1</span><span class="sp-label">理解意图</span></div>
+            <div class="sp-step" data-step="recall"><span class="sp-dot">2</span><span class="sp-label">池内召回</span></div>
+            <div class="sp-step" data-step="select"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+            <div class="sp-step" data-step="external"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
+          </div>
+          <details class="thinking" id="v1-thinking" open>
+            <summary>AI 思考过程 <span class="th-hint">模型思维链英文原文，如实显示 · 完成后可折叠</span></summary>
+            <div class="th-sec" id="v1-sec-intent" hidden>
+              <div class="th-sec-title">意图理解</div>
+              <pre class="th-text" id="v1-text-intent"></pre>
+            </div>
+            <div class="th-sec" id="v1-sec-select" hidden>
+              <div class="th-sec-title">精选</div>
+              <pre class="th-text" id="v1-text-select"></pre>
+            </div>
+          </details>
+        </div>
+
+        <div id="v1-result"></div>
+      </section>
+      <footer class="note">新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成 · 数据：GitHub 官方 API 每日 UTC 快照</footer>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 视图 2 · 桌面端完成态 ============ -->
+<section class="view" id="v-done">
+  <div class="view-label"><b>视图 2</b>桌面端 P8 · <u>完成态</u>：步骤条全绿、思考区保留展开（可手动折叠）、结果区与现状完全一致
+    <span class="hint">意图透明行/结果行/推荐理由/池外徽标与现行结果页同形态（行＝榜单行组件）；点「AI 思考过程」标题可折叠</span>
+  </div>
+  <div class="stage stage-scroll" id="stage-v2">
+    <header class="top">
+      <div class="wrap">
+        <h1 class="logo">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" opacity=".45"/><circle cx="12" cy="12" r="5" opacity=".7"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><path d="M12 12 19 5"/><circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+          </svg>
+          GitHub 雷达
+        </h1>
+        <nav class="tabs" aria-label="主导航">
+          <a href="#">本周报告</a><a href="#">我的关注<i>6</i></a><a href="#">季度回顾</a><a href="#">总星榜</a><a href="#">标签</a>
+          <a href="#" class="active" aria-current="page">搜索</a>
+        </nav>
+        <button class="translate-all">补译全部缺失</button>
+        <button class="translate-all recommend-all">补齐推荐语</button>
+        <button class="translate-all sync-all">立即同步</button>
+      </div>
+    </header>
+
+    <div class="wrap">
+      <p class="meta">基于池内 <b class="mono">3024</b> 个仓库（≥1000 星）本地检索 · 池内不足 20 条时 GitHub Search 实时补搜（池内在前、池外在后） · 检索走本地 SQL / GitHub API，AI 只做意图理解与精选 · 不建搜索缓存</p>
+      <section>
+        <h2 class="sec">搜索</h2>
+        <form class="search-box" onsubmit="return false">
+          <input type="text" value="我要做爬虫，Python 的" aria-label="搜索输入" maxlength="200">
+          <button type="submit">搜索</button>
+        </form>
+
+        <div class="search-progress">
+          <div class="sp-steps">
+            <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
+            <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
+            <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">AI 精选</span></div>
+            <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">补搜 GitHub</span></div>
+          </div>
+          <details class="thinking" open>
+            <summary>AI 思考过程 <span class="th-hint">模型思维链英文原文，如实显示 · 点击折叠</span></summary>
+            <div class="th-sec">
+              <div class="th-sec-title">意图理解</div>
+              <pre class="th-text">The user wants to build a web crawler, specifically in Python. I should map this to common English keywords: "crawler", "scraping", "spider", "web-scraping". Language is clearly Python. No structured filters mentioned, so filters stays empty.</pre>
+            </div>
+            <div class="th-sec">
+              <div class="th-sec-title">精选</div>
+              <pre class="th-text">Candidate 1 (scrapy/scrapy) is the de-facto Python crawling framework — strongest match. Candidate 3 (microsoft/playwright-python) fits browser-automation crawling. Candidate 7 (binux/pyspider) is relevant but unmaintained; still worth listing with a caveat. I'll rank by fit to "building a crawler in Python" and skip generic HTTP libs.</pre>
+            </div>
+          </details>
+        </div>
+
+        <div class="intent-line">
+          <span><b>理解为：</b><span class="kw">crawler</span>、<span class="kw">scraping</span>、<span class="kw">spider</span>、<span class="kw">web-scraping</span></span>
+          <span class="sep">／</span>
+          <span><b>语言：</b><span class="kw">Python</span></span>
+        </div>
+
+        <div class="boards">
+          <div class="board">
+            <h3>搜索结果<span class="n">5 条（池内 4 · 池外 1）</span></h3>
+            <div id="v2-rows"></div>
+          </div>
+        </div>
+      </section>
+      <footer class="note">原型仅渲染 5 条示意结果（4 池内＋1 池外）· 结果区内容/形态与现行搜索页一致，本变更只加"过程可见"</footer>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 视图 3 · 两退化态并排 ============ -->
+<section class="view" id="v-degrade">
+  <div class="view-label"><b>视图 3</b>退化态并排 · 左：无思维链（仅步骤条，补搜跳过如实标注）｜右：流中途失败收敛
+    <span class="hint">左＝模型不返回思维链字段时整区不渲染、不报错；右＝断流后如实提示＋自动以同步表单重跑一次</span>
+  </div>
+  <div class="two-col">
+    <div class="col">
+      <div class="col-tag"><b>无思维链退化</b>（本地 free 模型 / json_object 下 reasoning 为空）</div>
+      <div class="stage">
+        <div class="wrap" style="padding-top:8px">
+          <form class="search-box" onsubmit="return false">
+            <input type="text" value="我要做爬虫，Python 的" aria-label="搜索输入">
+            <button type="submit" disabled>搜索中…</button>
+          </form>
+          <div class="search-progress">
+            <div class="sp-steps">
+              <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
+              <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
+              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+              <div class="sp-step skip"><span class="sp-dot">—</span><span class="sp-label">补搜 GitHub</span><span class="sp-sub">无需补搜</span></div>
+            </div>
+            <!-- 无思维链增量：思考过程区整块不渲染（不留空架、不报错） -->
+          </div>
+          <p class="empty-follows" style="margin-top:10px">（此态下无"AI 思考过程"区——模型未返回思维链时只显阶段进度；补搜步"无需补搜"为池内已足 20 条的如实标注，不伪造进度）</p>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="col-tag"><b>流中途失败</b>（网络异常/服务端错误）</div>
+      <div class="stage">
+        <div class="wrap" style="padding-top:8px">
+          <form class="search-box" onsubmit="return false">
+            <input type="text" value="我要做爬虫，Python 的" aria-label="搜索输入">
+            <button type="submit" disabled>搜索中…</button>
+          </form>
+          <div class="search-progress">
+            <div class="sp-steps">
+              <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
+              <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
+              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+              <div class="sp-step"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
+            </div>
+          </div>
+          <div class="stream-fail" role="status">
+            流式连接中断，已自动以普通方式重跑本次搜索（结果不变，仅无过程显示）。
+            <div class="sf-sub">再次失败时请手动重新提交 · 半成品结果不展示</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 视图 4 · 移动端 375px 进行中 ============ -->
+<section class="view" id="v-mobile">
+  <div class="view-label"><b>视图 4</b>移动端（375px）· 进行中：步骤条纵排（≤640px 断点与既有页面同值）
+    <span class="hint">搜索框按既有窄屏口径纵向堆叠；步骤条改纵排，思考区同桌面可折叠</span>
+  </div>
+  <div class="stage stage-m" id="stage-v4">
+    <div class="stage-inner">
+      <header class="top">
+        <div class="wrap">
+          <h1 class="logo">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" opacity=".45"/><circle cx="12" cy="12" r="5" opacity=".7"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><path d="M12 12 19 5"/><circle cx="16.6" cy="14.6" r="1.1" fill="currentColor" stroke="none"/>
+            </svg>
+            GitHub 雷达
+          </h1>
+          <nav class="tabs" aria-label="主导航">
+            <a href="#">本周报告</a><a href="#">关注<i>6</i></a><a href="#">季榜</a><a href="#">总星</a><a href="#">标签</a>
+            <a href="#" class="active" aria-current="page">搜索</a>
+          </nav>
+        </div>
+      </header>
+      <div class="wrap">
+        <section>
+          <h2 class="sec">搜索</h2>
+          <form class="search-box" onsubmit="return false">
+            <input type="text" value="我要做爬虫，Python 的" aria-label="搜索输入">
+            <button type="submit" disabled>搜索中…</button>
+          </form>
+          <div class="search-progress">
+            <div class="sp-steps">
+              <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
+              <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
+              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+              <div class="sp-step"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
+            </div>
+            <details class="thinking" open>
+              <summary>AI 思考过程 <span class="th-hint">英文原文</span></summary>
+              <div class="th-sec">
+                <div class="th-sec-title">意图理解</div>
+                <pre class="th-text">The user wants to build a web crawler, specifically in Python. Keywords: "crawler", "scraping", "spider", "web-scraping".</pre>
+              </div>
+              <div class="th-sec">
+                <div class="th-sec-title">精选</div>
+                <pre class="th-text streaming">Candidate 1 (scrapy/scrapy) is the de-facto Python crawling framework — strongest match. Candidate 3 fits browser-automation crawling…</pre>
+              </div>
+            </details>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="note" style="max-width:1440px;margin:36px auto 40px;padding:0 20px 12px;">
+  原型范围说明：本文件仅提案新视觉元素（阶段步骤条三态＋补搜跳过态／AI 思考过程折叠区／流失败提示）；既有组件（顶栏、搜索框、意图透明行、结果行、详情面板）直接复用 radar.css 未改动 · 结果区内容与现行搜索页一致——本变更只加"过程可见"，意图/降级/追问口径一字不改 · 步骤条宽度、呼吸点节奏、思考区等宽字体等取舍详见 OpenSpec change streaming-search-progress 的 design.md · 假数据沿用搜索页真实风格
+</footer>
+
+<div id="toasts" aria-live="polite" role="status"></div>
+
+<script>
+/* ===== T-041 原型演示脚本（纯 vanilla，零依赖；非产品逻辑，不迁移） ===== */
+const ESC = s => s.replace(/"/g, "&quot;");
+const STAR_O = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
+const STAR_F = '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
+const STAR_S = '<svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>';
+const CHEV = '<svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+const EXT = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5.5"/></svg>';
+const LC = { "Python":"#4b8bbe", "TypeScript":"#5ca9e6", "Go":"#00ADD8" };
+
+/* 搜索结果假数据（沿用搜索页真实风格；4 池内＋1 池外） */
+const ROWS = [
+  {repo:"scrapy/scrapy", lang:"Python", stars:"53.4k", year:2008, f:1,
+   en:"A fast high-level web crawling and web scraping framework, used to crawl websites and extract structured data from their pages.",
+   zh:"快速的高层网页爬取与抓取框架，用于爬取网站并从页面中提取结构化数据。",
+   reason:"Python 爬虫事实标准，架构成熟、中间件生态全，做爬虫首选起点。",
+   note:"数据端点 2026-10-12"},
+  {repo:"microsoft/playwright-python", lang:"Python", stars:"13.2k", year:2020, f:0,
+   en:"Python version of the Playwright testing and automation library.",
+   zh:"Playwright 自动化库的 Python 版本，可驱动真实浏览器渲染抓取。",
+   reason:"动态渲染页面爬取利器，API 与浏览器端 Playwright 一致，上手成本低。",
+   note:"数据端点 2026-10-12"},
+  {repo:"binux/pyspider", lang:"Python", stars:"16.1k", year:2014, f:0,
+   en:"A Powerful Spider (Web Crawler) System in Python.",
+   zh:"强大的 Python 爬虫系统，带 Web 界面调试与任务调度。",
+   reason:"自带 WebUI 调试与调度，适合快速验证抓取逻辑（注意维护放缓）。",
+   note:"数据端点 2026-10-12"},
+  {repo:"apify/crawlee-python", lang:"Python", stars:"4.8k", year:2023, f:0,
+   en:"Crawlee—A web scraping and browser automation library for Python to build reliable crawlers.",
+   zh:"面向可靠爬虫的 Python 抓取与浏览器自动化库，内置队列与反封锁。",
+   reason:"新一代爬虫框架，内置请求队列/重试/会话轮换，适合规模化抓取。",
+   note:"数据端点 2026-10-12"},
+  {repo:"newcomer/lite-crawler", lang:"Python", stars:"1.2k", year:2025, f:0, external:1,
+   en:"A lightweight async web crawler with a simple pipeline API."},
+];
+
+function rowHTML(it, i){
+  const panelInner = it.external
+    ? `<div class="desc-en">${it.en}</div>
+       <div class="acts"><a class="gh" href="#" onclick="return false">在 GitHub 打开 ${EXT}</a></div>`
+    : `<div class="desc-en">${it.en}</div>
+       <div class="desc-zh">${it.zh}</div>
+       <div class="reason"><b>推荐理由</b>${it.reason}</div>
+       <div class="endpoint-note">${it.note}</div>
+       <div class="acts">
+         <a class="gh" href="#" onclick="return false">在 GitHub 打开 ${EXT}</a>
+         <button class="tag-add">＋ 标签</button>
+         <button class="translate-btn">重新翻译</button>
+       </div>`;
+  return `<div class="row expanded" data-b="v2" data-i="${i}" tabindex="0" role="button" aria-expanded="true">
+      <span class="rank">${i+1}</span>
+      <span class="repo-wrap"><span class="repo" title="${it.repo}">${it.repo}</span><span class="year">· ${it.year}</span>${CHEV}</span>
+      ${it.lang ? `<span class="badge"><span class="dot" style="background:${LC[it.lang]||"#8b98a9"}"></span>${it.lang}</span>` : ""}
+      ${it.external ? '<span class="badge pool">池外</span><span class="up na">——</span>' : ""}
+      <span class="total">${STAR_S}${it.stars}</span>
+      <button class="star ${it.f?"on":""}" aria-label="${it.f?"取消关注":"关注"}" title="${it.f?"取消关注":"关注"}">${it.f?STAR_F:STAR_O}</button>
+    </div>
+    <div class="panel open" data-b="v2" data-i="${i}">${panelInner}</div>`;
+}
+document.getElementById("v2-rows").innerHTML = ROWS.map(rowHTML).join("");
+
+/* ===== 视图 1：流式过程演示（压缩时序；真实节奏 10~30s） ===== */
+const THINK_INTENT = 'The user wants to build a web crawler, specifically in Python. I should map this to common English keywords: "crawler", "scraping", "spider", "web-scraping". Language is clearly Python. No structured filters mentioned, so filters stays empty.';
+const THINK_SELECT = "Candidate 1 (scrapy/scrapy) is the de-facto Python crawling framework — strongest match. Candidate 3 (microsoft/playwright-python) fits browser-automation crawling. Candidate 7 (binux/pyspider) is relevant but unmaintained; still worth listing with a caveat. I'll rank by fit and skip generic HTTP libs.";
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let playing = false;
+
+function setStep(id, state){ // state: "" | "active" | "done" | "skip"
+  const el = document.querySelector(`#v1-steps .sp-step[data-step="${id}"]`);
+  el.className = "sp-step" + (state ? " " + state : "");
+  el.querySelector(".sp-dot").textContent = state === "done" ? "✓" : state === "skip" ? "—" : el.dataset.step ? ({intent:1,recall:2,select:3,external:4})[el.dataset.step] : "";
+}
+async function typeInto(pre, text){
+  pre.classList.add("streaming");
+  for (let i = 0; i < text.length; i += 7){
+    pre.textContent += text.slice(i, i + 7);
+    pre.scrollTop = pre.scrollHeight;
+    await sleep(24);
+  }
+  pre.classList.remove("streaming");
+}
+async function play(){
+  if (playing) return;
+  playing = true;
+  const btn = document.getElementById("v1-btn");
+  document.getElementById("v1-result").innerHTML = "";
+  ["intent","recall","select","external"].forEach(s => setStep(s, ""));
+  ["v1-sec-intent","v1-sec-select"].forEach(id => document.getElementById(id).hidden = true);
+  document.getElementById("v1-text-intent").textContent = "";
+  document.getElementById("v1-text-select").textContent = "";
+  document.getElementById("v1-thinking").open = true;
+  btn.disabled = true; btn.textContent = "搜索中…";
+
+  setStep("intent", "active");
+  document.getElementById("v1-sec-intent").hidden = false;
+  await typeInto(document.getElementById("v1-text-intent"), THINK_INTENT);
+  setStep("intent", "done");
+
+  setStep("recall", "active");
+  await sleep(500); // 池内召回为毫秒级 SQL，演示放慢到半秒
+  setStep("recall", "done");
+
+  setStep("select", "active");
+  document.getElementById("v1-sec-select").hidden = false;
+  await typeInto(document.getElementById("v1-text-select"), THINK_SELECT);
+  setStep("select", "done");
+
+  setStep("external", "active");
+  await sleep(900);
+  setStep("external", "done");
+
+  btn.disabled = false; btn.textContent = "搜索";
+  toast("演示完成：结果区由服务端 SSR 片段整体替换（形态见视图 2）");
+  playing = false;
+}
+document.getElementById("replay").addEventListener("click", play);
+play(); // 打开页面自动播放一遍
+
+/* ===== 行交互（沿用示意图：折叠/展开、★ 关注；仅作用于视图 2 结果区） ===== */
+function toast(msg){
+  const t = document.createElement("div");
+  t.className = "toast"; t.textContent = msg;
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(() => t.remove(), 4000);
+}
+document.getElementById("stage-v2").addEventListener("click", e => {
+  const star = e.target.closest(".star");
+  if (star){
+    e.stopPropagation();
+    const on = star.classList.toggle("on");
+    star.innerHTML = on ? STAR_F : STAR_O;
+    star.title = on ? "取消关注" : "关注";
+    star.setAttribute("aria-label", star.title);
+    toast(on ? "已关注" : "已取消关注（跟踪保留）");
+    return;
+  }
+  const row = e.target.closest(".row");
+  if (row){
+    const panel = document.querySelector(`.panel[data-b="${row.dataset.b}"][data-i="${row.dataset.i}"]`);
+    const open = row.classList.toggle("expanded");
+    row.setAttribute("aria-expanded", String(open));
+    if (panel) panel.classList.toggle("open", open);
+  }
+});
+</script>
+</body>
+</html>
