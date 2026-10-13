@@ -78,6 +78,9 @@
   }
   .sp-label { font-size: 12px; color: var(--text-3); white-space: nowrap; }
   .sp-sub { font-size: 11px; color: var(--text-3); font-family: var(--font-mono); }
+  /* 进行中步骤的已用时秒数（走查追加）：与 label 同行、间距 4px；清空即收起 */
+  .sp-time { margin-left: 4px; font-size: 11px; font-weight: 400; color: var(--text-3); font-family: var(--font-mono); }
+  .sp-time:empty { display: none; }
   /* 进行中：品牌绿呼吸点 */
   .sp-step.active .sp-dot { background: var(--accent); animation: sp-breath 1.2s ease-in-out infinite; }
   .sp-step.active .sp-label { color: var(--accent-hi); font-weight: 600; }
@@ -184,10 +187,10 @@
 
         <div class="search-progress" id="v1-progress" aria-live="polite">
           <div class="sp-steps" id="v1-steps">
-            <div class="sp-step" data-step="intent"><span class="sp-dot">1</span><span class="sp-label">理解意图</span></div>
-            <div class="sp-step" data-step="recall"><span class="sp-dot">2</span><span class="sp-label">池内召回</span></div>
-            <div class="sp-step" data-step="select"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
-            <div class="sp-step" data-step="external"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
+            <div class="sp-step" data-step="intent"><span class="sp-dot">1</span><span class="sp-label">理解意图<span class="sp-time"></span></span></div>
+            <div class="sp-step" data-step="recall"><span class="sp-dot">2</span><span class="sp-label">池内召回<span class="sp-time"></span></span></div>
+            <div class="sp-step" data-step="select"><span class="sp-dot">3</span><span class="sp-label">AI 精选<span class="sp-time"></span></span></div>
+            <div class="sp-step" data-step="external"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub<span class="sp-time"></span></span></div>
           </div>
           <details class="thinking" id="v1-thinking" open>
             <summary>AI 思考过程 <span class="th-hint">模型思维链英文原文，如实显示 · 完成后可折叠</span></summary>
@@ -298,7 +301,7 @@
             <div class="sp-steps">
               <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
               <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
-              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选<span class="sp-time">· 3s</span></span></div>
               <div class="sp-step skip"><span class="sp-dot">—</span><span class="sp-label">补搜 GitHub</span><span class="sp-sub">无需补搜</span></div>
             </div>
             <!-- 无思维链增量：思考过程区整块不渲染（不留空架、不报错） -->
@@ -319,7 +322,7 @@
             <div class="sp-steps">
               <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
               <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
-              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选<span class="sp-time">· 3s</span></span></div>
               <div class="sp-step"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
             </div>
           </div>
@@ -365,7 +368,7 @@
             <div class="sp-steps">
               <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">理解意图</span></div>
               <div class="sp-step done"><span class="sp-dot">✓</span><span class="sp-label">池内召回</span></div>
-              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选</span></div>
+              <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选<span class="sp-time">· 3s</span></span></div>
               <div class="sp-step"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
             </div>
             <details class="thinking" open>
@@ -459,10 +462,26 @@ const THINK_SELECT = "Candidate 1 (scrapy/scrapy) is the de-facto Python crawlin
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let playing = false;
 
+let stepTimer = null, stepTimeEl = null;
+function stopStepTimer(){ // 与实现同口径：进行中显示已用时秒数，收尾（含重建）即停表清空
+  if (stepTimer) clearInterval(stepTimer);
+  stepTimer = null;
+  if (stepTimeEl) stepTimeEl.textContent = "";
+  stepTimeEl = null;
+}
 function setStep(id, state){ // state: "" | "active" | "done" | "skip"
   const el = document.querySelector(`#v1-steps .sp-step[data-step="${id}"]`);
   el.className = "sp-step" + (state ? " " + state : "");
   el.querySelector(".sp-dot").textContent = state === "done" ? "✓" : state === "skip" ? "—" : el.dataset.step ? ({intent:1,recall:2,select:3,external:4})[el.dataset.step] : "";
+  stopStepTimer();
+  if (state === "active"){
+    const time = el.querySelector(".sp-time");
+    const t0 = Date.now();
+    stepTimeEl = time;
+    const tick = () => { time.textContent = `· ${Math.floor((Date.now() - t0) / 1000)}s`; };
+    tick();
+    stepTimer = setInterval(tick, 1000);
+  }
 }
 async function typeInto(pre, text){
   pre.classList.add("streaming");
