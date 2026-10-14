@@ -109,13 +109,14 @@ def test_plural_normalized_and_low_freq_filtered(conn):
 
 def test_suggest_topics_parses_batch_json_and_tolerates_malformed():
     """AI 输出解析（§15.2）：批量一次调用（请求体含全部候选词与主题名，不含仓库数据）；
-    JSON 对象逐词解析（含"不建议收录"值）；markdown 围栏容错；畸形/无 JSON → DeepSeekError（调用方整段降级）。"""
+    JSON 对象逐词解析（含"不建议收录"值）；markdown 围栏容错；畸形/无 JSON → DeepSeekError（调用方整段降级）。
+    桩响应带 role：引擎按 role 决定消息类（缺 role 落成 ChatMessage 形态报校验错）。"""
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["body"] = json.loads(request.content)
         content = '```json\n{"claude-code": "AI与智能", "hacktoberfest": "不建议收录"}\n```'
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": content}}]})
 
     client = DeepSeekClient("test-key", transport=httpx.MockTransport(handler))
     out = asyncio.run(client.suggest_topics(["claude-code", "hacktoberfest"], ["AI与智能", "前端/UI"]))
@@ -128,7 +129,7 @@ def test_suggest_topics_parses_batch_json_and_tolerates_malformed():
 
     for bad in ("不是 JSON", '{"a": "b"', "[]"):
         def handler_bad(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"choices": [{"message": {"content": bad}}]})
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": bad}}]})
 
         client2 = DeepSeekClient("test-key", transport=httpx.MockTransport(handler_bad))
         with pytest.raises(DeepSeekError, match="解析失败"):

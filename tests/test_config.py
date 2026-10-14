@@ -47,7 +47,7 @@ def test_defaults_when_unset(monkeypatch, tmp_path):
     assert s.ai_api_key == ""
     assert s.ai_base_url == DEFAULT_AI_BASE_URL == "https://api.deepseek.com/v1"
     assert s.ai_model == DEFAULT_AI_MODEL == "deepseek-chat"
-    assert s.ai_timeout_seconds == DEFAULT_AI_TIMEOUT_SECONDS == 60
+    assert s.ai_timeout_seconds == DEFAULT_AI_TIMEOUT_SECONDS == 300  # 连接总上限（ai-langchain-refactor 裁定 4）
     assert s.ai_max_retries == DEFAULT_AI_MAX_RETRIES == 1
     assert s.ai_readme_head_chars == DEFAULT_AI_README_HEAD_CHARS == 8000
 
@@ -98,16 +98,17 @@ def test_invalid_int_falls_back_to_default(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_MAX_RETRIES", "0")
     monkeypatch.setenv("AI_README_HEAD_CHARS", "-100")
     s = get_settings()
-    assert (s.ai_timeout_seconds, s.ai_max_retries, s.ai_readme_head_chars) == (60, 1, 8000)
+    assert (s.ai_timeout_seconds, s.ai_max_retries, s.ai_readme_head_chars) == (300, 1, 8000)
 
 
 def test_client_uses_custom_base_url_and_model():
-    """DeepSeekClient 实例级 base_url/model：请求实际打到自定义端点、payload 用自定义模型。"""
+    """DeepSeekClient 实例级 base_url/model：请求实际打到自定义端点、payload 用自定义模型
+    （引擎切换后桩响应须带 role 字段）。"""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://example.com/v1/chat/completions"
         assert json.loads(request.content)["model"] == "some-other-model"
-        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
 
     client = DeepSeekClient(
         "k",

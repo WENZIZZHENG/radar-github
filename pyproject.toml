@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn>=0.30",
     "httpx>=0.27",
     "openai>=3.3,<4",  # AI 调用客户端（OpenAI 兼容协议）；下界钉到实测验证过的 3.3，防大版本行为漂移
+    "langchain-deepseek>=1.1.1,<2",  # AI 引擎（ChatDeepSeek）；下界钉 spike 实测版，上界防大版本漂移（StreamChunkTimeoutError 走私有模块导入，见裁定 2）
     "apscheduler>=3.10,<4",
     "jinja2>=3.1",
     "pyyaml>=6.0",

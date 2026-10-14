@@ -33,11 +33,20 @@
   直通整轮 handler；403 内容审核拦截（content_policy）属单仓失败，按 DeepSeekError 跳过该条；
   GitHub token 缺失/无效 → README 全量退化（readme_sha 保持 NULL），不报错；
   AI 整段异常由调用方（daily_job）吞掉记 ERROR——任何情况下快照主流程不受影响。
-- 流式变体（T-041，§17.5）：`_chat_stream` 逐 chunk 下发思维链增量（`reasoning_content` 字符串增量 /
-  `reasoning_details` 数组两种字段名兼容，皆缺则零增量不报错）并返回 content 增量；协议参数集与
-  `_chat` 一字不差（含 response_format）；仅在"尚未下发任何增量"时按既有错误链重试一次，已有增量
-  后中断按调用失败直抛（防重复展示思维链）。`understand_intent`/`select_and_reason` 的可选
-  `thinking_cb` 为 None（缺省）时走既有 `_chat`——同步路径请求形态逐字节不变。
+- 流式变体（T-041，§17.5；ai-langchain-refactor 后走 LangChain）：`understand_intent`/`select_and_reason`
+  的可选 `thinking_cb` 为 None（缺省）时走同步 ainvoke（协议参数与旧实现一致：带 response_format、
+  非流式），非 None 时走 astream 并把 `additional_kwargs["reasoning_content"]` 增量逐段喂回调
+  （字段缺/空 → 零增量不报错，退化为纯阶段进度）；content 增量只累积、末尾一次性解析（第二道防线
+  `_parse_suggested_topics` 不动）。交互路径零自动重试（首字节前失败也不重试，失败如实抛出）。
+  流式形态的 response_format 经 `extra_body` 下发（裁定 1）：顶层形式会命中引擎结构化输出解析路径，
+  逐段思维链被丢弃只在流末聚合透出；extra_body 形式线上请求体不变（顶层仍带该参数）而逐段恢复。
+- 引擎与重试双口径（ai-langchain-refactor 决策 1/2/4/5）：内部实现＝LangChain ChatDeepSeek（单点 factory
+  `_build_chat_model` 产交互/批量双实例，均 max_retries=0 关引擎内置重试）；交互路径不包重试，批量路径
+  外层 `with_retry(stop_after_attempt=max_retries+1, retry_if_exception_type=RETRYABLE_EXC)`（零等待）——
+  可重试类＝超时/连接/5xx/流式空闲超时/响应畸形，429 与其余 4xx、账户类永不重试。连接总上限走
+  `AI_TIMEOUT_SECONDS`（缺省 300s），流式空闲超时 `STREAM_CHUNK_TIMEOUT_SECONDS`（60s 写死）。
+  对外异常类型与人话文案逐字不变，唯一例外＝交互路径"重试 N 次后放弃"类文案消失（刻意行为变化，
+  见 openspec/changes/ai-langchain-refactor）。
 """
 
 from __future__ import annotations
@@ -47,18 +56,22 @@ import json
 import logging
 import re
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import NoReturn
 
 import httpx
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+from langchain_openai.chat_models._client_utils import StreamChunkTimeoutError
 from openai import (
     APIConnectionError,
     APIError,
     APIStatusError,
     APITimeoutError,
-    AsyncOpenAI,
     AuthenticationError,
+    InternalServerError,
     PermissionDeniedError,
 )
 
@@ -79,9 +92,9 @@ CHAT_URL = DEFAULT_AI_BASE_URL  # 缺省端点别名；实际请求走实例 bas
 CHAT_MODEL = DEFAULT_AI_MODEL  # 缺省模型别名；实际请求走实例 model（.env AI_MODEL）
 TOPICS_PATH = BASE_DIR / "config" / "topics.yaml"  # 与 web 层同一路径来源（app/web/routes.py TOPICS_PATH）
 
-DEFAULT_MAX_RETRIES = DEFAULT_AI_MAX_RETRIES  # 缺省重试次数别名；实际走实例 max_retries（.env AI_MAX_RETRIES）
-RETRY_WAIT_SECONDS = 1.0  # 仅重试一次，固定等 1 秒即可，不引指数退避
-REQUEST_TIMEOUT_SECONDS = DEFAULT_AI_TIMEOUT_SECONDS  # 缺省超时别名；实际走实例 timeout（.env AI_TIMEOUT_SECONDS）
+DEFAULT_MAX_RETRIES = DEFAULT_AI_MAX_RETRIES  # 缺省重试次数别名；批量路径重试次数（.env AI_MAX_RETRIES）
+REQUEST_TIMEOUT_SECONDS = DEFAULT_AI_TIMEOUT_SECONDS  # 缺省超时别名；实际走实例 request_timeout（.env AI_TIMEOUT_SECONDS）
+STREAM_CHUNK_TIMEOUT_SECONDS = 60.0  # 流式空闲超时：60 秒无 chunk 即判挂（引擎缺省 120s 不沿用，决策 5）
 
 # README 正文截断入 prompt 的缺省字符上限（T-017 本人拍板授权实施）：≈2000~3000 tokens，
 # 覆盖 README 头部核心信息且不撑爆上下文；截断点取前部（README 惯例：开头即项目定位）。
@@ -110,9 +123,53 @@ class DeepSeekAuthError(DeepSeekError):
     """
 
 
-class _RetryChatStream(Exception):
-    """流式 create 阶段的可重试失败已按既有口径等待（首字节前无副作用）：内部信号，
-    由 `_chat_stream` 捕获后续跑下一轮；不对外暴露、不进错误链文案。"""
+class _ResponseMalformedError(DeepSeekError):
+    """响应畸形（响应内容缺失/空白，或引擎解析层拒收响应体）：对外仍是 DeepSeekError（文案"响应畸形"逐字保留）。
+
+    子类化的唯一用途＝进 RETRYABLE_EXC 白名单，复刻"畸形重试一次"的批量口径（决策 2-4）；
+    交互路径不包 with_retry，故直接抛出。
+    """
+
+
+# 批量路径可重试异常白名单（决策 2-3）：超时/连接/5xx/流式空闲超时/响应畸形。
+# 429 与其余 4xx、账户类（401/402/403）永不入列——盲重试只会放大调用量（既有拍板延续）。
+# 注：openai 3.3.1 无 BadGatewayError/ServiceUnavailableError/GatewayTimeoutError 三个类（已核），
+# 5xx 统一由 InternalServerError 覆盖——LangChain 包装的 OpenAIAPIError 亦继承之，502/503/504 实测落此类。
+RETRYABLE_EXC: tuple[type[BaseException], ...] = (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    StreamChunkTimeoutError,
+    _ResponseMalformedError,
+)
+
+
+def _build_chat_model(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    request_timeout: float,
+    http_async_client: httpx.AsyncClient | None,
+) -> ChatDeepSeek:
+    """单点 factory（决策 1）：facade 参数 → ChatDeepSeek 构造参数映射。
+
+    base_url→api_base、model→model、request_timeout→request_timeout、transport 包出的 httpx 客户端
+    →http_async_client（测试缝保留：MockTransport 收到的请求 URL 仍为 {base_url}/chat/completions）；
+    max_retries=0 关引擎/SDK 内置重试（其语义＝重试 429＋指数退避，与本仓口径冲突，不关则双重复试放大
+    调用量）；temperature/response_format 不进构造器，由方法调用点经 .bind() 下发（spike 实证到达请求体）。
+    """
+    return ChatDeepSeek(
+        # SDK 构造会校验空 key；用占位符绕过，真实"空 key"拦截保留在使用点（_require_api_key），
+        # 与原有语义一致（config 层不报错，调用第一刀才报错）。
+        api_key=api_key or " ",
+        api_base=base_url,
+        model=model,
+        request_timeout=request_timeout,
+        max_retries=0,
+        stream_chunk_timeout=STREAM_CHUNK_TIMEOUT_SECONDS,
+        http_async_client=http_async_client,
+    )
 
 
 def _is_content_policy_403(exc: PermissionDeniedError) -> bool:
@@ -129,15 +186,65 @@ def _is_content_policy_403(exc: PermissionDeniedError) -> bool:
     return marker in haystack.lower()
 
 
-def _is_retryable_chat_error(exc: Exception) -> bool:
-    """该异常是否属于 `_handle_chat_error` 的可重试类（5xx 状态码 / 超时 / 连接 / 响应畸形）。
+def _chunk_text(chunk: object) -> str:
+    """从一次流式 chunk 取正文增量文本：content 为 str 直取；list 形态（content blocks）拼其中文本块；
+    其余形态返回空串（不报错）。"""
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return ""
 
-    流式变体"已有增量下发后不再重试"需据此类判定如实文案（真重试过才提"重试 N 次后放弃"）；
-    判级口径与 `_handle_chat_error` 逐分支对齐，改动其一须同步另一处。
+
+def _reasoning_delta(chunk: object) -> str:
+    """从一次流式 chunk 取思维链增量（T-041，§17.5）。
+
+    只认 `additional_kwargs["reasoning_content"]` 字符串增量——ChatDeepSeek 唯一透出点（spike 实证，
+    data/ai-fw-spike/result.json）；`reasoning_details` 数组兼容随旧手搓实现整体退役（引擎不解析该
+    字段，属死代码）。字段缺/空 → 空串（调用方不产生思维链增量，退化为纯阶段进度）。
     """
-    if isinstance(exc, APIStatusError):
-        return exc.status_code >= 500  # 其余 4xx（含 429）与账户类同姿态：不重试
-    return isinstance(exc, (APITimeoutError, APIConnectionError, APIError))
+    kwargs = getattr(chunk, "additional_kwargs", None)
+    if not isinstance(kwargs, dict):
+        return ""
+    raw = kwargs.get("reasoning_content")
+    return raw if isinstance(raw, str) else ""
+
+
+def _require_content(message: object) -> str:
+    """响应自检：取正文（str 或 text 块拼接）去首尾空白，空/缺 → `_ResponseMalformedError`。
+
+    文案与旧实现逐字一致（"DeepSeek 响应畸形（JSON 无法解析或缺 content）"＋响应摘录）；批量路径
+    该异常进 RETRYABLE_EXC 白名单 → 复刻"畸形重试一次"，交互路径直接抛。
+    """
+    text = _chunk_text(message).strip()
+    if not text:
+        raise _ResponseMalformedError(f"DeepSeek 响应畸形（JSON 无法解析或缺 content）：{repr(message)[:200]}")
+    return text
+
+
+# 引擎解析层拒收响应体时实际抛出的异常类型（F2-1 修复的捕获面，2026-10-14 逐例取证）：
+# 无 response_format → LangChain 响应类型检查抛 ValueError；带 response_format（结构化输出解析面）
+# → openai SDK `_parse_chat_completion` 遍历 str 的 `.choices` 抛 AttributeError、200＋{"error": …} 体
+# 抛 TypeError。三型共同语义＝"引擎未能把响应体解释成一条可用的助手消息"，与旧实现的"响应畸形"同类。
+_ENGINE_PARSE_ERRORS = (ValueError, AttributeError, TypeError)
+
+
+def _malformed_engine_response(exc: Exception) -> _ResponseMalformedError:
+    """引擎解析层拒收响应体 → "响应畸形"对外异常（F2-1 语义恢复，2026-10-14 主 agent 裁定）。
+
+    旧实现此类响应落"DeepSeek 响应畸形（…）"文案＋批量路径白名单重试一次；引擎切换后同样的响应在引擎
+    内部就抛异常、落"未知异常"分支（文案变"请求失败（…）"且批量不再重试），双重漂移。归一后同时恢复。
+    捕获面仅限引擎调用最小面（调用点已把本模块自身的参数构造移出该面；网络层失败是
+    APIConnectionError/APITimeoutError 等特定类型，不在此列）。
+    """
+    return _ResponseMalformedError(f"DeepSeek 响应畸形（{type(exc).__name__}: {exc}）")
 
 
 def has_cjk(text: str) -> bool:
@@ -166,60 +273,6 @@ def _refresh_window_open(d: date) -> bool:
     窗口判定只读 date，不引入新依赖；周榜（week）与手动批量补缺（refresh=False）不受此窗口影响。
     """
     return d.day in (1, 15)
-
-
-def _extract_content(response: object) -> str | None:
-    """从 chat/completions 响应取首条 message.content 并去首尾空白；结构缺失/空内容一律 None。"""
-    try:
-        content = response.choices[0].message.content  # type: ignore[attr-defined]
-    except (AttributeError, IndexError, TypeError):
-        return None
-    if not isinstance(content, str):
-        return None
-    return content.strip() or None
-
-
-def _response_text(response: object) -> str:
-    """取 SDK 响应对象的文本表示，用于错误日志（畸形响应时记录）。"""
-    if hasattr(response, "model_dump"):
-        try:
-            return json.dumps(response.model_dump(), ensure_ascii=False)  # type: ignore[attr-defined]
-        except (ValueError, TypeError):
-            pass
-    return repr(response)
-
-
-def _delta_field(delta: object, name: str) -> object:
-    """取流式 delta 上的字段：SDK 模型对象取属性，dict 形态取键（缺一律 None）。"""
-    if isinstance(delta, dict):
-        return delta.get(name)
-    return getattr(delta, name, None)
-
-
-def _reasoning_text(delta: object) -> str:
-    """从一个流式 chunk 的 delta 取思维链增量文本（T-041，§17.5，两种字段名兼容）。
-
-    `reasoning_content`（生产 deepseek 实测：字符串增量）优先；缺则探 `reasoning_details`
-    （本地 free 模型形态：数组）——元素为 str 直取、为 dict 取 text/content 字符串字段，
-    形态不识整体跳过。两字段皆缺/为空 → 空串（调用方不产生任何思维链增量，退化为纯阶段进度）。
-    """
-    raw = _delta_field(delta, "reasoning_content")
-    if isinstance(raw, str) and raw:
-        return raw
-    details = _delta_field(delta, "reasoning_details")
-    if not isinstance(details, list):
-        return ""
-    parts: list[str] = []
-    for item in details:
-        if isinstance(item, str):
-            parts.append(item)
-        elif isinstance(item, dict):
-            for key in ("text", "content"):
-                value = item.get(key)
-                if isinstance(value, str) and value:
-                    parts.append(value)
-                    break
-    return "".join(parts)
 
 
 def _parse_suggested_topics(content: str) -> dict | None:
@@ -361,8 +414,12 @@ def build_summary_prompt(
 
 
 class DeepSeekClient:
-    """OpenAI 官方 AsyncOpenAI 封装 OpenAI 兼容 chat/completions（缺省 DeepSeek，.env AI_BASE_URL/AI_MODEL 可换
-    提供方；类名保留 DeepSeekClient 免大面积改名）；transport / sleep 可注入（单测 MockTransport 离线跑）。"""
+    """AI 调用唯一入口（规格 ai-client）：外壳与公开签名稳定，内部实现＝LangChain ChatDeepSeek 双实例。
+
+    交互实例（understand_intent/select_and_reason——流式与同步降级形态同口径）零自动重试；批量实例
+    （translate/recommend/summarize/suggest_topics）按 RETRYABLE_EXC 白名单重试 self._max_retries 次。
+    transport 可注入（单测 MockTransport 离线跑）；sleep 参数签名保留但已无消费点（重试零等待，决策 2）。
+    """
 
     def __init__(
         self,
@@ -376,26 +433,37 @@ class DeepSeekClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self._api_key = api_key
-        self._model = model
-        self._sleep = sleep
         self._max_retries = max_retries
-        # transport 注入时，把 transport 包进 httpx.AsyncClient 再作为 http_client 传给 SDK，
+        self._sleep = sleep  # 签名保留（注入面不变）；重试零等待后不再被调用（决策 2 存疑点 1 拍板）
+        # transport 注入时，把 transport 包进 httpx.AsyncClient 再作为 http_async_client 传给引擎，
         # 单测 MockTransport handler 收到的请求 URL 保持为 {base_url}/chat/completions。
-        http_client = None
-        if transport is not None:
-            http_client = httpx.AsyncClient(transport=transport, timeout=request_timeout)
-        self._client = AsyncOpenAI(
-            # SDK 3.x 构造函数会校验空 key；用占位符绕过，真实"空 key"拦截保留在 _chat 使用点，
-            # 与原有语义一致（config 层不报错，调用第一刀才报错）。
-            api_key=api_key or " ",
-            base_url=base_url,
-            timeout=request_timeout,
-            max_retries=0,  # 自带重试关闭：重试语义由本类循环保证，避免双重复试放大调用量
-            http_client=http_client,
+        self._http_client = (
+            httpx.AsyncClient(transport=transport, timeout=request_timeout) if transport is not None else None
+        )
+        common = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+            "request_timeout": request_timeout,
+            "http_async_client": self._http_client,
+        }
+        # 双实例（决策 1）：交互＝零自动重试；批量＝"引擎调用＋响应自检"一并进 with_retry 白名单重试
+        # （响应畸形是外壳自检产物，须在包装内才走得上"畸形重试一次"的既有口径，决策 2-4）。
+        self._interactive = _build_chat_model(**common)
+        self._batch_model = _build_chat_model(**common)
+        # 重试单元＝"引擎最小调用面（含解析层异常归一）＋响应自检"：两者都须在 with_retry 包装内，
+        # 才走得上"畸形重试一次"的既有口径（决策 2-4）；归一语义见 _malformed_engine_response（F2-1）。
+        self._batch = RunnableLambda(self._batch_once).with_retry(
+            stop_after_attempt=max_retries + 1,
+            retry_if_exception_type=RETRYABLE_EXC,
+            wait_exponential_jitter=False,  # 零等待立即重试（不引 1s 薄包装，决策 2 存疑点 1 拍板）
         )
 
     async def aclose(self) -> None:
-        await self._client.close()
+        for chat_model in (self._interactive, self._batch_model):
+            await chat_model.root_async_client.close()
+        if self._http_client is not None:
+            await self._http_client.aclose()
 
     async def __aenter__(self) -> DeepSeekClient:
         return self
@@ -406,7 +474,7 @@ class DeepSeekClient:
     async def translate(self, text: str) -> str:
         """英文简介 → 中文译文本体（一条一次；prompt 见模块级 build_translate_prompt）。"""
         system, user, temperature = build_translate_prompt(text)
-        return await self._chat(system=system, user=user, temperature=temperature)
+        return await self._batch_chat(system=system, user=user, temperature=temperature)
 
     async def recommend(
         self,
@@ -437,7 +505,7 @@ class DeepSeekClient:
             readme=readme,
             pool_days=pool_days,
         )
-        return await self._chat(system=system, user=user, temperature=temperature)
+        return await self._batch_chat(system=system, user=user, temperature=temperature)
 
     async def summarize(
         self,
@@ -456,7 +524,7 @@ class DeepSeekClient:
         system, user, temperature = build_summary_prompt(
             full_name=full_name, description=description, language=language, readme=readme
         )
-        return await self._chat(system=system, user=user, temperature=temperature)
+        return await self._batch_chat(system=system, user=user, temperature=temperature)
 
     async def suggest_topics(self, terms: list[str], topic_names: list[str]) -> dict[str, str]:
         """候选词 → 建议主题（T-032，§15.2）：批量一次调用返回 {词: 主题名或"不建议收录"}。
@@ -474,7 +542,7 @@ class DeepSeekClient:
             "只输出一个 JSON 对象：键为候选标签原样，值为主题名或“不建议收录”，不要输出其他内容。"
         )
         user = "候选标签：\n" + "\n".join(f"- {t}" for t in terms) + "\n\n现有主题：\n" + "、".join(topic_names)
-        content = await self._chat(  # 低温度：归类求稳不求发散
+        content = await self._batch_chat(  # 低温度：归类求稳不求发散
             system=system,
             user=user,
             temperature=0.2,
@@ -504,8 +572,9 @@ class DeepSeekClient:
         调用失败抛 DeepSeekError/DeepSeekAuthError（spec 口径：调用方按"搜索暂不可用"处理）——
         None 与异常的分界即"有响应但内容烂"与"根本调不动"的分界。
 
-        thinking_cb（T-041，§17.5）：None（缺省）走既有 `_chat`（请求形态逐字节不变）；
-        非 None 走 `_chat_stream` 并把思维链增量喂回调——prompt/response_format/解析与返回契约一字不动。
+        thinking_cb（T-041，§17.5）：None（缺省）走同步 ainvoke（协议参数与旧实现一致：带 response_format、
+        非流式）；非 None 走 astream 并把思维链增量喂回调——prompt/response_format/解析与返回契约一字不动。
+        两形态同属交互路径：零自动重试，失败如实抛出（新版口径，见模块头）。
         """
         # 语言枚举从 classify.LANGUAGES 动态拼接（给 LLM 的是 GitHub 精确名＝dict 键集，非榜单 key）：
         # prompt 与语言分类单一事实源保持同步，语言榜扩容时意图理解面自动跟随（spec R4 派生一致性）
@@ -543,14 +612,14 @@ class DeepSeekClient:
             user = f"上一轮意图：{json.dumps(prev_intent, ensure_ascii=False)}\n本轮新输入：{query}"
         response_format = {"type": "json_object"}  # 协议层 JSON 约束（第一道防线）
         if thinking_cb is None:
-            content = await self._chat(  # 低温度：解析求稳
+            content = await self._interactive_chat(  # 低温度：解析求稳
                 system=system,
                 user=user,
                 temperature=0.2,
                 response_format=response_format,
             )
         else:
-            content = await self._collect_stream(
+            content = await self._stream_chat(
                 system=system, user=user, temperature=0.2, response_format=response_format, thinking_cb=thinking_cb
             )
         return _parse_suggested_topics(content)  # 复用 JSON 容错解析（剥 markdown 围栏 + 大括号截取）；None = 内容非法
@@ -565,7 +634,8 @@ class DeepSeekClient:
           （LLM 无幻觉出不存在项目的机会），至多 20 条按匹配度排序，理由 ≤50 字"为什么适合你的意图"视角；
         - 返回 None = 响应解析不出合法 JSON（调用方退化粗排直出记 WARNING）；
           调用失败抛 DeepSeekError/DeepSeekAuthError（调用方处理：Auth 直通不可用，其余退化粗排）；
-        - thinking_cb（T-041，§17.5）：缺省 None 走既有 `_chat`（请求形态逐字节不变），非 None 走流式变体。
+        - thinking_cb（T-041，§17.5）：缺省 None 走同步 ainvoke（协议参数与旧实现一致），非 None 走 astream
+          流式形态；两形态同属交互路径——零自动重试，失败如实抛出或退化粗排（新版口径，见模块头）。
         """
         lines = [
             f"{i}. {c['full_name']} | 语言 {c['language'] or '未知'} | {c['stars']} 星"
@@ -583,111 +653,95 @@ class DeepSeekClient:
         user = f"用户搜索意图：{intent_summary}\n\n候选清单（只许从中选择）：\n" + "\n".join(lines)
         response_format = {"type": "json_object"}  # 协议层 JSON 约束（第一道防线）
         if thinking_cb is None:
-            content = await self._chat(
+            content = await self._interactive_chat(
                 system=system,
                 user=user,
                 temperature=0.3,  # 与推荐语同值：允许一点措辞空间，但不许发散
                 response_format=response_format,
             )
         else:
-            content = await self._collect_stream(
+            content = await self._stream_chat(
                 system=system, user=user, temperature=0.3, response_format=response_format, thinking_cb=thinking_cb
             )
         return _parse_suggested_topics(content)
 
-    async def _collect_stream(
-        self,
-        *,
-        system: str,
-        user: str,
-        temperature: float,
-        response_format: dict | None,
-        thinking_cb: Callable[[str], None],
-    ) -> str:
-        """`_chat_stream` 的正文累积助手：只把 content 增量拼成完整字符串（思维链经回调旁路下发）。"""
-        parts: list[str] = []
-        async for piece in self._chat_stream(
-            system=system,
-            user=user,
-            temperature=temperature,
-            response_format=response_format,
-            thinking_cb=thinking_cb,
-        ):
-            parts.append(piece)
-        return "".join(parts)
+    @staticmethod
+    def _messages(system: str, user: str) -> list[dict[str, str]]:
+        """LangChain 消息输入：system/user 两段（与旧实现请求体逐字段同构）。"""
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-    async def _chat(
-        self, *, system: str, user: str, temperature: float, response_format: dict | None = None
-    ) -> str:
-        """一次 chat/completions 调用：超时/传输错误/5xx/响应畸形重试一次后仍失败 → 抛清晰异常。
-
-        response_format 非 None 时透传给 chat.completions.create（JSON 产出方法的协议层约束，
-        第一道防线）；None（缺省）时不传该字段——纯文本方法请求体逐字节不变。端点对该参数报
-        400 时走既有 4xx fail-fast 链，不去参重发（拍板口径，生产网关已实测支持）。
-        """
-        self._require_api_key()
-        for attempt in range(self._max_retries + 1):
-            try:
-                kwargs: dict = {}
-                if response_format is not None:
-                    kwargs["response_format"] = response_format
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    temperature=temperature,
-                    **kwargs,
-                )
-            except Exception as exc:
-                retry = self._handle_chat_error(exc, attempt)
-                if retry is not None:
-                    await retry
-                    continue
-
-            content = _extract_content(response)
-            if content is None:
-                if attempt >= self._max_retries:
-                    raise DeepSeekError(
-                        f"DeepSeek 响应畸形（JSON 无法解析或缺 content）：{_response_text(response)[:200]}"
-                    )
-                await self._sleep(RETRY_WAIT_SECONDS)
-                continue
-            return content
-        raise DeepSeekError("不可达：重试循环异常退出")  # 防御：max_retries≥0 时循环至少执行一次
-
-    async def _fetch_stream(
-        self, *, system: str, user: str, temperature: float, response_format: dict | None, attempt: int
-    ) -> object:
-        """发起一次流式 create（stream=True；response_format 传法与非流式一字不差）。
-
-        失败按既有错误链判定：不可重试异常直接抛（含第 attempt 次已到重试上限者）；
-        可重试异常在此完成重试等待后被 `_RetryChatStream` 标记上抛，由调用方决定是否续跑——
-        `_chat_stream` 的"已有增量下发后不再重试"由调用方按 produced 判定，故此处只做 create 段判级。
-        """
-        kwargs: dict = {}
+    @staticmethod
+    def _bind_kwargs(temperature: float, response_format: dict | None) -> dict:
+        """同步/批量调用点经 .bind() 下发的请求参数（决策 1）：temperature 恒下发；response_format 非 None
+        才下发（纯文本方法请求体不出现该字段，与旧实现同姿态）；端点对该参数报 400 时走既有 4xx fail-fast
+        链，不去参重发（拍板口径，生产网关已实测支持）。"""
+        kwargs: dict = {"temperature": temperature}
         if response_format is not None:
             kwargs["response_format"] = response_format
-        try:
-            return await self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=temperature,
-                stream=True,
-                **kwargs,
-            )
-        except Exception as exc:
-            retry = self._handle_chat_error(exc, attempt)
-            if retry is None:
-                raise  # 防御：_handle_chat_error 恒抛或返回等待，None 分支不可达
-            await retry
-            raise _RetryChatStream from exc
+        return kwargs
 
-    async def _chat_stream(
+    @staticmethod
+    def _stream_bind_kwargs(temperature: float, response_format: dict | None) -> dict:
+        """流式调用点经 .bind() 下发的请求参数（决策 1 裁定 1，2026-10-14 主 agent 拍板）。
+
+        response_format 经 `extra_body` 下发（非顶层 kwarg）：顶层形式会命中引擎的结构化输出解析路径
+        （langchain-openai `_astream`：`if "response_format" in payload → beta.chat.completions.stream()`），
+        逐 chunk 思维链被丢弃、只在流末聚合块里一次性透出（实证：spike result.json case2
+        loc_chunk_counts reasoning_content=1；冒烟 thinking_increments=1、唯一增量到达于流末）。
+        走 extra_body 后由 SDK 合并进请求体——**线上请求体不变**（仍带顶层 response_format，MockTransport
+        断言锁死），引擎走普通流式路径，逐 chunk `additional_kwargs["reasoning_content"]` 恢复透出。
+        """
+        kwargs: dict = {"temperature": temperature}
+        if response_format is not None:
+            kwargs["extra_body"] = {"response_format": response_format}
+        return kwargs
+
+    async def _batch_once(self, params: dict) -> str:
+        """with_retry 的重试单元（决策 2-4）：引擎最小调用面（含解析层异常归一）＋响应自检。"""
+        try:
+            message = await self._batch_model.bind(**params["bind"]).ainvoke(params["messages"])
+        except _ENGINE_PARSE_ERRORS as exc:  # 引擎解析层拒收响应体 → 归"响应畸形"（F2-1）
+            raise _malformed_engine_response(exc) from exc
+        return _require_content(message)
+
+    async def _batch_chat(
+        self, *, system: str, user: str, temperature: float, response_format: dict | None = None
+    ) -> str:
+        """批量路径单次调用（决策 1/2）：with_retry 包住"引擎调用＋响应自检"。
+
+        可重试类错误（超时/连接/5xx/空闲超时/响应畸形）按白名单零等待重试 self._max_retries 次，
+        仍失败按六分支抛 DeepSeekError/DeepSeekAuthError（文案带"重试 N 次后放弃"）；429 与其余 4xx、
+        账户类不重试（白名单外）。key 缺失在使用点拦住（与旧实现同姿态）。
+        """
+        self._require_api_key()
+        params = {
+            "bind": self._bind_kwargs(temperature, response_format),
+            "messages": self._messages(system=system, user=user),
+        }
+        try:
+            return await self._batch.ainvoke(params)
+        except Exception as exc:
+            self._raise_chat_error(exc, retried=True)
+
+    async def _interactive_chat(
+        self, *, system: str, user: str, temperature: float, response_format: dict | None = None
+    ) -> str:
+        """交互路径同步形态（决策 1/2）：零自动重试，失败即按六分支抛对外异常；响应自检同上。
+
+        参数构造在 try 之外：解析层异常归一只施加于引擎调用这一最小面（F2-1 边界口径）。
+        """
+        self._require_api_key()
+        runnable = self._interactive.bind(**self._bind_kwargs(temperature, response_format))
+        messages = self._messages(system=system, user=user)
+        try:
+            message = await runnable.ainvoke(messages)
+        except _ENGINE_PARSE_ERRORS as exc:  # 引擎解析层拒收响应体 → 归"响应畸形"（F2-1）
+            raise _malformed_engine_response(exc) from exc
+        except Exception as exc:
+            self._raise_chat_error(exc, retried=False)
+        return _require_content(message)
+
+    async def _stream_chat(
         self,
         *,
         system: str,
@@ -695,76 +749,41 @@ class DeepSeekClient:
         temperature: float,
         thinking_cb: Callable[[str], None],
         response_format: dict | None = None,
-    ) -> AsyncIterator[str]:
-        """流式变体（T-041，§17.5）：逐 chunk 下发思维链增量经 thinking_cb，content 增量由调用方累积。
+    ) -> str:
+        """交互路径流式形态（T-041，§17.5；决策 2/3）：逐 chunk 喂思维链增量，content 增量累积后一次性
+        自检返回（"只搬文本增量、末尾一次性解析"形态不变）。
 
-        与 `_chat` 同一协议参数集（response_format 传法与拦截姿态一字不差）；错误链姿态（设计决策 4）：
-        仅在"尚未下发任何增量"时按既有口径重试一次，一旦有增量的下发（思维链或正文）中断即按调用
-        失败抛既有异常类型——重试会重复已展示的思维链，不做。两 reasoning 字段皆缺 → 零思维链增量、
-        不报错（退化为纯阶段进度）。key 缺失在使用点拦住（与 `_chat` 同姿态）。
+        零自动重试（交互口径，流式与同步降级同姿态——首字节前失败也不重试，刻意行为变化）；思维链只认
+        additional_kwargs["reasoning_content"]，缺/空零增量不报错；全程零 content 增量按旧文案如实抛出。
+        response_format 经 `_stream_bind_kwargs`（extra_body）下发以保住逐段透出，线上请求体不变。
+        解析层异常归一只包住"引擎流推进"这一步，调用方回调不在该面内（其异常走通用分类）。
         """
         self._require_api_key()
-        attempt = 0
-        while attempt <= self._max_retries:
-            try:
-                stream = await self._fetch_stream(
-                    system=system,
-                    user=user,
-                    temperature=temperature,
-                    response_format=response_format,
-                    attempt=attempt,
-                )
-            except _RetryChatStream:  # create 阶段可重试失败（等待已做）：首字节前无副作用，续跑
-                attempt += 1
-                continue
-            produced = 0  # 已下发给调用方的增量计数（>0 即不再重试，防重复思维链）
-            try:
-                async for chunk in stream:
-                    choices = getattr(chunk, "choices", None)
-                    if not choices:
-                        continue
-                    delta = getattr(choices[0], "delta", None)
-                    if delta is None:
-                        continue
-                    think = _reasoning_text(delta)
-                    if think:
-                        thinking_cb(think)
-                        produced += 1
-                    piece = _delta_field(delta, "content")
-                    if isinstance(piece, str) and piece:
-                        produced += 1
-                        yield piece
-            except Exception as exc:
-                if produced:
-                    # 已有增量下发：不再重试（重试会重复展示思维链）——文案如实说明未重试
-                    if _is_retryable_chat_error(exc):
-                        raise DeepSeekError(
-                            f"DeepSeek 流传输中断（已产出增量，不重试；{type(exc).__name__}: {exc}）"
-                        ) from exc
-                    # 账户类/4xx 等：按既有分支直抛（文案与非流式路径逐字一致）
-                    self._handle_chat_error(exc, self._max_retries)
-                    raise  # 防御：上述异常类在该单点恒抛
-                retry = self._handle_chat_error(exc, attempt)
-                if retry is None:
-                    raise  # 防御：不可达分支
-                await retry
-                attempt += 1
-                if attempt > self._max_retries:
-                    raise DeepSeekError(f"DeepSeek 流式请求失败：重试 {self._max_retries} 次后放弃") from exc
-                continue
-            finally:
-                close = getattr(stream, "close", None)
-                if close is not None:
-                    try:
-                        await close()
-                    except Exception:  # 关闭流失败不影响主结果（响应已读完/已中断）
-                        logger.debug("流式响应关闭失败（忽略）", exc_info=True)
-            if produced:
-                return
-            if attempt >= self._max_retries:
-                raise DeepSeekError("DeepSeek 流式响应畸形（未产生任何 content 增量）")
-            await self._sleep(RETRY_WAIT_SECONDS)
-            attempt += 1
+        runnable = self._interactive.bind(**self._stream_bind_kwargs(temperature, response_format))
+        messages = self._messages(system=system, user=user)
+        parts: list[str] = []
+        try:
+            iterator = runnable.astream(messages).__aiter__()
+            while True:
+                try:  # 引擎最小面（流式推进）
+                    chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                except _ENGINE_PARSE_ERRORS as exc:  # 引擎解析层拒收响应体 → 归"响应畸形"（F2-1）
+                    raise _malformed_engine_response(exc) from exc
+                think = _reasoning_delta(chunk)
+                if think:
+                    thinking_cb(think)
+                piece = _chunk_text(chunk)
+                if piece:
+                    parts.append(piece)
+        except Exception as exc:
+            self._raise_chat_error(exc, retried=False)
+        content = "".join(parts).strip()
+        if not content:
+            # F3-1：逐字恢复旧文案与旧异常类型（旧实现此分支抛 plain DeepSeekError）
+            raise DeepSeekError("DeepSeek 流式响应畸形（未产生任何 content 增量）")
+        return content
 
     def _require_api_key(self) -> None:
         """key 在使用点校验（与 GitHubClient 同姿态）：config 层不报错，这里第一刀拦住空 key。"""
@@ -774,13 +793,20 @@ class DeepSeekClient:
                 "或注入同名系统环境变量；若置了 AI_ENABLED=0 则本服务不配真实 AI（本地开发口径）"
             )
 
-    def _handle_chat_error(self, exc: Exception, attempt: int) -> Awaitable[None] | None:
-        """调用失败 → 抛既有异常类型或返回"重试等待"awaitable（None 表示已抛，调用方不必再判）。
+    def _raise_chat_error(self, exc: Exception, *, retried: bool) -> NoReturn:
+        """错误分类单点（决策 4 六分支映射）：抛 DeepSeekAuthError / DeepSeekError，人话文案逐字保留。
 
-        与 `_chat` 原错误链逐分支同序同文案（账户类 401/403/402 直通、内容审核 403 单条失败、
-        5xx/超时/连接/畸形响应重试一次、其余 4xx 与未知异常不重试）；`_chat` 与 `_chat_stream`
-        共用此单点，防两条路径的错误语义漂移。
+        分支与旧 `_handle_chat_error` 逐分支同序同文案（账户类 401/402/403 直通、内容审核 403 单条失败、
+        5xx/超时/连接/响应畸形、其余 4xx 与未知异常不重试）；新增 StreamChunkTimeoutError（引擎空闲超时，
+        TimeoutError 系，不在 openai 异常体系内）显式映射入超时分支。
+
+        retried=True＝批量路径（with_retry 已按白名单重试 self._max_retries 次），5xx/超时/连接三类文案带
+        "重试 N 次后放弃"；retried=False＝交互路径（零自动重试），同类文案不带重试声称——交互路径
+        "重试 N 次后放弃"类文案消失属刻意行为变化（规格 ai-client／smart-search）。
         """
+        if isinstance(exc, DeepSeekError):
+            raise exc  # 外壳已构造好的对外异常（含 _ResponseMalformedError）：文案已定，原地抛出
+        suffix = f"：重试 {self._max_retries} 次后放弃" if retried else ""
         if isinstance(exc, AuthenticationError):
             raise DeepSeekAuthError(
                 "AI 账户类错误（HTTP 401）：请更新项目根 .env 中的 AI_API_KEY"
@@ -804,25 +830,15 @@ class DeepSeekClient:
                     f"响应：{exc.message[:200]}"
                 ) from exc
             if exc.status_code >= 500:
-                if attempt >= self._max_retries:
-                    raise DeepSeekError(
-                        f"DeepSeek 服务端错误（HTTP {exc.status_code}）：重试 {self._max_retries} 次后放弃"
-                    ) from exc
-                return self._sleep(RETRY_WAIT_SECONDS)
+                raise DeepSeekError(f"DeepSeek 服务端错误（HTTP {exc.status_code}）{suffix}") from exc
             # 其他 4xx 不重试（含 429 限速：有意不重试——盲重试只会放大调用量，
             # 余额事故背景；未来若要支持应尊重 Retry-After 而非立即重试）
             raise DeepSeekError(f"DeepSeek 请求失败（HTTP {exc.status_code}）：{exc.message[:200]}") from exc
-        if isinstance(exc, (APITimeoutError, APIConnectionError)):
-            if attempt >= self._max_retries:
-                raise DeepSeekError(
-                    f"DeepSeek 请求失败（{type(exc).__name__}: {exc}）：重试 {self._max_retries} 次后放弃"
-                ) from exc
-            return self._sleep(RETRY_WAIT_SECONDS)
+        if isinstance(exc, (APITimeoutError, APIConnectionError, StreamChunkTimeoutError)):
+            raise DeepSeekError(f"DeepSeek 请求失败（{type(exc).__name__}: {exc}）{suffix}") from exc
         if isinstance(exc, APIError):
-            # 响应无法解析等畸形响应，按"响应畸形"重试一次
-            if attempt >= self._max_retries:
-                raise DeepSeekError(f"DeepSeek 响应畸形（{type(exc).__name__}: {exc}）") from exc
-            return self._sleep(RETRY_WAIT_SECONDS)
+            # 引擎解析层透传的畸形响应（响应无法解析等），按"响应畸形"文案
+            raise DeepSeekError(f"DeepSeek 响应畸形（{type(exc).__name__}: {exc}）") from exc
         # 未知异常不重试
         raise DeepSeekError(f"DeepSeek 请求失败（{type(exc).__name__}: {exc}）") from exc
 

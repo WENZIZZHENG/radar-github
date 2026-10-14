@@ -22,7 +22,7 @@ ENV_PATH = BASE_DIR / ".env.dev"
 # SDK 语义：base_url 到 /v1 为止，SDK 自动补 /chat/completions。
 DEFAULT_AI_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_AI_MODEL = "deepseek-chat"
-DEFAULT_AI_TIMEOUT_SECONDS = 60  # LLM 响应慢于普通 REST，缺省放宽到 60 秒
+DEFAULT_AI_TIMEOUT_SECONDS = 300  # 单次调用连接总上限：LLM 响应慢于普通 REST，缺省放宽到 300 秒防挂死
 DEFAULT_AI_MAX_RETRIES = 1  # 任务书口径：重试一次后仍失败 → 抛清晰异常
 DEFAULT_AI_README_HEAD_CHARS = 8000  # README 截断入 prompt 上限（≈2000~3000 tokens，单次调用成本主杠杆）
 

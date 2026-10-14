@@ -1521,3 +1521,160 @@ def test_radar_js_step_elapsed_timer():
         assert stop < wipe, f"{name} 必须先停表再清箱（顺序反了＝计时器泄漏）"
 
     assert ".sp-time" in css and ".sp-time:empty" in css, "radar.css 缺 .sp-time 样式或空态收起规则"
+
+
+# ---------- ai-langchain-refactor 批 2（§17.5 三处追加）：等待期脉冲占位 / 取消按钮 / >15s 慢提示 ----------
+# 同上一组口径：项目无 JS 测试运行器，前端行为由桩级浏览器冒烟实证（data/t041_rehearse/fw-*.png）；
+# 本组锁源码级契约（创建-清除路径 / AbortError 分支归位 / 计时器阈值与清理顺序），改回去即红。
+
+
+def test_radar_js_thinking_placeholder_created_on_stage_start_and_removed():
+    """批 2 锁 1：等待期占位——intent/select 段 start 即建思考区骨架＋"AI 思考中…"脉冲占位（扭转
+    "首条增量才建区"的盲等）；首条增量清占位转原文追加；段收尾零增量则移除骨架（不留空架）。"""
+    js = _radar_js()
+
+    def _fn(pattern, name):
+        m = re.search(pattern, js, re.S)
+        assert m is not None, f"{name} 未找到（函数被改名/删除？）"
+        return m.group(1)
+
+    setter = _fn(r"function setSearchStep\(box, stage, state\) \{(.*?)\n\}", "setSearchStep")
+    assert 'stage === "intent" || stage === "select"' in setter, "占位仅两段 LLM 调用：缺 stage 判定"
+    assert "ensureSearchThinkingSec(box, stage)" in setter, "段 start 未建思考区骨架（等待期占位无处可渲）"
+    assert "searchThinkingPlaceholder()" in setter, "段 start 未插脉冲占位"
+    assert "removeSearchThinkingSec(box, stage)" in setter, "段收尾未做零增量清理（退化成空思考区）"
+
+    ensure = _fn(r"function ensureSearchThinkingSec\(box, stage\) \{(.*?)\n\}", "ensureSearchThinkingSec")
+    assert 'details.className = "thinking"' in ensure, "思考区容器未建"
+    assert 'title.textContent = stage === "intent" ? "意图理解" : "精选"' in ensure, "分段标题未按段渲染"
+    assert 'details.querySelector(`.th-sec[data-stage="${stage}"]`)' in ensure, "未按段查已有骨架（非幂等＝重复起段会叠区）"
+
+    ph = _fn(r"function searchThinkingPlaceholder\(\) \{(.*?)\n\}", "searchThinkingPlaceholder")
+    assert 'ph.className = "th-pending"' in ph, "占位类名未用 .th-pending（CSS 脉冲样式对不上）"
+    assert 'ph.textContent = "AI 思考中…"' in ph, "占位文案不是「AI 思考中…」（§17.5 钉死）"
+
+    remove = _fn(r"function removeSearchThinkingSec\(box, stage\) \{(.*?)\n\}", "removeSearchThinkingSec")
+    assert "sec.remove()" in remove, "零增量段收尾未移除骨架"
+    assert 'details.querySelector(".th-sec")' in remove, "两段皆无时未收起 details 整块（留空折叠壳）"
+
+    appender = _fn(r"function appendSearchThinking\(box, stage, delta\) \{(.*?)\n\}", "appendSearchThinking")
+    assert "ensureSearchThinkingSec(box, stage)" in appender, "增量入口未复用骨架单点（两条入口会分叉）"
+    assert 'pre.querySelector(".th-pending")' in appender and "pending.remove()" in appender, "首条增量未清脉冲占位"
+    assert "createTextNode(delta)" in appender, "增量须以文本节点追加（textContent 拼接会吞掉占位元素）"
+
+    css = _radar_css()
+    assert ".th-pending" in css, "radar.css 缺 .th-pending 脉冲占位样式"
+
+
+def test_radar_js_cancel_uses_abort_controller_and_skips_failure_fallback():
+    """批 2 锁 2：取消按钮＝AbortController 接 fetch signal；catch 区分 AbortError 与真失败——
+    取消清进度、提示已取消、恢复提交态，**不走 failSearchStream**（不自动重跑）；真失败收敛不变。"""
+    js = _radar_js()
+    m = re.search(r"async function runStreamSearch\(\) \{(.*?)\n  \}\n\}\)\(\);", js, re.S)
+    assert m is not None, "runStreamSearch 未找到（函数被改名/删除？）"
+    body = m.group(1)
+
+    assert "new AbortController()" in body, "每次 runStreamSearch 未新建 AbortController"
+    assert "signal: controller.signal" in body, "fetch 未接 signal（取消按钮点不动请求）"
+    assert 'addEventListener("click"' in body and "controller.abort()" in body, "取消按钮未接 abort()"
+    assert "let aborted = false" in body, "缺「本页主动取消」标记（AbortError 会与页面卸载中断混判）"
+    assert 'if (state === "start") cancelSearchStream' not in body, "取消态不得复用阶段终态渲染路径"
+
+    # 三条出口：取消专支（AbortError + 本页主动置位的 aborted）在前，真失败才进 failSearchStream
+    assert 'err.name === "AbortError" && aborted' in body, "catch 未区分 AbortError 与真失败"
+    cancel_at = body.index("cancelSearchStream(btn, progressBox, restoreSubmitState)")
+    fail_at = body.index("failSearchStream(form, btn, progressBox, restoreSubmitState)")
+    assert cancel_at < fail_at, "取消分支必须在失败收敛分支之前判定"
+    branch = body[body.rindex("if (", 0, cancel_at) : fail_at]
+    assert "AbortError" in branch and "aborted)" in branch, "取消与失败的分支条件必须同时看 err.name 与 aborted"
+    assert "gotResult" not in branch, "取消分支不得掺入结果判定（取消时按设计必无 result 帧）"
+
+    cancel = re.search(r"function cancelSearchStream\((.*?)\) \{(.*?)\n\}", js, re.S)
+    assert cancel is not None, "cancelSearchStream 未找到"
+    cbody = cancel.group(2)
+    assert "clearSearchStepTimer(box)" in cbody and "setSearchStreamActive(box, false)" in cbody, "取消清箱前未先停两个计时器"
+    assert cbody.index("clearSearchStepTimer(box)") < cbody.index('box.textContent = ""'), "取消须先停表再清箱"
+    assert '"stream-canceled"' in cbody, "取消未用中性提示样式（非失败，不得复用 .stream-fail）"
+    assert "form.submit()" not in cbody, "取消不得走原生提交（＝自动重跑，违背取消语义）"
+    assert "restoreSubmitState" in cbody, "取消后未恢复提交态"
+
+    assert "streamInFlight" in js, "缺在飞闸标记（取消后按钮恢复可提交，防连点需独立闸口）"
+    assert "if (streamInFlight) return;" in js, "防连点未用在飞闸标记"
+    assert "setSearchStreamActive(progressBox, false)" in js, "流收尾未关流态（watchdog 会残留）"
+    # F3-3：终态收起「取消」按钮——流已结束后残留一个点了没反应的按钮＝空控件（新一轮重建才重现）
+    active_fn = re.search(r"function setSearchStreamActive\(box, active\) \{(.*?)\n\}", js, re.S)
+    assert active_fn is not None, "setSearchStreamActive 未找到"
+    assert "cancel.hidden = !active" in active_fn.group(1), "F3-3：终态未收起「取消」按钮"
+    assert "renderSearchProgress(progressBox)" in js, "新一轮未重建面板（按钮无处重现）"
+
+    css = _radar_css()
+    assert ".sp-cancel" in css, "radar.css 缺 .sp-cancel 样式"
+    assert ".sp-cancel[hidden]" in css, "radar.css 缺 .sp-cancel[hidden]（display:block 会盖过 UA 的 [hidden]，终态藏不住按钮）"
+    assert ".stream-canceled" in css, "radar.css 缺 .stream-canceled 提示样式"
+
+
+def test_radar_js_slow_hint_watchdog_threshold_and_timer_cleanup():
+    """批 2 锁 3：慢提示 watchdog——段 start 起、任一 stage/thinking 事件重置、>15s 出提示、事件恢复或
+    段终态清；计时器挂 step 且与既有 sp-time 同防泄漏口径（清箱/重建前先 clearTimeout）。"""
+    js, css = _radar_js(), _radar_css()
+
+    def _fn(pattern, name):
+        m = re.search(pattern, js, re.S)
+        assert m is not None, f"{name} 未找到（函数被改名/删除？）"
+        return m.group(1)
+
+    assert "const SEARCH_SLOW_HINT_MS = 15000;" in js, "慢提示阈值常量必须是 15000ms（§17.5 钉死 15 秒）"
+
+    watchdog = _fn(r"function startSearchSlowWatchdog\(box, step\) \{(.*?)\n\}", "startSearchSlowWatchdog")
+    assert "resetSearchSlowHint(box, step);" in watchdog, "重置路径缺失（watchdog 必须由任一事件重起）"
+    assert "SEARCH_SLOW_HINT_MS" in watchdog, "超时未用阈值常量（硬编码会漂移）"
+    assert 'textContent = "网关响应较慢，仍在等待"' in watchdog, "提示文案不是 §17.5 钉死原文"
+    assert "step._spSlowTimer = setTimeout" in watchdog, "watchdog 未挂 step._spSlowTimer（清箱停不掉＝泄漏）"
+    assert "if (!step._spStreaming) return;" in watchdog, "流已结束时仍可起表（终态后误报慢提示）"
+
+    clear = _fn(r"function clearSearchSlowTimer\(step\) \{(.*?)\n\}", "clearSearchSlowTimer")
+    assert "clearTimeout(step._spSlowTimer)" in clear, "未 clearTimeout（清箱后空转＝泄漏）"
+    reset = _fn(r"function resetSearchSlowHint\(box, step\) \{(.*?)\n\}", "resetSearchSlowHint")
+    assert "clearSearchSlowTimer(step);" in reset, "重置入口未停表"
+    assert 'hint.textContent = ""' in reset, "未清空提示文本（:empty 收起依赖清空）"
+
+    stream_active = _fn(r"function setSearchStreamActive\(box, active\) \{(.*?)\n\}", "setSearchStreamActive")
+    assert "el._spStreaming = active" in stream_active, "流态未写到步骤元素（watchdog 无从判停）"
+    assert "clearSearchSlowTimer(el)" in stream_active, "关流时未清 watchdog"
+
+    run_body = re.search(r"async function runStreamSearch\(\) \{(.*?)\n  \}\n\}\)\(\);", js, re.S).group(1)
+    assert "setSearchStreamActive(progressBox, true)" in run_body, "流开始未开流态（watchdog 起不来）"
+    assert "startSearchSlowWatchdog(progressBox, step)" in run_body, "事件到达未重置 watchdog"
+    assert 'ev.type === "stage"' in run_body and 'ev.type === "thinking"' in run_body, "两类事件须都参与重置"
+
+    render = _fn(r"function renderSearchProgress\(box\) \{(.*?)\n\}", "renderSearchProgress")
+    assert 'slow.className = "sp-slow"' in render, "进度面板未渲染慢提示条容器"
+    fail_body = _fn(r"function failSearchStream\(form, btn, box, onManualRetry\) \{(.*?)\n\}", "failSearchStream")
+    for name, text in (("renderSearchProgress", render), ("failSearchStream", fail_body)):
+        stop = text.index("clearSearchSlowTimer") if "clearSearchSlowTimer" in text else text.index("setSearchStreamActive")
+        assert stop < text.index('box.textContent = ""'), f"{name} 必须先把慢提示 watchdog 停掉再清箱（顺序反了＝计时器泄漏）"
+
+    assert ".sp-slow" in css and ".sp-slow:empty" in css, "radar.css 缺 .sp-slow 样式或空态收起规则"
+
+
+def test_radar_js_zero_delta_teardown_drops_placeholder_before_empty_check():
+    """F1-1 修复锁（评审 agent-899 阻断项）：段收尾的"零增量"判定必须先摘占位再查 textContent——
+    占位 span（.th-pending）自带"AI 思考中…"文案，不摘则 textContent 恒非空 → 整段零增量（模型在
+    json_object 下不吐 reasoning_content）时骨架永不移除、脉冲永久跳动，违反 smart-search delta
+    「无思维链退化」Scenario 与 design 决策 6-1。有增量的路径占位已被 appendSearchThinking 摘除，
+    故本段（幂等）不得反过来影响正常路径——两条都锁住，防"修 A 破 B"。"""
+    js = _radar_js()
+    m = re.search(r"function setSearchStep\(box, stage, state\) \{(.*?)\n\}", js, re.S)
+    assert m is not None, "setSearchStep 未找到（函数被改名/删除？）"
+    body = m.group(1)
+    teardown = body[body.index('if (state !== "start")') :]
+    assert 'pre.querySelector(".th-pending")' in teardown, "收尾分支未查占位节点（F1-1 回归）"
+    pending_at = teardown.index('pre.querySelector(".th-pending")')
+    remove_at = teardown.index("pending.remove()")  # 未摘占位时此处直接抛 ValueError → 锁红
+    empty_at = teardown.index("!pre.textContent.trim()")
+    assert pending_at < remove_at, "先查后摘的顺序反了（未摘占位）"
+    assert remove_at < empty_at, "占位必须在零增量判空之前摘除（顺序反了＝判空恒假、骨架永不移除）"
+    assert teardown.index("removeSearchThinkingSec(box, stage)") > empty_at, "判空后未移除骨架"
+    appender = re.search(r"function appendSearchThinking\(box, stage, delta\) \{(.*?)\n\}", js, re.S)
+    assert appender is not None, "appendSearchThinking 未找到"
+    assert "pending.remove()" in appender.group(1), "首条增量未摘占位（F1-1 修复的幂等前提被破坏）"

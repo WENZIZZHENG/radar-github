@@ -1222,6 +1222,8 @@ document.addEventListener("keydown", (e) => {
 // "搜索中…"防连点——页面导航后无需恢复；输入为空由浏览器 required 拦截（此处防御不置灰） ----
 // T-041（§17.5）流式化：能力齐备时改为 fetch 读 NDJSON 流，进度面板实时渲染；无流式能力时本段
 // 不拦截（原生提交，现状行为）；流中途失败按设计决策 7 收敛回原生提交自动重跑一次。
+// ai-langchain-refactor 批 2（§17.5 追加三处）：等待期"AI 思考中…"脉冲占位、「取消」按钮、>15s
+// 无增量慢提示——取消是用户主动行为（AbortController），MUST NOT 走失败收敛的自动重跑。
 // 进度面板/思考区 HTML 由本段渲染（原型 T041 提案样式已迁 radar.css），结果区由服务端 SSR 片段
 // 整体替换（前端零行模板）；radar.js 行交互是 document 级事件委托，innerHTML 注入零重绑。
 const SEARCH_STAGE_LABELS = { intent: "理解意图", recall: "池内召回", select: "AI 精选", external: "补搜 GitHub" };
@@ -1239,7 +1241,6 @@ function clearSearchStepTimer(box) {
   if (box._spTime) box._spTime.textContent = ""; // 清空 → CSS .sp-time:empty 收起（不占位）
   box._spTime = null;
 }
-
 function startSearchStepTimer(box, step) {
   clearSearchStepTimer(box); // 同一 box 同时只有一个活动计时器：新 start 前先清旧的
   const time = step.querySelector(".sp-time");
@@ -1251,8 +1252,49 @@ function startSearchStepTimer(box, step) {
   box._spTimer = setInterval(tick, 1000);
 }
 
+// 慢提示 watchdog（ai-langchain-refactor 批 2，§17.5 第 4 条）：段 start 起、>15s 无任何新增量
+// （stage/thinking 事件均无）→ 步骤条下显示"网关响应较慢，仍在等待"；事件恢复或段终态即清。
+// 计时器挂 step 元素（同 sp-time 的防泄漏口径：清箱/重建前先 clearTimeout，否则空转到下次判定）。
+const SEARCH_SLOW_HINT_MS = 15000;
+
+function clearSearchSlowTimer(step) {
+  if (step._spSlowTimer) clearTimeout(step._spSlowTimer);
+  step._spSlowTimer = null;
+}
+
+// 清提示文本并停表（同一入口，避免"只停表忘了清文本"留下过期的慢提示）
+function resetSearchSlowHint(box, step) {
+  clearSearchSlowTimer(step);
+  const hint = box.querySelector(".sp-slow");
+  if (hint) hint.textContent = ""; // 清空 → :empty 收起（不占位、无布局位移）
+}
+
+function startSearchSlowWatchdog(box, step) {
+  resetSearchSlowHint(box, step); // 任一事件到达即重置：先清旧的再重新起表（同一段只许一个活动 watchdog）
+  if (!step._spStreaming) return; // 流已结束（终态/取消/失败）：不再起表
+  step._spSlowTimer = setTimeout(() => {
+    step._spSlowTimer = null;
+    const hint = box.querySelector(".sp-slow");
+    if (hint && step._spStreaming) hint.textContent = "网关响应较慢，仍在等待";
+  }, SEARCH_SLOW_HINT_MS);
+}
+
+// 流生命周期（写入各步骤标记）：终态/取消/失败后 watchdog 不再起表、慢提示清空、取消按钮收起
+// （F3-3：流已结束，面板上留一个点了没反应的「取消」是空控件；新一轮 renderSearchProgress 重建面板，
+// 新按钮默认可见）。dispose 路径用 hidden 属性而非移除节点：失败/取消分支随后会 textContent="" 清箱，
+// 移除与否都在此一并处理，hidden 对读屏也同步生效。
+function setSearchStreamActive(box, active) {
+  for (const el of box.querySelectorAll(".sp-step")) {
+    el._spStreaming = active;
+    if (!active) clearSearchSlowTimer(el);
+  }
+  const cancel = box.querySelector(".sp-cancel");
+  if (cancel) cancel.hidden = !active;
+}
+
 function renderSearchProgress(box) {
   clearSearchStepTimer(box); // 新一轮重建：清旧的（textContent="" 停不掉旧 setInterval → 泄漏）
+  for (const el of box.querySelectorAll(".sp-step")) clearSearchSlowTimer(el); // 慢提示 watchdog 同口径：清箱前先停（否则重建后旧 watchdog 仍会点到新 DOM）
   box.textContent = "";
   const panel = document.createElement("div");
   panel.className = "search-progress";
@@ -1279,7 +1321,21 @@ function renderSearchProgress(box) {
     steps.appendChild(step);
   }
   panel.appendChild(steps);
+  // 慢提示条（>15s 无增量）：常驻 DOM、空文本由 :empty 收起（与 .sp-time 同口径，清空即不占位）
+  const slow = document.createElement("div");
+  slow.className = "sp-slow";
+  slow.setAttribute("role", "status");
+  panel.appendChild(slow);
+  // 「取消」按钮（§17.5）：中断流式请求＝用户主动行为，与失败收敛（failSearchStream）无因果关系。
+  // DOM 位次钉在"思考区之前"：思考区按需插入在其后，按钮恒贴着步骤条，面板随思考区增高时不下移
+  // （两大元素都不存在时它就是面板最后一行——三种形态下按钮都在固定位置，不随增量跳动）。
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "sp-cancel";
+  cancel.textContent = "取消";
+  panel.insertBefore(cancel, panel.querySelector("details.thinking")); // 新建面板尚未有思考区 → 等价 appendChild
   box.appendChild(panel);
+  box._spCancel = cancel;
 }
 
 function setSearchStep(box, stage, state) {
@@ -1290,14 +1346,40 @@ function setSearchStep(box, stage, state) {
   step.querySelector(".sp-dot").textContent = state === "done" ? "✓" : state === "skip" ? "—" : String([...step.parentNode.children].indexOf(step) + 1);
   if (state === "start") startSearchStepTimer(box, step);
   else clearSearchStepTimer(box); // 终态（done/skip/failed）与未开始态：停表并清空收起
-  const pre = box.querySelector(`.th-sec[data-stage="${stage}"] .th-text`);
-  if (pre && state !== "start") pre.classList.remove("streaming"); // 该段思考收尾：去流式光标
+  // 等待期占位（§17.5 第 1 条）：intent/select 两段 LLM 调用 start 即建思考区骨架＋"AI 思考中…"脉冲
+  // 占位（扭转"首条增量才建区"的盲等）；非 LLM 段（recall/external）无可等待的思维链，不建区。
+  if (state === "start" && (stage === "intent" || stage === "select")) {
+    const sec = ensureSearchThinkingSec(box, stage);
+    const pre = sec && sec.querySelector(".th-text");
+    if (pre) {
+      pre.textContent = ""; // 该段重播（同一 box 二次 runSearch）：清空残留原文与占用元素
+      pre.appendChild(searchThinkingPlaceholder());
+      pre.classList.add("streaming");
+    }
+  }
+  if (state !== "start") {
+    // 段收尾：零增量的骨架随收尾移除（不留空架）；有原文的去流式光标、保留可折叠原文
+    const sec = box.querySelector(`.th-sec[data-stage="${stage}"]`);
+    const pre = sec && sec.querySelector(".th-text");
+    if (pre) {
+      pre.classList.remove("streaming");
+      // F1-1：占位 span 自带"AI 思考中…"文案——不先摘，下面的判空恒为假，零增量段（模型不吐
+      // reasoning_content）的骨架永不移除、脉冲永久跳动（违反"无思维链退化"Scenario）。先摘后判；
+      // 有增量的路径占位已被 appendSearchThinking 摘除，故本段幂等。
+      const pending = pre.querySelector(".th-pending");
+      if (pending) pending.remove();
+      if (!pre.textContent.trim()) removeSearchThinkingSec(box, stage);
+    }
+  }
+  resetSearchSlowHint(box, step); // 任一事件到达即重置慢提示 watchdog（start 分支随后重新起表）
+  if (state === "start") startSearchSlowWatchdog(box, step);
 }
 
-// 首条思维链增量才创建思考区（无 reasoning 字段 → 整区不渲染，不报错、不留空架）
-function appendSearchThinking(box, stage, delta) {
+// 思考区骨架单点：details 容器＋该段 .th-sec 建而返回（幂等，已有即直接返回）。
+// 两条入口共用它——① setSearchStep 段 start 的等待期占位；② appendSearchThinking 首条增量兜底建区。
+function ensureSearchThinkingSec(box, stage) {
   const panel = box.querySelector(".search-progress");
-  if (!panel) return;
+  if (!panel) return null;
   let details = panel.querySelector("details.thinking");
   if (!details) {
     details = document.createElement("details");
@@ -1325,8 +1407,34 @@ function appendSearchThinking(box, stage, delta) {
     sec.append(title, pre);
     details.appendChild(sec);
   }
+  return sec;
+}
+
+// "AI 思考中…"脉冲占位（§17.5）：等待期骨架里的临时子元素，首条增量到达或段收尾时移除
+function searchThinkingPlaceholder() {
+  const ph = document.createElement("span");
+  ph.className = "th-pending";
+  ph.textContent = "AI 思考中…";
+  return ph;
+}
+
+// 段收尾且该段零增量：移除骨架（退化口径：不留空思考区）；两段皆无则连同 details 整块收起
+function removeSearchThinkingSec(box, stage) {
+  const sec = box.querySelector(`.th-sec[data-stage="${stage}"]`);
+  if (!sec) return;
+  const details = sec.parentNode;
+  sec.remove();
+  if (details && details.classList.contains("thinking") && !details.querySelector(".th-sec")) details.remove();
+}
+
+function appendSearchThinking(box, stage, delta) {
+  const sec = ensureSearchThinkingSec(box, stage);
+  if (!sec) return;
   const pre = sec.querySelector(".th-text");
-  pre.textContent += delta;
+  // 首条增量：清掉"AI 思考中…"脉冲占位（原文与之不相邻拼接），转入流式原文追加
+  const pending = pre.querySelector(".th-pending");
+  if (pending) pending.remove();
+  pre.appendChild(document.createTextNode(delta)); // 追加文本节点：占位是元素、不可被 textContent 拼接吞掉
   pre.scrollTop = pre.scrollHeight; // 自动滚到底（原型口径）
 }
 
@@ -1347,6 +1455,7 @@ function writeSearchHidden(form, name, value) {
 // 流失败收敛（决策 7）：如实提示＋原生表单提交重跑（自动重跑仅一次的结构性保证见下）；不渲染半成品结果
 function failSearchStream(form, btn, box, onManualRetry) {
   clearSearchStepTimer(box); // 断流清箱：先停表再清（textContent="" 停不掉 setInterval）
+  setSearchStreamActive(box, false); // 慢提示 watchdog 同口径：清箱前先停（否则空转点到已销毁 DOM）
   box.textContent = "";
   const fail = document.createElement("div");
   fail.className = "stream-fail";
@@ -1370,6 +1479,24 @@ function failSearchStream(form, btn, box, onManualRetry) {
     toast("流式连接中断，请手动重新提交", true);
     if (onManualRetry) onManualRetry();
   }
+}
+
+// 取消收敛（§17.5 第 2 条）：用户点「取消」→ AbortController 中断流式请求——属主动行为、非失败，
+// 故 MUST NOT 走 failSearchStream 的自动重跑；只清进度区、如实提示已取消、恢复可提交态。
+function cancelSearchStream(btn, box, restoreSubmitState) {
+  clearSearchStepTimer(box); // 清箱前先停表（同两个既有清箱入口口径）
+  setSearchStreamActive(box, false);     // 慢提示 watchdog 一并停（流已中断，终态不再起表）
+  box.textContent = "";
+  const canceled = document.createElement("div");
+  canceled.className = "stream-canceled";
+  canceled.setAttribute("role", "status");
+  canceled.textContent = "已取消本次搜索（进度已中断，结果未展示）。";
+  const sub = document.createElement("div");
+  sub.className = "sc-sub";
+  sub.textContent = "输入框与「搜索」按钮已恢复，可随时重新提交";
+  canceled.appendChild(sub);
+  box.appendChild(canceled);
+  if (restoreSubmitState) restoreSubmitState();
 }
 
 async function* readNdjsonLines(body) {
@@ -1400,6 +1527,7 @@ async function* readNdjsonLines(body) {
   const progressBox = document.getElementById("search-progress");
   const resultBox = document.getElementById("search-result");
   const supportStream = typeof window.fetch === "function" && typeof window.ReadableStream === "function";
+  let streamInFlight = false; // 流式请求在飞：派生态（与置灰按钮同起同落）之外的独立防连点闸
 
   function restoreSubmitState() {
     if (!btn) return;
@@ -1418,26 +1546,46 @@ async function* readNdjsonLines(body) {
       return;
     }
     e.preventDefault();
-    if (btn.disabled) return; // 防连点（按钮态与现状一致：提交即置灰"搜索中…"）
+    if (streamInFlight) return; // 防连点：取消后按钮即恢复可提交，闸口由本标记独立承担
     runStreamSearch();
   });
 
   async function runStreamSearch() {
+    streamInFlight = true;
     btn.disabled = true;
     btn.textContent = "搜索中…";
     renderSearchProgress(progressBox);
+    setSearchStreamActive(progressBox, true); // 流开始：终态/取消/失败后再置 false（watchdog 据此停表）
+    const controller = new AbortController(); // 每次新建：一次搜索一个中断句柄（§17.5 取消按钮）
+    const cancelBtn = progressBox.querySelector(".sp-cancel");
+    let aborted = false; // 只有「点取消」置位：AbortError 与本页主动取消配对，页面卸载引发的中断不误判
     let gotResult = false;
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", () => {
+        aborted = true;
+        controller.abort();
+      });
+    }
     try {
       const resp = await fetch("/search/stream", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
         body: new URLSearchParams(new FormData(form)).toString(),
+        signal: controller.signal, // 取消按钮 → abort() → 读流抛 AbortError（下方 catch 分支）
       });
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
       for await (const ev of readNdjsonLines(resp.body)) {
-        if (ev.type === "stage") setSearchStep(progressBox, ev.stage, ev.state);
-        else if (ev.type === "thinking") appendSearchThinking(progressBox, ev.stage, ev.delta);
-        else if (ev.type === "result") {
+        if (ev.type === "stage") {
+          setSearchStep(progressBox, ev.stage, ev.state);
+          if (ev.state === "start") {
+            const step = progressBox.querySelector(`.sp-step[data-step="${ev.stage}"]`);
+            if (step) startSearchSlowWatchdog(progressBox, step); // 慢提示 watchdog 由任一事件重置
+          }
+        } else if (ev.type === "thinking") {
+          appendSearchThinking(progressBox, ev.stage, ev.delta);
+          const step = progressBox.querySelector(`.sp-step[data-step="${ev.stage}"]`);
+          if (step) startSearchSlowWatchdog(progressBox, step);
+        } else if (ev.type === "result") {
           gotResult = true;
           resultBox.innerHTML = ev.html; // 服务端 SSR 片段（与同步路径同 partial），前端零行模板
           writeSearchHidden(form, "prev_intent", ev.prev_intent); // 追问无状态回传口径不变
@@ -1452,7 +1600,12 @@ async function* readNdjsonLines(body) {
       if (!gotResult) throw new Error("结果事件未到达即断流");
       restoreSubmitState();
     } catch (err) {
-      failSearchStream(form, btn, progressBox, restoreSubmitState);
+      // 取消 ≠ 失败：AbortError 走专支——清进度区、如实提示、恢复提交态，不走失败收敛（不自动重跑）
+      if (err && err.name === "AbortError" && aborted) cancelSearchStream(btn, progressBox, restoreSubmitState);
+      else failSearchStream(form, btn, progressBox, restoreSubmitState);
+    } finally {
+      streamInFlight = false;
+      setSearchStreamActive(progressBox, false); // 三出口统一收尾：watchdog 停表、慢提示清空
     }
   }
 })();
