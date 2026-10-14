@@ -40,8 +40,8 @@
 
 ## 7. 部署后留痕（生产）
 
-- [ ] 7.1 生产真实流式搜索一次，留痕：流式＋json_object 组合下 `reasoning_content` 是否非空（决策 5 存疑点了结）、事件序列完整、耗时对比；若思维链确为空如实记录（按拍板退化为纯进度，是否放宽协议参数另行拍板）。
-- [ ] 7.2 回环冒烟（/、/search 及一次流式搜索）全 200；回写《验收记录.md》或等价留痕位置。
+- [x] 7.1 生产真实流式搜索一次，留痕：流式＋json_object 组合下 `reasoning_content` 是否非空（决策 5 存疑点了结）、事件序列完整、耗时对比；若思维链确为空如实记录（按拍板退化为纯进度，是否放宽协议参数另行拍板）。——**实测（2026-10-14 生产部署后，服务器回环 POST /search/stream，q="我要做爬虫，Python 的"）**：共 303 帧＝8 stage＋**294 thinking**＋1 result；**`reasoning_content` 非空、逐段透出**（intent 897 字符、select 2632 字符，多帧增量而非流末一次性——决策 5 存疑点了结：透出）；阶段序列完整 intent→recall→select→external 四段 start/done 齐全；result 帧 HTML 49239 字符；端到端约 30s（含 ssh 链路开销）。注：本次部署已含 `ai-langchain-refactor`（思维链走 extra_body 下发 response_format 的修复态），抓包留档本地 `data/prod-deploy-20261014/stream.ndjson`。
+- [x] 7.2 回环冒烟（/、/search 及一次流式搜索）全 200；回写《验收记录.md》或等价留痕位置。——**实测（2026-10-14）**：服务器回环 `/`、`/?board=all`、`/total`、`/total?board=all`、`/search`、`/follows`、`/tags` 全 200；流式搜索见 7.1（303 帧正常收尾）；公网 `https://radar.suipaiji.com/` 未授权 401（鉴权墙正常）。回写见《验收记录.md》2026-10-14 条。
 
 ## Workflow follow-up
 

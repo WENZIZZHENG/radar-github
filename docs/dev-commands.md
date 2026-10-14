@@ -25,6 +25,10 @@ uv venv .venv && uv pip install -r pyproject.toml --extra dev
 > PowerShell 下拆两行跑：`uv venv .venv` 然后 `uv pip install -r pyproject.toml --extra dev`；或直接用 Git Bash 跑原命令。
 > 本手册所有 `&&` 连写同理（本地命令默认 Git Bash 环境）。
 
+> 踩坑记录（2026-10-14）：本机 PyPI 直连会卡死，单包安装/更新走国内源——
+> `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple uv pip install --python .venv/Scripts/python.exe <包名>`；
+> venv 是 uv 管的（无 pip），不要用 `python -m pip install`。
+
 ## 4. 生产部署（tar+scp，2026-08-14 实跑固化）
 
 > 服务器：root@<SERVER_IP>（CentOS 9）；应用 /opt/radar 归 radar 用户；systemd 单元 radar.service；

@@ -9,6 +9,8 @@
   T-041 同保真原型（2026-10-13，开发前本人确认用）：
   - 依据：《交互流程说明》§17.5 流式加载态（v3.0 草案，待本人确认）＋ OpenSpec change streaming-search-progress
   - 范围：四个视图锚点陈列 —— ① 桌面进行中（可重播流式动画） ② 桌面完成态（结果与现状一致） ③ 两退化态并排（无思维链/流失败收敛） ④ 移动端 375px 进行中
+  - 批 2 追加（ai-langchain-refactor，2026-10-14 主 agent 拍板"冻结视觉体系内组件追加、免新原型"）：等待期
+    "AI 思考中…"脉冲占位、「取消」按钮、>15s 无事件慢提示条三处，同步进本原型保持"原型＝实现"先例
   - 样式：既有视觉基线直接 link ../app/web/static/radar.css 复用；步骤条/思考过程区/呼吸点等
     新组件样式在本文件 <style> 内定义（标注"提案样式，确认后迁 radar.css"）
   - 红线遵守：仅本文件为新增；不改 app/、不改既有示意图.html；不引任何外部资源（无字体外链，系统字体栈），
@@ -131,6 +133,29 @@
   }
   .stream-fail .sf-sub { margin-top: 4px; font-size: 11.5px; color: var(--text-3); }
 
+  /* ===== 提案④⑤⑥ 批 2 追加（等待期脉冲占位／「取消」按钮／>15s 慢提示；已迁 radar.css） ===== */
+  .th-pending { color: var(--text-3); animation: th-pulse 1.4s ease-in-out infinite; }
+  @keyframes th-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+  .sp-cancel {
+    display: block; margin: var(--s3) auto 0;
+    background: none; border: 1px solid var(--line-strong); border-radius: var(--r-pill);
+    padding: 3px 16px; color: var(--text-3);
+    font-family: var(--font-sans); font-size: 12px; cursor: pointer;
+    transition: color var(--t-fast) ease, border-color var(--t-fast) ease;
+  }
+  .sp-cancel:hover { color: var(--text-1); border-color: var(--text-3); }
+  /* 终态收起（同实现：JS 置 hidden 属性；须显式一条规则，否则上面的 display:block 盖过 UA 的 [hidden]） */
+  .sp-cancel[hidden] { display: none; }
+  .sp-slow { margin-top: var(--s3); font-size: 11.5px; color: var(--text-3); }
+  .sp-slow:empty { display: none; }
+  .stream-canceled {
+    margin-top: var(--s3);
+    background: var(--surface); border: 1px solid var(--line-strong);
+    border-radius: 10px; padding: 10px 14px;
+    font-size: 12.5px; color: var(--text-1);
+  }
+  .stream-canceled .sc-sub { margin-top: 4px; font-size: 11.5px; color: var(--text-3); }
+
   /* 窄屏（≤640px，断点与既有页面同值）：步骤条纵排 */
   @media (max-width: 640px) {
     .sp-steps { flex-direction: column; gap: 10px; }
@@ -155,7 +180,7 @@
 <!-- ============ 视图 1 · 桌面端搜索进行中（流式动画，可重播） ============ -->
 <section class="view" id="v-running">
   <div class="view-label"><b>视图 1</b>桌面端 P8 搜索页 · <u>进行中</u>：阶段步骤条逐段点亮＋AI 思考过程流式追加
-    <span class="hint">点顶栏「▶ 重播流式演示」从头播放；典型全程 10~30 秒（本演示压缩到约 12 秒）</span>
+    <span class="hint">点顶栏「▶ 重播流式演示」从头播放；典型全程 10~30 秒（本演示压缩到约 12 秒）· 等待期「AI 思考中…」脉冲占位 ＋ 面板底部「取消」按钮（批 2 追加）</span>
   </div>
   <div class="stage stage-scroll" id="stage-v1">
     <header class="top">
@@ -194,7 +219,7 @@
           </div>
           <details class="thinking" id="v1-thinking" open>
             <summary>AI 思考过程 <span class="th-hint">模型思维链英文原文，如实显示 · 完成后可折叠</span></summary>
-            <div class="th-sec" id="v1-sec-intent" hidden>
+            <div class="th-sec" id="v1-sec-intent">
               <div class="th-sec-title">意图理解</div>
               <pre class="th-text" id="v1-text-intent"></pre>
             </div>
@@ -203,9 +228,15 @@
               <pre class="th-text" id="v1-text-select"></pre>
             </div>
           </details>
+          <div class="sp-slow" id="v1-slow" role="status"></div>
+          <button type="button" class="sp-cancel" id="v1-cancel">取消</button>
         </div>
 
         <div id="v1-result"></div>
+        <div class="stream-canceled" id="v1-canceled" role="status" hidden>
+          已取消本次搜索（进度已中断，结果未展示）。
+          <div class="sc-sub">输入框与「搜索」按钮已恢复，可随时重新提交 · 取消是主动行为，不触发自动重跑</div>
+        </div>
       </section>
       <footer class="note">新入池项目首周不参与增量榜 · 推荐理由由 AI 每周生成 · 数据：GitHub 官方 API 每日 UTC 快照</footer>
     </div>
@@ -285,8 +316,8 @@
 
 <!-- ============ 视图 3 · 两退化态并排 ============ -->
 <section class="view" id="v-degrade">
-  <div class="view-label"><b>视图 3</b>退化态并排 · 左：无思维链（仅步骤条，补搜跳过如实标注）｜右：流中途失败收敛
-    <span class="hint">左＝模型不返回思维链字段时整区不渲染、不报错；右＝断流后如实提示＋自动以同步表单重跑一次</span>
+  <div class="view-label"><b>视图 3</b>退化态并排 · 左：无思维链（仅步骤条＋>15s 慢提示，补搜跳过如实标注）｜右：流中途失败收敛
+    <span class="hint">左＝模型不返回思维链字段时整区不渲染、不报错；右＝断流后如实提示＋自动以同步表单重跑一次（「取消」是主动行为，不走这条收敛路径，见视图 1 演示）</span>
   </div>
   <div class="two-col">
     <div class="col">
@@ -304,9 +335,11 @@
               <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选<span class="sp-time">· 3s</span></span></div>
               <div class="sp-step skip"><span class="sp-dot">—</span><span class="sp-label">补搜 GitHub</span><span class="sp-sub">无需补搜</span></div>
             </div>
-            <!-- 无思维链增量：思考过程区整块不渲染（不留空架、不报错） -->
+            <!-- 无思维链增量、且已 >15s 无任何新增量：思考区整块不渲染（不留空架、不报错），步骤条下出慢提示 -->
+            <div class="sp-slow" role="status">网关响应较慢，仍在等待</div>
+            <button type="button" class="sp-cancel">取消</button>
           </div>
-          <p class="empty-follows" style="margin-top:10px">（此态下无"AI 思考过程"区——模型未返回思维链时只显阶段进度；补搜步"无需补搜"为池内已足 20 条的如实标注，不伪造进度）</p>
+          <p class="empty-follows" style="margin-top:10px">（此态下无"AI 思考过程"区——模型未返回思维链时只显阶段进度；补搜步"无需补搜"为池内已足 20 条的如实标注，不伪造进度；「网关响应较慢，仍在等待」＝该段 >15s 无任何新增量时出现，增量到达或收尾即消退）</p>
         </div>
       </div>
     </div>
@@ -325,6 +358,7 @@
               <div class="sp-step active"><span class="sp-dot">3</span><span class="sp-label">AI 精选<span class="sp-time">· 3s</span></span></div>
               <div class="sp-step"><span class="sp-dot">4</span><span class="sp-label">补搜 GitHub</span></div>
             </div>
+            <button type="button" class="sp-cancel">取消</button>
           </div>
           <div class="stream-fail" role="status">
             流式连接中断，已自动以普通方式重跑本次搜索（结果不变，仅无过程显示）。
@@ -339,7 +373,7 @@
 <!-- ============ 视图 4 · 移动端 375px 进行中 ============ -->
 <section class="view" id="v-mobile">
   <div class="view-label"><b>视图 4</b>移动端（375px）· 进行中：步骤条纵排（≤640px 断点与既有页面同值）
-    <span class="hint">搜索框按既有窄屏口径纵向堆叠；步骤条改纵排，思考区同桌面可折叠</span>
+    <span class="hint">搜索框按既有窄屏口径纵向堆叠；步骤条改纵排，思考区同桌面可折叠；「取消」按钮居中、窄屏同形态</span>
   </div>
   <div class="stage stage-m" id="stage-v4">
     <div class="stage-inner">
@@ -382,6 +416,7 @@
                 <pre class="th-text streaming">Candidate 1 (scrapy/scrapy) is the de-facto Python crawling framework — strongest match. Candidate 3 fits browser-automation crawling…</pre>
               </div>
             </details>
+            <button type="button" class="sp-cancel">取消</button>
           </div>
         </section>
       </div>
@@ -390,7 +425,7 @@
 </section>
 
 <footer class="note" style="max-width:1440px;margin:36px auto 40px;padding:0 20px 12px;">
-  原型范围说明：本文件仅提案新视觉元素（阶段步骤条三态＋补搜跳过态／AI 思考过程折叠区／流失败提示）；既有组件（顶栏、搜索框、意图透明行、结果行、详情面板）直接复用 radar.css 未改动 · 结果区内容与现行搜索页一致——本变更只加"过程可见"，意图/降级/追问口径一字不改 · 步骤条宽度、呼吸点节奏、思考区等宽字体等取舍详见 OpenSpec change streaming-search-progress 的 design.md · 假数据沿用搜索页真实风格
+  原型范围说明：本文件仅提案新视觉元素（阶段步骤条三态＋补搜跳过态／AI 思考过程折叠区／流失败提示；批 2 追加：等待期"AI 思考中…"脉冲占位／「取消」按钮／>15s 慢提示条，2026-10-14 按主 agent 拍板以"T-041 冻结视觉体系内组件追加"处理、同步进本原型）；既有组件（顶栏、搜索框、意图透明行、结果行、详情面板）直接复用 radar.css 未改动 · 结果区内容与现行搜索页一致——本变更只加"过程可见"，意图/降级/追问口径一字不改 · 步骤条宽度、呼吸点节奏、思考区等宽字体等取舍详见 OpenSpec change streaming-search-progress 的 design.md；批 2 三处见 ai-langchain-refactor 的 design.md 决策 6 · 假数据沿用搜索页真实风格
 </footer>
 
 <div id="toasts" aria-live="polite" role="status"></div>
@@ -497,15 +532,19 @@ async function play(){
   playing = true;
   const btn = document.getElementById("v1-btn");
   document.getElementById("v1-result").innerHTML = "";
+  document.getElementById("v1-canceled").hidden = true; // 取消提示（演示取消态用）
   ["intent","recall","select","external"].forEach(s => setStep(s, ""));
-  ["v1-sec-intent","v1-sec-select"].forEach(id => document.getElementById(id).hidden = true);
-  document.getElementById("v1-text-intent").textContent = "";
+  document.getElementById("v1-sec-intent").hidden = false; // 骨架随段 start 即建（等待期占位）
+  document.getElementById("v1-sec-select").hidden = true;
+  document.getElementById("v1-text-intent").innerHTML = '<span class="th-pending">AI 思考中…</span>';
   document.getElementById("v1-text-select").textContent = "";
   document.getElementById("v1-thinking").open = true;
+  document.getElementById("v1-cancel").hidden = false; // 流开始：「取消」可见（F3-3：终态收起、新一轮重现）
   btn.disabled = true; btn.textContent = "搜索中…";
 
   setStep("intent", "active");
-  document.getElementById("v1-sec-intent").hidden = false;
+  await sleep(900); // 演示等待期：占位脉冲可见（真实实现＝首条增量到达前一直脉冲；>15s 无增量另出慢提示）
+  document.getElementById("v1-text-intent").textContent = "";
   await typeInto(document.getElementById("v1-text-intent"), THINK_INTENT);
   setStep("intent", "done");
 
@@ -515,6 +554,9 @@ async function play(){
 
   setStep("select", "active");
   document.getElementById("v1-sec-select").hidden = false;
+  document.getElementById("v1-text-select").innerHTML = '<span class="th-pending">AI 思考中…</span>';
+  await sleep(900);
+  document.getElementById("v1-text-select").textContent = "";
   await typeInto(document.getElementById("v1-text-select"), THINK_SELECT);
   setStep("select", "done");
 
@@ -523,10 +565,24 @@ async function play(){
   setStep("external", "done");
 
   btn.disabled = false; btn.textContent = "搜索";
+  document.getElementById("v1-cancel").hidden = true; // 终态收起（同实现 F3-3：流已结束，按钮是空控件）
   toast("演示完成：结果区由服务端 SSR 片段整体替换（形态见视图 2）");
   playing = false;
 }
 document.getElementById("replay").addEventListener("click", play);
+document.getElementById("v1-cancel").addEventListener("click", () => {
+  if (!playing) return; // 演示态：只演示"取消后清进度、不自动重跑、恢复提交态"
+  playing = false;
+  stopStepTimer();
+  const box = document.getElementById("v1-progress");
+  box.querySelectorAll(".sp-step").forEach(el => { el.className = "sp-step"; });
+  box.querySelectorAll(".th-sec").forEach(el => { el.hidden = true; el.querySelector(".th-text").textContent = ""; });
+  document.getElementById("v1-slow").textContent = "";
+  document.getElementById("v1-canceled").hidden = false;
+  document.getElementById("v1-cancel").hidden = true; // 取消后进度区已清：按钮一并收起
+  document.getElementById("v1-btn").disabled = false;
+  document.getElementById("v1-btn").textContent = "搜索";
+});
 play(); // 打开页面自动播放一遍
 
 /* ===== 行交互（沿用示意图：折叠/展开、★ 关注；仅作用于视图 2 结果区） ===== */
