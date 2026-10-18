@@ -41,5 +41,5 @@
 - [x] 6.1 `tools/verify.ps1` 一次跑绿（ruff + pytest；基线 586 passed＋本变更新增用例），留存日志与退出码
 - [x] 6.2 `openspec validate direct-follow --strict` 通过；`openspec validate --all --strict` 的 3 项存量失败（ai-refresh-cadence 的 Purpose 占位、local-ai-relay 与 smart-search 各超长 requirement）不在本变更范围，留痕不修（留存原始输出与退出码）
 - [x] 6.3 A 级真实环境预演（本地 uvicorn＋真实 `GITHUB_TOKEN`）：逐条跑「已入池 / 未入池 / 复活 / 已关注 / 400 / 404 / 409」七条路径，核对状态码、横幅文案、GitHub 调用次数（0 与 1）、新行落组与顶栏计数，留档执行记录
-- [ ] 6.4 页面走查（真实页面截图）：P6 输入行与空态、四类成功横幅与锚点跳转、五类失败同页渲染与输入保留、搜索页引导；按 `docs/sop/复验交付规范.md` 出复验步骤卡
-- [ ] 6.5 本人页面验收通过后（另行一轮）将本 change 归档并同步 `openspec/specs/`（`openspec archive direct-follow`），确认 `direct-follow` 能力落入主规格库；本轮收口＝统一验证入口一次跑绿＋独立评审通过＋commit
+- [x] 6.4 页面走查（真实页面截图）：P6 输入行与空态、四类成功横幅与锚点跳转、五类失败同页渲染与输入保留、搜索页引导；按 `docs/sop/复验交付规范.md` 出复验步骤卡（2026-10-18 本人按 `data/_rehearsal/复验步骤卡.md` 走查通过）
+- [x] 6.5 本人页面验收通过后（另行一轮）将本 change 归档并同步 `openspec/specs/`（`openspec archive direct-follow`），确认 `direct-follow` 能力落入主规格库；本轮收口＝统一验证入口一次跑绿＋独立评审通过＋commit（2026-10-18 本人验收通过后当场归档）
