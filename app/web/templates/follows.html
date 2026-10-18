@@ -29,7 +29,8 @@
     <button type="button" class="fchip on" data-tag="">全部<i>{{ follow_count }}</i></button>
     {%- for t in filter_tags %}<button type="button" class="fchip" data-tag="{{ t.tag }}">{{ t.tag }}<i>{{ t.count }}</i></button>{% endfor -%}
   </div>
-  {# 筛选 0 命中空态（§12.2）：JS 控制显隐，初始隐藏；触发路径＝页内取消关注联动把选中 chip 计数减到 0（radar.js） #}
+  {# 筛选 0 命中兜底（§12.2）：T-044 起页内不可达（计数归零的 chip 即被移除、筛选回落"全部"），
+     保留为服务端渲染口径万一放行 0 计数时的兜底文案；JS 控制显隐，初始隐藏 #}
   <p class="filter-empty" id="filter-empty" hidden>该标签下暂无关注项目</p>
   {# id="follow-boards"：radar.js 据以识别 P6 页面，页内取消关注时即时移除该行（组空连组块移除） #}
   <div class="boards" id="follow-boards">

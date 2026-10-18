@@ -208,6 +208,9 @@ async function deleteTag(x) {
     );
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
+    // T-044：删除成功 → 行 data-tags 去掉该标签并重建筛选行（否则要刷新页面才一致）
+    syncRowTags(repo, tag, false);
+    refreshFollowChipCounts();
     const undoToast = toast("已删除标签", false, {
       duration: 6000, // T-023：撤销 toast 存续 6 秒（普通 toast 4s 不动）
       action: {
@@ -224,6 +227,9 @@ async function deleteTag(x) {
             undoToast.remove(); // 撤销成功：撤掉"已删除标签"toast，避免与"已恢复标签"并排矛盾（已移除节点 remove 是 no-op）
             if (anchor && anchor.parentElement) host.insertBefore(chip, anchor);
             else host.appendChild(chip);
+            // T-044：撤销＝标签回到行上，同步回 data-tags 与筛选行
+            syncRowTags(repo, tag, true);
+            refreshFollowChipCounts();
             toast("已恢复标签");
           } catch (err) {
             toast("恢复标签失败：" + err.message, true); // 失败不回插（与删除失败插回路径互不干扰）
@@ -363,6 +369,9 @@ function startTagInput(btn) {
         wrapper.replaceWith(chip);
         hint.remove();
         chip.insertAdjacentElement("afterend", btn); // 按钮接回原位：同一行可连续打多枚标签（评审发现漏插）
+        // T-044：新增成功 → 行 data-tags 加上该标签并重建筛选行（新标签即时出现在 chips 里）
+        syncRowTags(btn.dataset.repo, t, true);
+        refreshFollowChipCounts();
         toast("已添加标签");
       } else {
         restore(); // 重名幂等：不重复写入，toast 提示（§3.3：同仓同名 → "标签已存在"）
@@ -977,8 +986,34 @@ function applyFollowTagFilter() {
   if (empty) empty.hidden = anyVisible;
 }
 
-// 筛选 chips 计数重算（取消关注后按剩余行集重算："全部"=剩余行数，各标签=剩余命中数，0 也列出）
+// T-044：把某仓库在 P6 行集里的 data-tags 加/去一个标签（同仓只有一行，但按 data-repo 定位更稳）。
+// 前提：只对 P6（`#follow-boards` 内、且行内有 `.star[data-repo]`）生效——`_row.html` 的星标是条件渲染
+// （external 且已关注时不渲染），P6 恒渲染故当前成立；若将来复用到「无星标的行集」，需改为传入行元素。
+// 只改客户端 DOM 数据，服务端行由打标/删标 API 持久化；返回是否有变化（供断言/调试）。
+function syncRowTags(repo, tag, add) {
+  if (!repo || !tag) return false;
+  let changed = false;
+  document.querySelectorAll("#follow-boards .row").forEach((r) => {
+    const star = r.querySelector(".star[data-repo]");
+    if (!star || star.dataset.repo !== repo) return;
+    const tags = parseRowTags(r);
+    const has = tags.includes(tag);
+    if (add && !has) tags.push(tag);
+    else if (!add && has) tags.splice(tags.indexOf(tag), 1);
+    else return;
+    r.dataset.tags = JSON.stringify(tags);
+    changed = true;
+  });
+  return changed;
+}
+
+// 筛选 chips 重建（T-044：来源从"只改计数"扩展为"按当前行集整排重建"）——
+// 与 SSR 同口径（服务端只渲染 count>0 的标签），因此新增标签即时出现、计数归零的标签即时消失；
+// "全部"恒在首位、携带行数；当前筛选标签若已无命中则回落"全部"；重建后立即重算可见行集。
+// 无筛选行的页面（P1/P3/P4/P5）直接返回，行为不变。
 function refreshFollowChipCounts() {
+  const filter = document.querySelector(".tag-filter");
+  if (!filter) return;
   const rows = document.querySelectorAll("#follow-boards .row");
   const counts = {};
   rows.forEach((r) =>
@@ -986,11 +1021,24 @@ function refreshFollowChipCounts() {
       if (t) counts[t] = (counts[t] || 0) + 1;
     })
   );
-  document.querySelectorAll(".tag-filter .fchip").forEach((c) => {
-    const i = c.querySelector("i");
-    if (!i) return;
-    i.textContent = String(c.dataset.tag === "" ? rows.length : counts[c.dataset.tag] || 0);
-  });
+  if (activeFollowTag && !counts[activeFollowTag]) activeFollowTag = "";
+  filter.querySelectorAll(".fchip").forEach((c) => c.remove());
+  const makeChip = (value, label, count) => {
+    const c = document.createElement("button");
+    c.type = "button";
+    c.className = "fchip" + ((value || "") === activeFollowTag ? " on" : "");
+    c.dataset.tag = value;
+    c.append(document.createTextNode(label));
+    const i = document.createElement("i");
+    i.textContent = String(count);
+    c.append(i);
+    filter.append(c);
+  };
+  makeChip("", "全部", rows.length);
+  Object.keys(counts)
+    .sort()
+    .forEach((t) => makeChip(t, t, counts[t]));
+  applyFollowTagFilter();
 }
 
 // 点 chip：再点当前标签或"全部" → 取消筛选恢复（§12.2）

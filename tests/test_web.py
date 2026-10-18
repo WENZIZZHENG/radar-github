@@ -11,6 +11,7 @@
 """
 
 import json
+import pathlib
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -888,6 +889,26 @@ def test_follows_filter_row_and_data_tags(follows_client):
     assert text.count('data-tags="[]"') == 4  # 其余四行无标签
     assert 'id="filter-empty" hidden' in text
     assert "该标签下暂无关注项目" in text
+
+
+def test_p6_tag_filter_sync_wiring_source_lock():
+    """回归锁（T-044）：P6 标签增删后必须联动筛选行与行 data-tags。
+
+    前端无 JS 单测框架（零构建），按项目既有先例做**源码级锁定**（同 test_search.py 的 radar.js 断言）：
+    锁定三处调用点与"整排重建 chips"的实现标记；配合真实 Chrome 预演（data/_rehearsal/t044-result.json）兜行为。
+    """
+    src = (pathlib.Path(__file__).resolve().parents[1] / "app/web/static/radar.js").read_text(encoding="utf-8")
+    assert "function syncRowTags(" in src, "T-044：行 data-tags 同步函数缺失"
+    # 1 处定义 + 3 处调用（删除成功 / 撤销成功 / 新增成功）
+    assert src.count("syncRowTags(") >= 4, "T-044：syncRowTags 调用点不足三处"
+    assert "function refreshFollowChipCounts(" in src
+    # 整排重建标记：先清空既有 .fchip 再按当前行集重建（0 计数不出现，与服务端同口径）
+    assert 'filter.querySelectorAll(".fchip").forEach((c) => c.remove())' in src
+    # 当前筛选标签无命中时回落"全部"
+    assert 'if (activeFollowTag && !counts[activeFollowTag]) activeFollowTag = "";' in src
+    # 无筛选行的页面（P1/P3/P4/P5）必须早期返回，避免影响既有页面
+    assert 'const filter = document.querySelector(".tag-filter");' in src
+    assert "if (!filter) return;" in src
 
 
 # ---------- direct-follow：P6 直接关注入口与结果横幅（§21.1/§21.4） ----------
