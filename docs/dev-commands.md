@@ -3,11 +3,15 @@
 > 本项目日常开发与验证命令的唯一登记处，均已实测跑通（Windows + Git Bash 环境）。
 > 新增或变更命令必须实际跑通后才写入本文件；统一收口验证入口见 §1，收口只认它一次跑绿。
 
-## 1. 统一验证入口（ruff + pytest）
+## 1. 统一验证入口（ruff + 规范文本复扫 + pytest）
 
 ```bash
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 ```
+
+- 三段：`ruff check app tests` → `python tools/check_spec_text.py` → `pytest -q`；任一段非 0 即整体失败。
+- `tools/check_spec_text.py`（2026-10-18 新增，T-044 评审实证后落成门禁）：扫 `openspec/specs/**/spec.md` 的 requirement 正文，查三类别处——拆条腰斩（正文以标点开头）、残句（末行缺句末标点且非"冒号＋列表"）、重复分句（≥15 字，抓"把移动写成复制"这类假完成）。`openspec validate --strict` 对这三类**不报**，故单列一段机器检查。
+- 单独跑某一段：`.venv\Scripts\python.exe tools\check_spec_text.py`（exit 0 = 无命中，1 = 有命中，逐条打印 文件:行号）。
 
 ## 2. 本地起服务
 
