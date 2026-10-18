@@ -355,6 +355,18 @@ nav.tabs a.active i { color: var(--text-2); }
 /* P6 空态里的回首页链接：弱文字块中点出可点性 */
 .empty-follows a { color: var(--blue); }
 
+/* ===== direct-follow 追加（P6 直接关注入口＋结果横幅；复用既有 .search-box / .notice 与 :root token） ===== */
+
+/* 地址输入行：复用 .search-box 的输入框与按钮形态，只收窄最大宽度（与页面正文行宽一致，不新造组件） */
+.follow-add { max-width: 760px; }
+/* 输入行下的口径提示（P6）与搜索页引导（P8）共用同一个小字样式 */
+.follow-add-hint { margin-top: 6px; font-size: 12px; color: var(--text-3); }
+.follow-add-hint a { color: var(--blue); }
+/* 失败横幅（direct-follow §21.4）：复用 .notice 形态，侧条换警示红区分成功/失败（同 .toast.err 口径） */
+.notice.err { border-left-color: var(--destructive); }
+/* 横幅内锚点链接（"在下方「{语言组}」组查看"）：浏览器默认链接色在深底上对比度不足，统一用既有 --blue */
+.notice a { color: var(--blue); }
+
 /* ===== T-010 追加（标签增删＋P5 筛选页；样式照示意图，一律复用 :root token） ===== */
 
 /* chip 本体变链接（跳 /tags/<tag>）：去链接下划线，色随 chip；hover 下划线提示可点 */

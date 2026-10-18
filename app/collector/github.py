@@ -209,8 +209,14 @@ class GitHubClient:
         响应字段与 Search item 同构，入库映射与采集层共用同一套口径。
         404（仓库不存在/已删除/转私有）抛 GitHubNotFoundError，由调用方映射用户可见错误；
         核心 REST 限速 5000 次/小时（认证），单发请求不配主动限速（Search 的 30 次/分钟才需要 _pace_search）。
+
+        跟随改名 301（direct-follow §21.6）：仓库改名后旧链接会被 GitHub 301 到新名，本请求级开
+        `follow_redirects=True`（只这一条 GET；客户端全局与 Search/GraphQL/README 不动——它们不需要，
+        全局打开会无谓扩大既有请求行为的回归面）。跟随之后 `full_name` 字段即新名：旧链接指向未入池
+        仓库时按新名入池；旧名已在库、新名 node_id 已存在时由 ingest_followed_repo 的既有 fail-loud
+        报错（409），库内 full_name 不改写、不自动归并。
         """
-        response = await self._request("GET", f"{REPOS_URL}/{full_name}")
+        response = await self._request("GET", f"{REPOS_URL}/{full_name}", follow_redirects=True)
         return response.json()
 
     async def fetch_readme(self, full_name: str) -> tuple[str | None, str | None]:

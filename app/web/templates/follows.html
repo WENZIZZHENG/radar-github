@@ -2,8 +2,21 @@
 {% block title %}{{ title }}{% endblock %}
 
 {% block content %}
-{# P6 我的关注（v1.3 独立页，流程说明 §2A 三层）：元信息行 → 分组区（按语言，空组不渲染）→ 项目行（_row.html 与榜单行共用） #}
+{# P6 我的关注（v1.3 独立页，流程说明 §2A 三层）：元信息行 → 直接关注入口 → 分组区（按语言，空组不渲染）→ 项目行（_row.html 与榜单行共用） #}
 <p class="meta">窗口：{{ meta.window }}，与当期周报同口径 · 关注 <b class="mono" id="follow-total">{{ follow_count }}</b> 个仓库 · 按语言分组 · 组内按当周增量降序</p>
+
+{# direct-follow §21.3/§21.4：结果横幅（GET 成功走 PRG 回跳参数渲染；POST 失败同页渲染错误条）。
+   成功横幅附"在下方「{语言组}」组查看"锚点（anchor/group_label 由 _follow_banner 查库与分组口径给出，
+   查不到组就不给链接）；失败横幅用 .notice.err（既有 token，不新造颜色）。 #}
+{% if banner %}<p class="notice{% if banner.kind == 'err' %} err{% endif %}" role="status">{{ banner.text }}{% if banner.anchor %} <a href="#{{ banner.anchor }}">在下方「{{ banner.group_label }}」组查看</a>{% endif %}</p>{% endif %}
+
+{# direct-follow §21.1：直接关注入口——元信息行下、标签筛选行上；原生表单提交（无 JS 可用），
+   提交语义与行内 ☆ 同义、不经过 AI；maxlength=300 只是体验约束，服务端判定按 owner/repo 口径（140）。 #}
+<form class="search-box follow-add" method="post" action="/follows/add">
+  <input id="follow-add-input" name="repo" type="text" value="{{ repo_value | default('') }}" placeholder="粘贴 GitHub 地址或 owner/repo，如 https://github.com/psf/requests" aria-label="仓库地址" maxlength="300" autocomplete="off" spellcheck="false" required>
+  <button type="submit">关注</button>
+</form>
+<p class="follow-add-hint">支持 github.com 链接、git@github.com:owner/repo.git 与 owner/repo；已关注的仓库不会重复写入。</p>
 
 {% if groups %}
 <section>
@@ -29,7 +42,8 @@
   </div>
 </section>
 {% else %}
-{# 空关注空态（流程说明 §4：空态必须回答"接下来会发生什么"）＋回首页链接 #}
-<p class="empty-follows">还没有关注任何项目：去榜单点行右侧 ☆，该项目每周增量会出现在这里。<a href="/">回首页</a></p>
+{# 空关注空态（流程说明 §4：空态必须回答"接下来会发生什么"）＋回首页链接；
+   direct-follow §21.1：空态下输入入口照常可用，故空态文案指向"在上方粘贴地址"。 #}
+<p class="empty-follows">还没有关注任何项目：在上方粘贴 GitHub 仓库地址直接添加，或去榜单点行右侧 ☆，该项目每周增量会出现在这里。<a href="/">回首页</a></p>
 {% endif %}
 {% endblock %}

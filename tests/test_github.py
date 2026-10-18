@@ -395,3 +395,59 @@ def test_fetch_readme_auth_error_passes_through():
     with pytest.raises(GitHubAuthError):
         asyncio.run(client.fetch_readme("o/r"))
     asyncio.run(client.aclose())
+
+
+# ---------- direct-follow：fetch_repo 跟随改名 301（§21.6；只这一条 GET） ----------
+
+
+def test_fetch_repo_follows_301_rename():
+    """旧名 301 → 新名：fetch_repo 请求级跟随重定向，取到最终元数据（新 full_name），共 2 次请求。
+
+    锁定 direct-follow 设计决策 5：客户端全局不开 follow_redirects，只有单仓 GET 打开；
+    库内不改写 full_name，改名由「跟随 + node_id 撞库 fail-loud」处理。
+    """
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.path == "/repos/old/name":
+            return httpx.Response(301, headers={"Location": "/repos/new/name"}, json={"message": "Moved Permanently"})
+        return httpx.Response(
+            200,
+            json={
+                "full_name": "new/name",
+                "node_id": "node-new/name",
+                "description": "renamed",
+                "language": "Go",
+                "topics": [],
+                "stargazers_count": 7,
+            },
+        )
+
+    client = _make_client(handler, [])
+    item = asyncio.run(client.fetch_repo("old/name"))
+    assert item["full_name"] == "new/name"  # 跟随后的响应体即新名（入库与横幅用规范名）
+    assert item["stargazers_count"] == 7
+    assert calls == ["https://api.github.com/repos/old/name", "https://api.github.com/repos/new/name"]
+    asyncio.run(client.aclose())
+
+
+def test_fetch_repo_does_not_follow_other_requests():
+    """回归锁：只有 fetch_repo 跟随重定向；GraphQL 批量（fetch_repos_by_ids）不跟随，301 按普通响应返回。
+
+    全局开 follow_redirects 会改变 Search/GraphQL/README 的既有请求行为（设计决策 5 的备选否决）。
+    """
+    post_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        post_calls.append(request.method)
+        return httpx.Response(301, headers={"Location": "/other"}, json={"data": {"nodes": []}})
+
+    async def main() -> None:
+        sleeps: list[float] = []
+        async with _make_client(handler, sleeps) as client:
+            nodes = await client.fetch_repos_by_ids(["node-1"])
+        assert nodes == []  # 301 响应体原样解析：没有二次请求（未跟随）
+        assert post_calls == ["POST"]
+
+    asyncio.run(main())

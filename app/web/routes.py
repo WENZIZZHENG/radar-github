@@ -37,10 +37,17 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.templating import Jinja2Templates
 
 from app.ai import (
@@ -61,10 +68,11 @@ from app.collector.github import (
 )
 from app.config import BASE_DIR, get_settings
 from app.db import get_conn
-from app.follows import follow_repo, unfollow_repo
+from app.follows import FollowOutcome, follow_repo, unfollow_repo
 from app.jobs import sync_status, try_start_sync
 from app.local_ai import KINDS as LOCAL_AI_KINDS
 from app.local_ai import apply_fill, build_export, parse_fill_payload, render_export_text
+from app.reporef import is_valid_full_name, parse_repo_ref
 from app.report import (
     OTHER_TOPIC_KEY,
     Board,
@@ -967,34 +975,103 @@ def total(request: Request, board: str | None = None, hide_tagged: str | None = 
     )
 
 
+# 成功横幅文案（direct-follow spec「结果与失败如实反馈」四类，与《交互流程/21-直接关注.md》§21.4 逐字同源）
+_FOLLOW_BANNER_TEXTS = {
+    "joined": "已关注 {full_name}：此前不在池内，已即时抓取基线快照并入池，下周起显示当周增量。",
+    "revived": "已关注 {full_name}：此前已标记失效，已复活并补一张基线快照，次日起恢复每日采集。",
+    "alive": "已关注 {full_name}：该仓库已在跟踪池内，无需额外抓取。",
+    "already": "{full_name} 已经在关注中，未做重复写入。",
+}
+
+# 地址无法识别的 400 文案（§21.4 逐字；提交内容原样回显，模板自动转义）
+_FOLLOW_PARSE_ERROR = "无法识别仓库地址：{raw}。支持 https://github.com/owner/repo、git@github.com:owner/repo.git 或 owner/repo。"
+# 表单体上限（防御）：浏览器输入框 maxlength=300，正常提交远小于此；超限按防御性 400 处理，
+# 不把超大原文回显进页面（§21.4「失败页保留输入框原值」覆盖 300 字以内的正常输入）。
+_FOLLOW_ADD_BODY_MAX = 8192
+_FOLLOW_TOO_LARGE = (
+    "无法识别仓库地址：输入过长（超过 8192 字节）。"
+    "支持 https://github.com/owner/repo、git@github.com:owner/repo.git 或 owner/repo。"
+)
+
+
+def _follows_context(conn: sqlite3.Connection) -> dict:
+    """P6 页面上下文（元信息行＋筛选 chips＋分组区＋计数）——GET 与 POST 失败页共用同一份。
+
+    T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块；
+    T-024：概要固定取 ('summary', 'all')（文档视角、全页面同一条），缺则该行无概要块。
+    T-021 §12.2 筛选 chips（2026-10-12 收窄）：仅关注仓上实际打过的标签（INNER JOIN follows，
+    计数 > 0 才列出）；按标签名字典序（与 _all_tags 同口径 ORDER BY tag）。
+
+    direct-follow §21.1：POST 失败时要在同一页渲染原因，页面骨架（元信息行/计数/分组区）必须完整，
+    故把装配收口到本函数，GET 与失败分支各只额外补自己的字段（banner/repo_value）。
+    """
+    now = datetime.now(timezone.utc)
+    follow_rows = conn.execute(
+        "SELECT r.id, r.full_name, r.language, r.description_en, r.dead, r.github_created_at"
+        " FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
+    ).fetchall()
+    cards = _follow_cards(conn, follow_rows, now.strftime(_ISO_FMT))
+    # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块；
+    # T-024：概要固定取 ('summary', 'all')（文档视角，全页面同一条），缺则该行无概要块
+    reasons, zh, tags, summaries = _display_maps(conn, dimension="total", period_label="all")
+    filter_tags = [
+        {"tag": r["tag"], "count": r["n"]}
+        for r in conn.execute(
+            "SELECT t.tag AS tag, COUNT(*) AS n FROM tags t"
+            " JOIN follows f ON f.repo_id = t.repo_id GROUP BY t.tag ORDER BY t.tag"
+        )
+    ]
+    return {
+        "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
+        "follow_count": len(follow_rows),
+        "filter_tags": filter_tags,  # T-021：标签筛选行数据（仅关注仓实际标签，计数 > 0）
+        "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
+        "groups": _follow_groups(cards, reasons, zh, tags, summaries),
+    }
+
+
+def _follow_banner(groups: list[dict], conn: sqlite3.Connection, added: str | None, result: str | None) -> dict | None:
+    """成功横幅（PRG 回跳参数 → 展示数据）；参数伪造/过期/白名单外一律 None（不渲染横幅）。
+
+    added 必须①过 full_name 形态校验、②能在关注集（follows JOIN repos）里查到——否则横幅不渲染：
+    查询串是用户可改的，不能让任意文本进页面，也不给"已关注"兜底文案（design 决策 6 参数白名单）。
+    result 只接受四类之一（joined/revived/alive/already），其余不渲染。
+    锚点：classify_language(language) → `f-<key>`（无语言归 `f-other`「其它语言」），组标签从 groups
+    里按 anchor 反查（查不到则不给链接）——与 `_follow_groups` 的分组口径同源，不另造分组。
+    """
+    if result not in _FOLLOW_BANNER_TEXTS or not is_valid_full_name(added):
+        return None
+    row = conn.execute(
+        "SELECT r.full_name, r.language FROM follows f JOIN repos r ON r.id = f.repo_id WHERE r.full_name = ?",
+        (added,),
+    ).fetchone()
+    if row is None:
+        return None  # 伪装/过期参数（含已取消关注的仓库）：静默不渲染，不做无意义报错
+    anchor = f"f-{classify_language(row['language'])}"
+    group = next((g for g in groups if g["anchor"] == anchor), None)
+    return {
+        "kind": "ok",
+        "text": _FOLLOW_BANNER_TEXTS[result].format(full_name=row["full_name"]),
+        "anchor": anchor if group is not None else None,
+        "group_label": group["label"] if group is not None else None,
+    }
+
+
 @router.get("/follows", response_class=HTMLResponse)
-def follows_page(request: Request) -> HTMLResponse:
+def follows_page(
+    request: Request, added: str | None = None, result: str | None = None
+) -> HTMLResponse:
     """P6 我的关注（v1.3 独立页）：关注仓库按语言分组，增量与当期周报同窗口（as_of=now 周口径）。
 
     无期次概念（不跟周次切换走）；空关注时渲染空态引导（流程说明 §4），分组/排序口径在 _follow_groups。
-    T-021 §12.2（2026-10-12 收窄）：filter_tags = 关注仓上实际打过的标签（计数 > 0，字典序），
-    供页内客户端筛选 chips；0 计数不列出（页内取消关注联动致计数归零时的空态由 radar.js 处理）。
+    direct-follow §21.1~§21.4：元信息行下加地址输入行（原生表单 POST /follows/add）；
+    `added`/`result` 为成功后的 PRG 回跳参数（白名单校验见 _follow_banner），GET 页面只读它们渲染横幅。
     """
-    now = datetime.now(timezone.utc)
     conn = get_conn()
     try:
-        follow_rows = conn.execute(
-            "SELECT r.id, r.full_name, r.language, r.description_en, r.dead, r.github_created_at"
-            " FROM follows f JOIN repos r ON r.id = f.repo_id ORDER BY f.created_at"
-        ).fetchall()
-        cards = _follow_cards(conn, follow_rows, now.strftime(_ISO_FMT))
-        # T-017（§8.1）：关注页长期盯梢语境 → 总星维度文本（最新一条），缺则该行无推荐语块；
-        # T-024：概要固定取 ('summary', 'all')（文档视角，全页面同一条），缺则该行无概要块
-        reasons, zh, tags, summaries = _display_maps(conn, dimension="total", period_label="all")
-        # T-021 §12.2 筛选 chips（2026-10-12 收窄）：仅关注仓上实际打过的标签（INNER JOIN follows，
-        # 计数 > 0 才列出）；按标签名字典序（与 _all_tags 同口径 ORDER BY tag）
-        filter_tags = [
-            {"tag": r["tag"], "count": r["n"]}
-            for r in conn.execute(
-                "SELECT t.tag AS tag, COUNT(*) AS n FROM tags t"
-                " JOIN follows f ON f.repo_id = t.repo_id GROUP BY t.tag ORDER BY t.tag"
-            )
-        ]
+        context = _follows_context(conn)
+        context["banner"] = _follow_banner(context["groups"], conn, added, result)
+        context["repo_value"] = ""  # GET 无回填值（输入框 value 取空）
         return templates.TemplateResponse(
             request=request,
             name="follows.html",
@@ -1002,11 +1079,7 @@ def follows_page(request: Request) -> HTMLResponse:
                 "request": request,
                 "page": "follows",  # 顶栏 active 态
                 "title": "我的关注",
-                "meta": _meta(conn, "week", now.date()),  # 与当期周报同窗口口径（v1.3 §2A 第 1 层）
-                "follow_count": len(follow_rows),
-                "filter_tags": filter_tags,  # T-021：标签筛选行数据（仅关注仓实际标签，计数 > 0）
-                "all_tags": _all_tags(conn),  # T-022 打标输入建议（datalist）
-                "groups": _follow_groups(cards, reasons, zh, tags, summaries),
+                **context,
             },
         )
     finally:
@@ -1057,9 +1130,8 @@ def topic_candidates_page(request: Request) -> HTMLResponse:
 
 # ===== 关注 API（T-009；决策 9 动态入池；三态分流在 app.follows） =====
 
-# owner/repo 字符集（GitHub 惯例：字母数字与 -_.）；长度上限 = owner 39 + "/" + repo 100
-_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_FULL_NAME_MAX_LEN = 140
+# full_name 形态判定（owner/repo 字符集、长度上限 140）唯一实现在 app.reporef；
+# 本层只借它做入参校验 / 页面上下文白名单，不再自带第二份正则常量（direct-follow §21.5 解析单一入口）。
 
 
 async def _github_client() -> AsyncIterator[GitHubClient]:
@@ -1075,8 +1147,12 @@ async def _github_client() -> AsyncIterator[GitHubClient]:
 
 
 def _parse_full_name(raw: object) -> str:
-    """full_name 入参校验：非法形态直接 400（fail-loud，不把垃圾输入带去打 GitHub）。"""
-    if not isinstance(raw, str) or not _FULL_NAME_RE.fullmatch(raw) or len(raw) > _FULL_NAME_MAX_LEN:
+    """full_name 入参校验：非法形态直接 400（fail-loud，不把垃圾输入带去打 GitHub）。
+
+    判定委托 app.reporef.is_valid_full_name（形态与长度上限的单一实现，与地址归一同一份口径）；
+    本函数只负责把失败转成 HTTP 400。
+    """
+    if not is_valid_full_name(raw):
         raise HTTPException(status_code=400, detail=f"full_name 应为 owner/repo 形态，收到：{raw!r}")
     return raw
 
@@ -1094,6 +1170,31 @@ def _parse_as_of(raw: object) -> str | None:
             status_code=400, detail=f"as_of 应为 UTC 定长 ISO（YYYY-MM-DDTHH:MM:SSZ），收到：{raw!r}"
         ) from None
     return raw
+
+
+async def _follow_or_http(conn: sqlite3.Connection, client: GitHubClient, full_name: str) -> FollowOutcome:
+    """调三态关注写路径并把服务层异常映射成 HTTPException（404/500/502/409）——单一映射点。
+
+    `POST /api/follows`（JSON API）与 `POST /follows/add`（页面路由）共用本函数：两条入口的
+    状态码与文案口径必须逐字一致，异常映射只在本处写一次（direct-follow 设计决策 3）。
+    映射表：GitHubNotFoundError→404（不存在/已删除/转私有）；GitHubAuthError→500（token 配置问题，
+    message 自带修复指引原样透传）；GitHubError→502（上游请求失败）；ValueError→409（node_id 撞库，
+    改名或同名重建，已回滚无半写，让本人知情处置）。`from None` 保留：不把底层异常链暴露给响应。
+    """
+    try:
+        return await follow_repo(conn, client, full_name)
+    except GitHubNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"GitHub 上找不到仓库 {full_name}（不存在/已删除/转私有）"
+        ) from None
+    except GitHubAuthError as exc:
+        # token 配置问题（服务端侧）：message 自带修复指引，原样透传给本人
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+    except GitHubError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub 请求失败：{exc}") from None
+    except ValueError as exc:
+        # node_id 撞库（改名仓库）：已回滚无半写，409 让本人知情处置
+        raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
 @router.post("/api/follows")
@@ -1114,20 +1215,7 @@ async def api_follow(request: Request, client: GitHubClient = Depends(_github_cl
     _parse_as_of(payload.get("as_of"))  # 校验形态保留（坏值仍 400）；值本身 v1.3 起不再消费
     conn = get_conn()
     try:
-        try:
-            outcome = await follow_repo(conn, client, full_name)
-        except GitHubNotFoundError:
-            raise HTTPException(
-                status_code=404, detail=f"GitHub 上找不到仓库 {full_name}（不存在/已删除/转私有）"
-            ) from None
-        except GitHubAuthError as exc:
-            # token 配置问题（服务端侧）：message 自带修复指引，原样透传给本人
-            raise HTTPException(status_code=500, detail=str(exc)) from None
-        except GitHubError as exc:
-            raise HTTPException(status_code=502, detail=f"GitHub 请求失败：{exc}") from None
-        except ValueError as exc:
-            # node_id 撞库（改名仓库）：已回滚无半写，409 让本人知情处置
-            raise HTTPException(status_code=409, detail=str(exc)) from None
+        outcome = await _follow_or_http(conn, client, full_name)
         return {
             "full_name": outcome.full_name,
             "followed": True,
@@ -1137,6 +1225,118 @@ async def api_follow(request: Request, client: GitHubClient = Depends(_github_cl
         }
     finally:
         conn.close()
+
+
+def _check_same_origin(request: Request) -> None:
+    """同源校验（CSRF 防护，direct-follow 设计决策 8）：urlencoded 表单 POST 是跨站可提交的简单请求。
+
+    只在请求带 Origin 时校验（跨站 POST 必带 Origin；同源表单/旧浏览器不带时放行，不破坏正常提交）：
+    取 Origin 的 hostname，与请求 Host（以及可信反代给出的 X-Forwarded-Host）的 hostname 比较——
+    忽略端口与 scheme（决策 8 只约束 host）。应用只监听回环（deploy/radar.service），
+    外部客户端无法直连伪造 X-Forwarded-Host；Caddy 默认透传 Host 且总是设置 X-Forwarded-Host，
+    改用改写 Host 的反代时由后者兜底。
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return
+    origin_host = urllib.parse.urlsplit(origin).hostname
+    candidates: set[str] = set()
+    for raw_host in (request.headers.get("host", ""), request.headers.get("x-forwarded-host", "")):
+        first = raw_host.split(",")[0].strip()
+        if first:
+            hostname = urllib.parse.urlsplit(f"//{first}").hostname
+            if hostname:
+                candidates.add(hostname)
+    if not origin_host or origin_host not in candidates:
+        raise HTTPException(status_code=403, detail="跨站提交被拒绝：本表单只接受同源提交")
+
+
+def _declared_too_large(value: str) -> bool:
+    """Content-Length 预判：纯数字、位数 ≤10 且超过请求体上限时返回 True。
+
+    位数上限是防御 Python 3.11+ 的 int 字符串转换 4300 位上限（不可信的 CL 头直接 int() 会抛
+    ValueError 把防御分支变成 500）；10 位已覆盖 8192 与任何现实的请求体长度。
+    """
+    return value.isdigit() and len(value) <= 10 and int(value) > _FOLLOW_ADD_BODY_MAX
+
+
+def _follows_too_large(request: Request) -> HTMLResponse:
+    """防御分支（§21.4）：请求体超限时渲染固定短文案的 400 页，不回显原文。"""
+    conn = get_conn()
+    try:
+        return _follows_error_response(request, conn, "", _FOLLOW_TOO_LARGE, status_code=400)
+    finally:
+        conn.close()
+
+
+@router.post("/follows/add")
+async def follows_add(request: Request, client: GitHubClient = Depends(_github_client)) -> Response:
+    """P6 直接关注（direct-follow §21.1/§21.3）：粘贴 GitHub 地址 → 归一 → 既有三态写路径 → PRG 反馈。
+
+    三步固定（设计决策 3，不新增第二条写路径）：解析（app.reporef.parse_repo_ref）→
+    `_follow_or_http`（app.follows.follow_repo 三态 + 异常映射）→ 结果映射。
+    成功：303 跳回 `/follows?added=<规范名>&result=<joined|revived|alive|already>`，由随后的 GET 渲染横幅；
+    失败：不跳转，以 400/404/409/500/502 在原页渲染原因并回填输入（HTTP 状态与错误类别一致，§21.4）。
+    表单体手动解析 urlencoded（项目零依赖惯例：不引 python-multipart，同 _parse_search_body）；
+    请求体超过 `_FOLLOW_ADD_BODY_MAX` 或 Origin 非同一站点时防御性拒绝（分别 400/403，不回显原文）：
+    带 Content-Length 的请求在读取 body 之前就拒绝，读出后再按实际长度兜底（分块/缺长度场景）。
+    """
+    _check_same_origin(request)
+    if _declared_too_large(request.headers.get("content-length", "")):
+        return _follows_too_large(request)  # 读 body 之前拒绝：不为超大请求分配内存
+    body = await request.body()
+    if len(body) > _FOLLOW_ADD_BODY_MAX:
+        return _follows_too_large(request)  # 无/非法 Content-Length 的兜底
+    try:
+        params = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        params = {}
+    raw_values = params.get("repo")
+    raw = (raw_values[0] if raw_values else "").strip()
+    conn = get_conn()
+    try:
+        full_name = parse_repo_ref(raw)
+        if full_name is None:
+            # 形态无法识别：400 同页渲染，输入框原样回填（§21.4「保留原值」；模板自动转义）
+            return _follows_error_response(
+                request, conn, raw, _FOLLOW_PARSE_ERROR.format(raw=raw), status_code=400
+            )
+        try:
+            outcome = await _follow_or_http(conn, client, full_name)
+        except HTTPException as exc:
+            return _follows_error_response(
+                request, conn, raw, str(exc.detail), status_code=exc.status_code
+            )
+        result = "already" if outcome.already_followed else outcome.state
+        return RedirectResponse(
+            f"/follows?{urlencode({'added': outcome.full_name, 'result': result})}", status_code=303
+        )
+    finally:
+        conn.close()
+
+
+def _follows_error_response(
+    request: Request, conn: sqlite3.Connection, repo_value: str, text: str, *, status_code: int
+) -> HTMLResponse:
+    """失败同页渲染（§21.4）：完整 P6 页面骨架＋错误横幅＋输入框回填原值，状态码与错误类别一致。
+
+    页面数据走 `_follows_context`（与 GET 同源），保证失败页不是残缺片段；
+    横幅字段与成功横幅同形（kind/text/anchor/group_label），模板按 kind 决定样式与锚点。
+    """
+    context = _follows_context(conn)
+    context["banner"] = {"kind": "err", "text": text, "anchor": None, "group_label": None}
+    context["repo_value"] = repo_value
+    return templates.TemplateResponse(
+        request=request,
+        name="follows.html",
+        status_code=status_code,
+        context={
+            "request": request,
+            "page": "follows",
+            "title": "我的关注",
+            **context,
+        },
+    )
 
 
 @router.delete("/api/follows/{full_name:path}")

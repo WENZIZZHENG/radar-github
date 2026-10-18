@@ -550,7 +550,10 @@ def _seed_web(conn):
 
 
 def test_search_page_ok_and_nav(search_env):
-    """打开搜索页：200、顶栏 6 项含"搜索"入口（active）、输入框+提交按钮、无结果区。"""
+    """打开搜索页：200、顶栏 6 项含"搜索"入口（active）、输入框+提交按钮、无结果区。
+
+    direct-follow §21.7：搜索框下始终有一行指向「我的关注」的静态引导；表单契约（action/字段名）不变。
+    """
     conn = get_conn(search_env)
     _seed_web(conn)
     conn.close()
@@ -562,11 +565,17 @@ def test_search_page_ok_and_nav(search_env):
         assert 'name="q"' in resp.text and 'action="/search"' in resp.text
         assert "搜索结果" not in resp.text  # 未搜索无结果区
         assert "搜索暂不可用" not in resp.text
+        # 引导行：指向 P6，文案逐字；不新增表单字段、不改提交目标
+        assert '已知仓库地址？到 <a href="/follows">「我的关注」</a> 粘贴地址即可直接关注（不经过 AI 搜索）。' in resp.text
+        assert resp.text.count("</form>") == 1  # 仍只有一个表单（引导不是第二处添加入口）
     app.dependency_overrides.clear()
 
 
 def test_search_page_unavailable_without_key(tmp_path, monkeypatch):
-    """AI key 未配置：页面明确"搜索暂不可用（AI 未配置或已禁用）"＋表单禁用；榜单页不受影响。"""
+    """AI key 未配置：页面明确"搜索暂不可用（AI 未配置或已禁用）"＋表单禁用；榜单页不受影响。
+
+    direct-follow §21.7：AI 不可用时降级形态（表单禁用＋提示）一字不改，引导行照常显示。
+    """
     db = tmp_path / "no-key.db"
     init_db(db)
     monkeypatch.setenv("RADAR_DB_PATH", str(db))
@@ -578,6 +587,7 @@ def test_search_page_unavailable_without_key(tmp_path, monkeypatch):
         assert "搜索暂不可用（AI 未配置或已禁用）" in resp.text
         assert 'id="search-btn" disabled' in resp.text  # 按钮禁用
         assert 'required disabled' in resp.text  # 输入框禁用（disabled 在标签尾，不与 id 相邻）
+        assert '已知仓库地址？到 <a href="/follows">「我的关注」</a> 粘贴地址即可直接关注（不经过 AI 搜索）。' in resp.text
         assert client.get("/").status_code == 200  # 主链路不受影响
 
 

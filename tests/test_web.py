@@ -412,14 +412,23 @@ def test_follows_page_na_and_dead_row_marks(follows_client):
 
 
 def test_follows_page_empty_state(fresh_client):
-    """空关注空态（v1.3 §4）：引导文案＋回首页链接；分组区不渲染；计数徽标 0。"""
+    """空关注空态（v1.3 §4）：引导文案＋回首页链接；分组区不渲染；计数徽标 0。
+
+    direct-follow §21.1：空态文案改为先指"在上方粘贴地址"，且输入入口在空态下同样渲染
+    （表单与横幅在 `{% if groups %}` 之外）——文案逐字按《交互流程/21-直接关注.md》。
+    """
     resp = fresh_client.get("/follows")
     assert resp.status_code == 200
     text = resp.text
-    assert "还没有关注任何项目：去榜单点行右侧 ☆，该项目每周增量会出现在这里" in text
+    assert (
+        "还没有关注任何项目：在上方粘贴 GitHub 仓库地址直接添加，或去榜单点行右侧 ☆，该项目每周增量会出现在这里"
+        in text
+    )
     assert '<a href="/">回首页</a>' in text
     assert 'id="follow-boards"' not in text
     assert '我的关注<i id="nav-follow-count">0</i>' in text
+    assert 'action="/follows/add"' in text  # 空态下添加入口照常在
+    assert 'id="follow-add-input"' in text
 
 
 # ---------- T-017：_display_maps 维度映射与页面推荐语展示 ----------
@@ -881,12 +890,57 @@ def test_follows_filter_row_and_data_tags(follows_client):
     assert "该标签下暂无关注项目" in text
 
 
+# ---------- direct-follow：P6 直接关注入口与结果横幅（§21.1/§21.4） ----------
+
+
+def test_follows_page_has_add_form(follows_client):
+    """P6 添加入口（§21.1）：元信息行下、原生表单（无 JS 可用）＋口径提示行；表单控件属性齐备。"""
+    text = follows_client.get("/follows").text
+    assert '<form class="search-box follow-add" method="post" action="/follows/add">' in text
+    assert (
+        '<input id="follow-add-input" name="repo" type="text" value=""'
+        ' placeholder="粘贴 GitHub 地址或 owner/repo，如 https://github.com/psf/requests"'
+        ' aria-label="仓库地址" maxlength="300" autocomplete="off" spellcheck="false" required>' in text
+    )
+    assert "支持 github.com 链接、git@github.com:owner/repo.git 与 owner/repo；已关注的仓库不会重复写入。" in text
+    # 入口在标签筛选行之前（§21.1 位置：元信息行下、标签筛选行上）
+    assert text.index('action="/follows/add"') < text.index('<div class="tag-filter"')
+
+
+def test_follows_page_add_form_present_when_empty(fresh_client):
+    """空关注页（§21.1）：输入框与「关注」按钮照常可见，与空态说明并存。"""
+    text = fresh_client.get("/follows").text
+    assert 'action="/follows/add"' in text
+    assert '<button type="submit">关注</button>' in text
+    assert "还没有关注任何项目" in text
+
+
+def test_follows_page_success_banner_with_group_anchor(follows_client):
+    """成功横幅（§21.4）：GET 读 added/result 渲染四句之一，并附「在下方「{语言组}」组查看」锚点链接。"""
+    text = follows_client.get("/follows?added=f%2Fpy-up&result=joined").text
+    assert '<p class="notice" role="status">' in text
+    assert "已关注 f/py-up：此前不在池内，已即时抓取基线快照并入池，下周起显示当周增量。" in text
+    assert '<a href="#f-python">在下方「Python」组查看</a>' in text
+    assert "notice err" not in text
+
+
+def test_follows_page_banner_absent_without_params(follows_client):
+    """无 PRG 参数：不渲染横幅（GET 正常访问形态）；页面骨架与分组区照常。"""
+    text = follows_client.get("/follows").text
+    assert '<p class="notice' not in text  # 无横幅块
+    assert "已关注 " not in text
+    assert 'id="follow-boards"' in text
+
+
 def test_follows_filter_row_absent_when_empty(fresh_client):
-    """空关注页（§12.2）：不炸（200）；无筛选行与分组区（无行可筛），既有空态引导保留。"""
+    """空关注页（§12.2）：不炸（200）；无筛选行与分组区（无行可筛），既有空态引导保留。
+
+    direct-follow §21.1：空态文案已按新口径改（添加入口在元信息行下），筛选行/分组区仍不渲染。
+    """
     resp = fresh_client.get("/follows")
     assert resp.status_code == 200
     text = resp.text
-    assert "还没有关注任何项目：去榜单点行右侧 ☆，该项目每周增量会出现在这里" in text
+    assert "还没有关注任何项目：在上方粘贴 GitHub 仓库地址直接添加" in text
     assert 'class="tag-filter"' not in text
     assert 'id="filter-empty"' not in text
     assert 'id="follow-boards"' not in text

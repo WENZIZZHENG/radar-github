@@ -6,15 +6,17 @@
 """
 
 import asyncio
+import re
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.collector.github import GitHubError, GitHubNotFoundError
+from app.collector.github import GitHubAuthError, GitHubClient, GitHubError, GitHubNotFoundError
 from app.db import get_conn, init_db
 from app.follows import STATE_ALIVE, STATE_JOINED, STATE_REVIVED, follow_repo, unfollow_repo
 from app.main import app
-from app.web.routes import _github_client
+from app.web.routes import _declared_too_large, _github_client
 
 NOW = "2026-08-09T08:00:00Z"  # 关注/基线共享的固定时间戳（UTC 定长硬约定）
 
@@ -88,6 +90,34 @@ def _counts(conn):
     )
 
 
+def _banner_text(html: str) -> str | None:
+    """从 P6 页面里取出结果横幅文本（`<p class="notice[...]" role="status">…</p>`）；无横幅返回 None。
+
+    横幅内含可选锚点链接，故取 `</p>` 之前、首个 `<a` 之前的部分——断言的是横幅文案本身。
+    """
+    match = re.search(r'<p class="notice[^"]*" role="status">(.*?)</p>', html, re.S)
+    if match is None:
+        return None
+    return match.group(1).split("<a ", 1)[0].strip()
+
+
+def _get_follows(client, location: str) -> tuple[str | None, str]:
+    """按 303 的 Location 走一次 GET（PRG 第二步）：返回 (横幅文本, 页面 HTML)。"""
+    resp = client.get(location)
+    assert resp.status_code == 200
+    return _banner_text(resp.text), resp.text
+
+
+def _assert_follows_skeleton(text: str) -> None:
+    """失败页必须是完整 P6 页面：元信息行、关注计数、顶栏计数、添加入口与提示行都在（不是残缺片段）。"""
+    assert "与当期周报同口径" in text
+    assert 'id="follow-total">' in text
+    assert 'id="nav-follow-count">' in text
+    assert 'action="/follows/add"' in text
+    assert 'id="follow-add-input"' in text
+    assert "支持 github.com 链接、git@github.com:owner/repo.git 与 owner/repo；已关注的仓库不会重复写入。" in text
+
+
 # ---------- 服务层：关注三态与幂等 ----------
 
 
@@ -149,6 +179,34 @@ def test_follow_new_repo_joins_pool(tmp_path):
     snap = conn.execute("SELECT captured_at, stars FROM star_snapshots WHERE repo_id = ?", (row["id"],)).fetchone()
     assert (snap["captured_at"], snap["stars"]) == (NOW, 66)  # 基线快照：增量两端从这里起算
     assert conn.execute("SELECT created_at FROM follows WHERE repo_id = ?", (row["id"],)).fetchone()[0] == NOW
+    conn.close()
+
+
+def test_follow_via_301_uses_new_name(tmp_path):
+    """改名 301 端到端（§21.6）：旧链接 → 跟随跳转 → 按新名入池，outcome 与库内都用新名。
+
+    串起 fetch_repo 的请求级 follow_redirects 与 follow_repo 的规范名回传（两半各自有单测，
+    这里是拼接处：301 后的 200 响应 full_name 即新名，入池不再用旧名）。
+    """
+    conn = _open_db(tmp_path)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            return httpx.Response(301, headers={"Location": "https://api.github.com/repositories/42"})
+        return httpx.Response(200, json=make_repo_item("new/name", stars=5))
+
+    client = GitHubClient("fake-token", transport=httpx.MockTransport(handler))
+    try:
+        outcome = _follow(conn, client, "old/name")
+    finally:
+        asyncio.run(client.aclose())
+    assert len(calls) == 2  # 旧链接一次 301 + 跟随一次 200
+    assert outcome.state == STATE_JOINED and outcome.full_name == "new/name"
+    row = conn.execute("SELECT full_name, source FROM repos").fetchone()
+    assert (row["full_name"], row["source"]) == ("new/name", "follow")
+    assert conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0] == 1
     conn.close()
 
 
@@ -257,6 +315,69 @@ def test_follow_node_id_changed_fails_loud(tmp_path):
         _follow(conn, client, "a/rebuilt")
     assert _counts(conn) == (1, 1, 0)  # 无新 repos/快照/follows
     assert conn.execute("SELECT dead FROM repos WHERE full_name = 'a/rebuilt'").fetchone()[0] == 1  # 未复活
+    conn.close()
+
+
+# ---------- 服务层：大小写不敏感命中与规范名回传（direct-follow 设计决策 4） ----------
+
+
+def test_follow_case_insensitive_hits_pooled_record(tmp_path):
+    """大小写命中态①：库内 psf/requests，输入 PSF/Requests → 命中同一条、0 次 GitHub 调用、回传库内规范名。"""
+    conn = _open_db(tmp_path)
+    repo_id = _add_repo(conn, "psf/requests", snapshots=[("2026-08-09T00:00:00Z", 10)])
+    client = FakeRepoClient()
+
+    outcome = _follow(conn, client, "PSF/Requests")
+    assert outcome.state == STATE_ALIVE and not outcome.already_followed
+    assert outcome.repo_id == repo_id  # 命中库内记录，不是新建第二条
+    assert outcome.full_name == "psf/requests"  # 规范名 = 库内名字（不是输入的 PSF/Requests）
+    assert client.calls == []  # 已入池 alive 不打 GitHub
+    assert _counts(conn) == (1, 1, 1)  # 只有一条 repos：没有因大小写差异重复入池
+    conn.close()
+
+
+def test_follow_case_insensitive_idempotent_shortcut(tmp_path):
+    """大小写变体的幂等短路：先关注 psf/requests，再以 PSF/Requests 提交 → already_followed、仍 0 次调用。"""
+    conn = _open_db(tmp_path)
+    repo_id = _add_repo(conn, "psf/requests", snapshots=[("2026-08-09T00:00:00Z", 10)])
+    client = FakeRepoClient()
+
+    first = _follow(conn, client, "psf/requests")
+    second = _follow(conn, client, "PSF/Requests")
+    assert not first.already_followed and second.already_followed
+    assert second.repo_id == repo_id and second.full_name == "psf/requests"
+    assert client.calls == []  # 幂等短路位置未变：两次都不打 GitHub
+    assert _counts(conn) == (1, 1, 1)
+    conn.close()
+
+
+def test_follow_case_insensitive_dead_uses_canonical_name(tmp_path):
+    """大小写命中态②：库内 a/dead 为 dead，输入 A/DEAD → 只调用一次且参数是库内规范名 a/dead。
+
+    用规范名打 GitHub 是硬要求：拿输入大小写变体去请求会与库内记录分叉成两条 node_id，撞库误判。
+    """
+    conn = _open_db(tmp_path)
+    _add_repo(conn, "a/dead", dead=1, snapshots=[("2026-08-01T00:00:00Z", 77)])
+    client = FakeRepoClient(items={"a/dead": make_repo_item("a/dead", stars=99)})
+
+    outcome = _follow(conn, client, "A/DEAD")
+    assert client.calls == ["a/dead"]  # 一次调用，且参数是库内规范名
+    assert outcome.state == STATE_REVIVED and outcome.full_name == "a/dead"
+    assert conn.execute("SELECT dead FROM repos WHERE full_name = 'a/dead'").fetchone()[0] == 0  # 已复活
+    assert _counts(conn) == (1, 2, 1)  # 无新 repo：大小写差异没有造出第二条记录
+    conn.close()
+
+
+def test_follow_unpooled_uses_github_returned_canonical_name(tmp_path):
+    """大小写未入池态③：输入 TINY/LIB，GitHub 返回 tiny/lib → 入池与回传都用 GitHub 返回的规范名。"""
+    conn = _open_db(tmp_path)
+    client = FakeRepoClient(items={"TINY/LIB": make_repo_item("tiny/lib", stars=66, language="Rust")})
+
+    outcome = _follow(conn, client, "TINY/LIB")
+    assert client.calls == ["TINY/LIB"]  # 未入池只能用输入值去问 GitHub
+    assert outcome.state == STATE_JOINED
+    assert outcome.full_name == "tiny/lib"  # 规范名以 GitHub 返回为准
+    assert conn.execute("SELECT full_name FROM repos").fetchone()[0] == "tiny/lib"
     conn.close()
 
 
@@ -460,3 +581,349 @@ def test_api_follow_bad_body_400(api):
     resp = client.post("/api/follows", content=b"not json", headers={"Content-Type": "application/json"})
     assert resp.status_code == 400
     assert fake.calls == []
+
+
+# ---------- 页面路由 POST /follows/add（direct-follow §21.1~§21.4；TestClient 不跟随跳转以断言 303） ----------
+
+
+def _follow_add(client, raw):
+    """提交 P6 地址表单（urlencoded）；TestClient 用 follow_redirects=False 断言 303 本身。"""
+    return client.post("/follows/add", data={"repo": raw}, follow_redirects=False)
+
+
+def test_follows_add_joined_303_and_banner(api):
+    """态③ 未入池：303 → ?added=tiny/lib&result=joined；GET 渲染结果横幅＋语言组锚点，行落入该组。
+
+    地址段大小写混合（TINY/lib）时按输入去问 GitHub，回库与横幅用 GitHub 返回的规范名 tiny/lib。
+    """
+    client, fake, _ = api
+    fake.items["TINY/lib"] = make_repo_item("tiny/lib", stars=66, language="Rust")
+    resp = _follow_add(client, "https://github.com/TINY/lib")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/follows?added=tiny%2Flib&result=joined"
+    banner, body = _get_follows(client, resp.headers["location"])
+    assert banner == "已关注 tiny/lib：此前不在池内，已即时抓取基线快照并入池，下周起显示当周增量。"
+    assert '<a href="#f-rust">在下方「Rust」组查看</a>' in body
+    assert 'id="f-rust"' in body and 'data-repo="tiny/lib"' in body
+    assert '我的关注<i id="nav-follow-count">1</i>' in body  # 顶栏计数与实际关注数一致
+    assert fake.calls == ["TINY/lib"]
+
+
+def test_follows_add_alive_303_and_banner(api):
+    """态① 已入池 alive：303 result=alive，0 次 GitHub 调用，横幅不带"已抓取"字样。"""
+    client, fake, db = api
+    conn = get_conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at)"
+            " VALUES ('a/pooled', 'node-a/pooled', 'Go', '[]', 0, 'initial', '2026-08-01T00:00:00Z')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    resp = _follow_add(client, "a/pooled")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/follows?added=a%2Fpooled&result=alive"
+    banner, body = _get_follows(client, resp.headers["location"])
+    assert banner == "已关注 a/pooled：该仓库已在跟踪池内，无需额外抓取。"
+    assert '<a href="#f-go">在下方「Go」组查看</a>' in body
+    assert fake.calls == []  # 已入池不消耗 GitHub 配额
+
+
+def test_follows_add_revived_303_and_banner(api):
+    """态② dead 复活：303 result=revived，恰好 1 次 GitHub 调用，横幅为复活口径。"""
+    client, fake, db = api
+    conn = get_conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at)"
+            " VALUES ('a/dead', 'node-a/dead', 'Python', '[]', 1, 'discover', '2026-08-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO star_snapshots (repo_id, captured_at, stars)"
+            " VALUES ((SELECT id FROM repos WHERE full_name = 'a/dead'), '2026-08-01T00:00:00Z', 77)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    fake.items["a/dead"] = make_repo_item("a/dead", stars=88, language="Python")
+    resp = _follow_add(client, "git@github.com:a/dead.git")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/follows?added=a%2Fdead&result=revived"
+    banner, body = _get_follows(client, resp.headers["location"])
+    assert banner == "已关注 a/dead：此前已标记失效，已复活并补一张基线快照，次日起恢复每日采集。"
+    assert '<a href="#f-python">在下方「Python」组查看</a>' in body
+    assert fake.calls == ["a/dead"]
+
+
+def test_follows_add_already_303_and_banner(api):
+    """已关注幂等：303 result=already，关注列表不出现重复行、库内零变化、0 次 GitHub 调用。"""
+    client, fake, _ = api
+    assert _follow_add(client, "tiny/lib").status_code == 303  # 先关注
+    resp = _follow_add(client, "tiny/lib")  # 再提交同一仓库
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/follows?added=tiny%2Flib&result=already"
+    banner, body = _get_follows(client, resp.headers["location"])
+    assert banner == "tiny/lib 已经在关注中，未做重复写入。"
+    assert 'class="star on" data-repo="tiny/lib"' in body  # 该行在页面里（P6 行恒已关注）
+    assert body.count('data-tags="[]"') == 1  # 只有一行（重复行会多出 data-tags 属性）
+    assert fake.calls == ["tiny/lib"]  # 幂等短路：第二次不打 GitHub
+
+
+def test_follows_add_bare_name_accepted(api):
+    """裸 owner/repo 在关注页接受（§21.2）：直接归一入池，不经过 AI。"""
+    client, fake, _ = api
+    resp = _follow_add(client, "tiny/lib")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/follows?added=tiny%2Flib&result=joined"
+    assert fake.calls == ["tiny/lib"]
+
+
+def test_follows_add_unrecognized_400_keeps_input(api):
+    """400 无法识别（§21.4）：状态码 400、文案逐字、输入框回填原值、完整页面骨架仍在、不打 GitHub。"""
+    client, fake, _ = api
+    resp = _follow_add(client, "not a repo")
+    assert resp.status_code == 400
+    text = resp.text
+    assert "无法识别仓库地址：not a repo。支持 https://github.com/owner/repo、git@github.com:owner/repo.git 或 owner/repo。" in text
+    assert 'value="not a repo"' in text  # 回填原值（模板自动转义）
+    _assert_follows_skeleton(text)  # 失败页仍是完整 P6，不是残缺片段
+    assert fake.calls == []  # 解析失败不打 GitHub
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://gitlab.com/psf/requests",  # 非 github.com 域名
+        "psf",  # 只有 owner
+        "https://github.com/orgs/psf",  # 保留页前缀
+        "https://github.com/psf",  # 地址形态缺 repo（不得掉进裸名分支）
+        "psf/requests/extra",  # 裸形态三段
+        "psf/requests\ngithub.com/psf/requests",  # 多地址不做批量（§21.6）
+        "psf/requests #标签",  # 添加时不打标签（§21.6）
+        "",  # 空提交
+    ],
+)
+def test_follows_add_rejected_forms_400(api, raw):
+    """400 矩阵（§21.2/§21.6）：非 GitHub 域名、只有 owner、保留页前缀、三段裸名、多地址、带标签、空串。"""
+    client, fake, _ = api
+    resp = _follow_add(client, raw)
+    assert resp.status_code == 400
+    assert "无法识别仓库地址：" in resp.text
+    assert fake.calls == []
+
+
+def test_follows_add_long_input_preserved_300(api):
+    """浏览器可达的 300 字输入：横幅与输入框都按原值回显（§21.4「保留输入框原值」，不截断）。"""
+    client, _, _ = api
+    raw = "x" * 300
+    resp = _follow_add(client, raw)
+    assert resp.status_code == 400
+    assert f"无法识别仓库地址：{raw}。" in resp.text
+    assert f'value="{raw}"' in resp.text
+
+
+def test_follows_add_oversized_body_rejected_without_echo(api):
+    """防御分支：请求体超过 8192 字节 → 400 固定短文案，不回显超大原文（防大字段灌页面）。"""
+    client, _, _ = api
+    raw = "x" * 9000
+    resp = _follow_add(client, raw)
+    assert resp.status_code == 400
+    assert "输入过长（超过 8192 字节）" in resp.text
+    assert raw not in resp.text
+    assert 'value=""' in resp.text
+
+
+def test_declared_too_large_guard_edges():
+    """Content-Length 预判边界（R3 F3）：超限/正常、非数字/负数、4301 位数字都不抛异常（不会变 500）。"""
+    assert _declared_too_large("8192") is False
+    assert _declared_too_large("8193") is True
+    assert _declared_too_large("9" * 10) is True
+    assert _declared_too_large("9" * 4301) is False  # 位数守卫：不调 int()，避免 Python 3.11 的 4300 位上限抛错
+    assert _declared_too_large("abc") is False
+    assert _declared_too_large("-1") is False
+    assert _declared_too_large("") is False
+
+
+def test_follows_add_error_echo_escaped(api):
+    """400 回显转义（§21.4）：输入含 HTML 标签时只以转义文本进页面，不注入 DOM（Jinja 自动转义）。"""
+    client, _, _ = api
+    raw = "<script>alert(1)</script>"
+    resp = _follow_add(client, raw)
+    assert resp.status_code == 400
+    assert "<script>alert(1)</script>" not in resp.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in resp.text
+
+
+def test_follows_add_cross_origin_rejected(api):
+    """CSRF 防护（design 决策 8）：跨站 Origin 的 POST 403 且不写库；同源/可信反代 X-Forwarded-Host 正常 303。"""
+    client, fake, _ = api
+    cross = client.post(
+        "/follows/add", data={"repo": "tiny/lib"}, headers={"Origin": "https://evil.example"}, follow_redirects=False
+    )
+    assert cross.status_code == 403
+    assert fake.calls == []  # 未进写路径
+    # 改写 Host 的反代场景：Host 是回环地址，Origin 的公网主机名由 X-Forwarded-Host 兜底
+    proxied = client.post(
+        "/follows/add",
+        data={"repo": "tiny/lib"},
+        headers={
+            "Origin": "https://radar.example.com",
+            "Host": "127.0.0.1:8000",
+            "X-Forwarded-Host": "radar.example.com",
+        },
+        follow_redirects=False,
+    )
+    assert proxied.status_code == 303
+    assert fake.calls == ["tiny/lib"]
+    # 同源（TestClient 默认 Host=testserver）
+    same = client.post(
+        "/follows/add", data={"repo": "tiny/lib"}, headers={"Origin": "http://testserver"}, follow_redirects=False
+    )
+    assert same.status_code == 303
+    assert fake.calls == ["tiny/lib"]  # 幂等短路，未重复打 GitHub
+
+
+def test_follows_add_not_found_404(api):
+    """404 仓库不存在（§21.4）：同页渲染、状态码 404、输入回填、页面骨架完整、不打库。"""
+    client, fake, db = api
+    resp = _follow_add(client, "ghost/none")
+    assert resp.status_code == 404
+    assert "GitHub 上找不到仓库 ghost/none（不存在/已删除/转私有）" in resp.text
+    assert 'value="ghost/none"' in resp.text
+    _assert_follows_skeleton(resp.text)
+    conn = get_conn(db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert fake.calls == ["ghost/none"]
+
+
+def test_follows_add_node_id_conflict_409(api):
+    """409 node_id 撞库（改名/同名重建，§21.6）：既有文案、库内 full_name 不改写、无归并、无新行。"""
+    client, fake, db = api
+    conn = get_conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at)"
+            " VALUES ('old/name', 'node-old/name', 'Go', '[]', 0, 'initial', '2026-08-01T00:00:00Z')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    fake.items["renamed/name"] = make_repo_item("renamed/name", node_id="node-old/name")
+    resp = _follow_add(client, "https://github.com/renamed/name")
+    assert resp.status_code == 409
+    assert (
+        "仓库 renamed/name 的 node_id 与库内已有记录冲突（仓库可能已改名，旧名仍在库），暂未自动归并" in resp.text
+    )  # 既有文案完整锁定（不只 "改名" 子串）
+    assert 'value="https://github.com/renamed/name"' in resp.text  # 输入框保留原值（原样，未被归一覆盖）
+    _assert_follows_skeleton(resp.text)
+    conn = get_conn(db)
+    try:
+        names = [r[0] for r in conn.execute("SELECT full_name FROM repos")]
+        assert names == ["old/name"]  # 未改写库内 full_name、未自动归并
+        assert conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_follows_add_upstream_error_502(api):
+    """502 上游请求失败（§21.4）：同页渲染 `GitHub 请求失败：{原因}`、状态码 502、输入保留、三表零变化。"""
+    client, _, db = api
+    app.dependency_overrides[_github_client] = lambda: FakeRepoClient(error=GitHubError("模拟限速"))
+    resp = _follow_add(client, "tiny/lib")
+    assert resp.status_code == 502
+    assert "GitHub 请求失败：模拟限速" in resp.text
+    assert 'value="tiny/lib"' in resp.text
+    _assert_follows_skeleton(resp.text)
+    conn = get_conn(db)
+    try:
+        assert _counts(conn) == (0, 0, 0)
+    finally:
+        conn.close()
+
+
+def test_follows_add_auth_error_500(api):
+    """500 token 配置问题（§21.4）：沿用既有 GitHub token 文案原样透传、状态码 500、输入保留。"""
+    client, _, _ = api
+    app.dependency_overrides[_github_client] = lambda: FakeRepoClient(
+        error=GitHubAuthError("GitHub token 为空：请在项目根 .env 配置 GITHUB_TOKEN")
+    )
+    resp = _follow_add(client, "tiny/lib")
+    assert resp.status_code == 500
+    assert "GitHub token 为空：请在项目根 .env 配置 GITHUB_TOKEN" in resp.text
+    assert 'value="tiny/lib"' in resp.text
+    _assert_follows_skeleton(resp.text)
+
+
+def test_follows_page_empty_shows_add_form(tmp_path, monkeypatch):
+    """空关注页显示添加入口与提示行（§21.1）：无 JS 也能提交（原生表单）；横幅区此刻无内容。"""
+    db = tmp_path / "empty.db"
+    init_db(db)
+    monkeypatch.setenv("RADAR_DB_PATH", str(db))
+    monkeypatch.setenv("RADAR_JOBS_ENABLED", "0")
+    with TestClient(app, follow_redirects=False) as client:
+        resp = client.get("/follows")
+    assert resp.status_code == 200
+    text = resp.text
+    assert 'class="search-box follow-add" method="post" action="/follows/add"' in text
+    assert 'name="repo"' in text and 'maxlength="300"' in text and "required" in text
+    assert 'id="follow-add-input"' in text and 'value=""' in text  # GET 不回填
+    assert "支持 github.com 链接、git@github.com:owner/repo.git 与 owner/repo；已关注的仓库不会重复写入。" in text
+    assert _banner_text(text) is None  # 无参数 → 不渲染横幅
+    assert "还没有关注任何项目：在上方粘贴 GitHub 仓库地址直接添加" in text  # 空态与入口并存
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "?added=tiny/lib&result=already",  # 该仓库未关注：查不到关注集记录 → 不渲染
+        "?added=ghost/none&result=joined",  # 库内无此仓库
+        "?added=not%20a%20repo&result=joined",  # added 形态非法
+        "?added=tiny/lib&result=%3Cscript%3E",  # result 白名单外
+        "?added=tiny/lib&result=",  # result 空
+        "?result=joined",  # 只有 result
+        "?added=tiny/lib",  # 只有 added
+        "?added=%3Cimg%20src%3Dx%20onerror%3D1%3E&result=already",  # 伪造 added（注入串）
+    ],
+)
+def test_follows_page_banner_whitelist_rejects_forged_params(api, query):
+    """PRG 参数白名单（design 决策 6）：added 必须过形态校验且在关注集内、result 必须在四值内，否则不渲染横幅。"""
+    client, _, _ = api
+    resp = client.get(f"/follows{query}")
+    assert resp.status_code == 200
+    assert _banner_text(resp.text) is None
+    assert "<img src=x onerror=1>" not in resp.text  # 任意输入不进页面
+
+
+def test_follows_page_banner_after_unfollow_not_shown(api):
+    """过期参数：关注后取消关注，再带原 added/result 访问 → 横幅不渲染（查库已查不到）。"""
+    client, _, _ = api
+    assert _follow_add(client, "tiny/lib").status_code == 303
+    assert client.delete("/api/follows/tiny/lib").json()["removed"] is True
+    resp = client.get("/follows?added=tiny%2Flib&result=already")
+    assert resp.status_code == 200
+    assert _banner_text(resp.text) is None
+
+
+def test_follows_page_banner_other_language_group(api):
+    """无语言（language 为空）的仓库落「其它语言」组：锚点 #f-other、组标签「其它语言」（§21.4）。"""
+    client, _, db = api
+    conn = get_conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO repos (full_name, node_id, language, topics, dead, source, created_at)"
+            " VALUES ('a/nolang', 'node-a/nolang', NULL, '[]', 0, 'initial', '2026-08-01T00:00:00Z')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    resp = _follow_add(client, "a/nolang")
+    assert resp.status_code == 303
+    banner, body = _get_follows(client, resp.headers["location"])
+    assert banner == "已关注 a/nolang：该仓库已在跟踪池内，无需额外抓取。"
+    assert '<a href="#f-other">在下方「其它语言」组查看</a>' in body
+    assert 'id="f-other"' in body
