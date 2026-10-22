@@ -17,7 +17,7 @@
 #
 # Basic Auth 密码（内联 hash，不用环境变量）：
 #   1) 生成：在服务器执行 `caddy hash-password`，交互输入密码，输出 bcrypt hash。
-#   2) 整体替换下面 basic_auth 块里的占位串 `$2a$14$aaaa…`——那是一串语法合法
+#   2) 整体替换下面 basic_auth 块里 admin 后的占位串（`$2a$14$` 后接 53 个 a）——它是语法合法
 #      但永远登录不上的假 hash，存在意义是让仓库原文件也能过 `caddy validate`
 #      （真实 hash 是 base64，尖括号占位符过不了校验）；它不提供任何登录能力，
 #      但部署时仍必须替换。用户名按需改 `admin` 那一处。真实 hash 不回写本仓。
