@@ -42,8 +42,9 @@ WorkingDirectory=/opt/radar
 # 不支持 export 前缀和复杂引号转义——.env.prod 保持简单格式即可。
 EnvironmentFile=-/opt/radar/.env.prod
 
-# 只绑回环：公网唯一入口是 Caddy（反代 127.0.0.1:8000，见 deploy/Caddyfile），
-# 应用不直接暴露公网，攻击面收敛到 Caddy 一层；改端口需与 Caddyfile 同步改。
+# 只绑回环：公网唯一入口是 Caddy（反代 127.0.0.1:8000，见 deploy/radar.caddy，
+# 装到服务器 /etc/caddy/sites.d/radar.caddy，勿覆盖主 Caddyfile），
+# 应用不直接暴露公网，攻击面收敛到 Caddy 一层；改端口需与 deploy/radar.caddy 同步改。
 ExecStart=/opt/radar/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 # 崩溃自动拉起；间隔 5 秒，避免故障时疯狂重启刷日志

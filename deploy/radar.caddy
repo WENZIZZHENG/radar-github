@@ -1,0 +1,65 @@
+# ==========================================================================
+# Radar 雷达 · Caddy 站点块（T-012 部署起草物）
+# 部署位置：/etc/caddy/sites.d/radar.caddy
+#
+# 多租户结构（2026-10-22 起，线上现状）：本机与其他项目共用 Caddy，
+# 主 /etc/caddy/Caddyfile 全文只有一行 `import /etc/caddy/sites.d/*.caddy`，
+# 各项目在 /etc/caddy/sites.d/ 下各自维护自己的 .caddy 文件、互不覆盖。
+#
+# ★ 禁止把本文件安装为 /etc/caddy/Caddyfile ★
+#   覆盖主文件＝抹掉 import 行＝全机所有站点一起下线。
+#   2026-10-21 事故即此路径：同机另一项目按旧 SOP 整文件覆盖主 Caddyfile，
+#   雷达站点块被抹掉，https://radar.suipaiji.com/ 宕机约 24 小时。
+#
+# 语法前提：Caddy v2.8。访问控制指令自 v2.8.0 起更名为 basic_auth
+# （v2.8.0 之前名为 basicauth，已弃用勿用——低于 v2.8.0 的 Caddy 解析不了本文件，先升级）。
+# 线上实测版本 v2.11.4（见《服务器探测记录》第 10 项）。
+#
+# Basic Auth 密码（内联 hash，不用环境变量）：
+#   1) 生成：在服务器执行 `caddy hash-password`，交互输入密码，输出 bcrypt hash。
+#   2) 整体替换下面 basic_auth 块里的占位串 `$2a$14$aaaa…`——那是一串语法合法
+#      但永远登录不上的假 hash，存在意义是让仓库原文件也能过 `caddy validate`
+#      （真实 hash 是 base64，尖括号占位符过不了校验）；它不提供任何登录能力，
+#      但部署时仍必须替换。用户名按需改 `admin` 那一处。真实 hash 不回写本仓。
+#   3) 配置里只放 hash 不放明文——hash 可随文件留存，明文不要落任何文件。
+#      注意 bcrypt hash 含 `$` 字符，用 shell 命令写入时用单引号包起来。
+#   4) 生效：先 `sudo caddy validate --config /etc/caddy/Caddyfile`
+#      （校验的是 import 合并后的全量配置，能同时发现本文件与主文件的问题），
+#      通过后 `sudo systemctl reload caddy`。内联 hash 不依赖环境变量，reload 足够，
+#      不需要 restart（reload 平滑，不打扰同机其他站点）。
+#   5) 部署后断言（失败即判发布失败、立即回滚排查）：
+#      `curl -s -o /dev/null -w '%{http_code}\n' https://radar.suipaiji.com/` 期望 401（Basic Auth 挑战）；
+#      共机场景顺带抽测同机其他站点（本机五站基线 200/301/401/200/401，任一不符即排查）。
+#
+# HTTPS 自动签发的前置条件（全部满足后 Caddy 全自动签发/续期，无需人工干预）：
+#   1) radar.suipaiji.com 的 DNS A 记录指向本服务器公网 IP；
+#   2) 80/443 对外开放（机器防火墙 + 云安全组）——80 走 ACME HTTP-01 挑战，443 提供 HTTPS。
+# ==========================================================================
+
+radar.suipaiji.com {
+
+	# 访问控制：Basic Auth 挡外人（《架构决策记录》决策 8）。
+	# 单人使用、无应用内用户体系——这一层就是全部"权限"，密码强度即全部防线。
+	basic_auth {
+		# 占位假 hash（语法合法、永远登录不上），部署时必须用 `caddy hash-password` 生成的真 hash 整体替换
+		admin $2a$14$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	}
+
+	# 反代到本机回环上的 uvicorn。应用只绑 127.0.0.1（见 deploy/radar.service），
+	# 公网唯一入口就是 Caddy，攻击面收敛到这一层。
+	# X-Forwarded-For / X-Forwarded-Proto / Host 由 Caddy 默认带齐，无需额外配置。
+	reverse_proxy 127.0.0.1:8000
+
+	# 响应压缩（2026-08-14 实测 /total 传输 1.7MB→335KB、/ 640KB→128KB）
+	encode zstd gzip
+
+	# 安全响应头（保持克制，只加对 SSR 页面确定无害的三条）：
+	header {
+		# 禁止浏览器嗅探 MIME，防把文本响应误当脚本执行
+		X-Content-Type-Options nosniff
+		# 禁止被 iframe 嵌套，防点击劫持
+		X-Frame-Options DENY
+		# 跨站跳转不带完整 Referer，减少 URL 信息外泄
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

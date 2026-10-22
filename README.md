@@ -28,7 +28,7 @@ app/
   local_ai.py   # 本地 AI 生成回传：导出判定（与每日 ensure 同口径）/ 作业单 / 回填写入
   db.py + schema.sql  # 连接层与建表（全量 IF NOT EXISTS，启动自动建表+迁移）
 config/topics.yaml    # 主题词表（封板物）
-deploy/         # Caddyfile + systemd unit（生产配置起草物）
+deploy/         # radar.caddy（Caddy 站点块，装 /etc/caddy/sites.d/）+ radar.service（systemd unit）
 scripts/backup.sh     # 每日备份（cron 03:17，轮转 14 份）
 docs/sop/       # 产品层决策唯一事实来源（需求/流程/架构决策/任务表/验收记录）
 docs/dev-commands.md  # 日常开发与验证命令唯一登记处（含 §4 生产部署手册）

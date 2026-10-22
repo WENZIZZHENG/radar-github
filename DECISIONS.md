@@ -81,3 +81,11 @@
 **原因**：分级依据是「静态手段能否证明改动正确」。原口径按「核心链路一律 A」整段处理，对「改动文件只有前端、但行为挂在写接口之后」这类形态每次都要临场裁定（实例 T-044：P6 标签增删后联动筛选行——写路径是既有打标/删标 API，客户端只做**落库成功后的**页内同步）。收紧后写出可判定分界——**按整次改动是否含落库写路径判定，不按改动文件所在层次判定**；据此 T-044 **仍归 A**（含落库写路径），本条的收益是把边界写成文字、去掉临场裁定，而不是给该案例降级。同时 mock 顶替外部依赖、异步/后台任务两条 A 级入口原样保留（原始事故形态仍在 A）。
 
 **附带（同批两条）**：① 过程验证档 `tools/verify.ps1 -Fast`——按改动文件同名映射只跑受影响测试（实测 68 passed/≈13s vs 全量 812 passed/≈2 分钟），供中间轮次使用，收口仍只认不带参数全量；源码改动映射不到同名测试或含 `tests/conftest.py` 时回落全量，不允许「零测试的绿」。② 免评审档上收全局（`AGENTS.md` §3「免评审档」），本项目只引用不复述。
+
+## 2026-10-22：生产网关多租户 sites.d 隔离改造（Caddy）
+
+**起因**：2026-10-21 同机另一项目（love-lens）按旧 SOP 整文件覆盖 `/etc/caddy/Caddyfile`，雷达站点块被抹掉，https://radar.suipaiji.com/ 宕机约 24 小时（2026-10-22 修复）。根因是单文件配置形态：所有站点挤在一个文件里，任何一方"整文件覆盖"都会连带抹掉别人的站点块。
+
+**决策**：主 `/etc/caddy/Caddyfile` 只保留一行 `import /etc/caddy/sites.d/*.caddy`；各项目在 `/etc/caddy/sites.d/` 下独立维护自己的 `.caddy` 文件，互不覆盖。雷达侧：站点块落 `/etc/caddy/sites.d/radar.caddy`（内容与 2026-10-02 备份逐字一致：basic_auth 内联 bcrypt hash ＋ `reverse_proxy 127.0.0.1:8000` ＋ `encode zstd gzip` ＋ 三条安全 header）；本仓部署资产由 `deploy/Caddyfile`（`{$RADAR_DOMAIN}`/`{$RADAR_BASIC_AUTH_USER}`/`{$RADAR_BASIC_AUTH_HASH}` 环境变量占位起草稿）更名为 `deploy/radar.caddy`，域名写字面值 `radar.suipaiji.com`、hash 改内联假 hash 占位（`$2a$14$`＋53 个 a：语法合法、永不匹配、仓内原文件可过 `caddy validate`；尖括号占位符因过不了 base64 校验被否决；真实 hash 部署时服务器侧 `caddy hash-password` 生成替换、不回写本仓）；生效流程改为 `sudo caddy validate --config /etc/caddy/Caddyfile`（校验 import 合并后的全量配置）＋`sudo systemctl reload caddy`，不再依赖环境变量、不需要 restart。
+
+**后果**：① 部署 SOP 变更——网关配置只改 `/etc/caddy/sites.d/radar.caddy`，validate 通过后 reload；② 新增红线——**禁止把任何项目的站点块文件安装为 `/etc/caddy/Caddyfile`**（多项目共机，覆盖主文件＝全机站点一起下线）；③ 本仓 `deploy/` 起草物与线上结构一致，照它部署不会碰主文件；④ 同机其他项目须各自确认已迁到 sites.d，雷达侧不再对主 Caddyfile 做任何追加/替换操作。
