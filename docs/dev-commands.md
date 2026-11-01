@@ -98,7 +98,7 @@ $SSH 'for u in "/" "/?board=all" "/total" "/total?board=all"; do
 
 ### 4.4 本地 AI 生成回传（local-ai-relay，T-040）
 
-生产 AI 段停用后，文本改由"本地工具生成 + 接口回填"。两个端点：导出 `GET /api/local-ai/tasks`、回填 `POST /api/local-ai/fill`；判定与写入语义见 `docs/sop/交互流程/20-本地AI生成回传.md`，接口契约见 `openspec/specs/local-ai-relay/`。
+AI 段关闭（`AI_ENABLED=0`）或需要由本地工具生成文本时，走"本地工具生成 + 接口回填"；自动 AI 段启用（`AI_ENABLED=1`）时两通道并存。两个端点：导出 `GET /api/local-ai/tasks`、回填 `POST /api/local-ai/fill`；判定与写入语义见 `docs/sop/交互流程/20-本地AI生成回传.md`，接口契约见 `openspec/specs/local-ai-relay/`。
 
 服务器回环形态（**仅服务器上可用**，免鉴权，排障/冒烟用；2026-09-13 预演实测）：
 

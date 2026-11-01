@@ -89,3 +89,19 @@
 **决策**：主 `/etc/caddy/Caddyfile` 只保留一行 `import /etc/caddy/sites.d/*.caddy`；各项目在 `/etc/caddy/sites.d/` 下独立维护自己的 `.caddy` 文件，互不覆盖。雷达侧：站点块落 `/etc/caddy/sites.d/radar.caddy`（内容与 2026-10-02 备份逐字一致：basic_auth 内联 bcrypt hash ＋ `reverse_proxy 127.0.0.1:8000` ＋ `encode zstd gzip` ＋ 三条安全 header）；本仓部署资产由 `deploy/Caddyfile`（`{$RADAR_DOMAIN}`/`{$RADAR_BASIC_AUTH_USER}`/`{$RADAR_BASIC_AUTH_HASH}` 环境变量占位起草稿）更名为 `deploy/radar.caddy`，域名写字面值 `radar.suipaiji.com`、hash 改内联假 hash 占位（`$2a$14$`＋53 个 a：语法合法、永不匹配、仓内原文件可过 `caddy validate`；尖括号占位符因过不了 base64 校验被否决；真实 hash 部署时服务器侧 `caddy hash-password` 生成替换、不回写本仓）；生效流程改为 `sudo caddy validate --config /etc/caddy/Caddyfile`（校验 import 合并后的全量配置）＋`sudo systemctl reload caddy`，不再依赖环境变量、不需要 restart。
 
 **后果**：① 部署 SOP 变更——网关配置只改 `/etc/caddy/sites.d/radar.caddy`，validate 通过后 reload；② 新增红线——**禁止把任何项目的站点块文件安装为 `/etc/caddy/Caddyfile`**（多项目共机，覆盖主文件＝全机站点一起下线）；③ 本仓 `deploy/` 起草物与线上结构一致，照它部署不会碰主文件；④ 同机其他项目须各自确认已迁到 sites.d，雷达侧不再对主 Caddyfile 做任何追加/替换操作。
+
+## 2026-11-01：生产 AI 段状态口径纠正（README／dev-commands／交互流程 §20）
+
+**旧文**（四处均按"生产已停用 AI 段"口径写）：
+> README 功能清单：「**生产现已停用自动 AI 段**（`.env.prod` 的 `AI_ENABLED=0`），文本改走"本地 AI 生成回传"通道——见下节。」
+> README §本地 AI 生成回传：「生产 AI 段已停用（`.env.prod` 的 `AI_ENABLED=0`）：文本不再由服务自动调模型生成……」
+> `docs/dev-commands.md` §4.4：「生产 AI 段停用后，文本改由"本地工具生成 + 接口回填"。」
+> `docs/sop/交互流程/20-本地AI生成回传.md` §20.1：「不做：……不恢复 `AI_ENABLED`。」
+
+**新文**：四处改为现行口径——`AI_ENABLED` 由 `.env.prod` 运维侧配置决定；生产为 `AI_ENABLED=1`（自动 AI 段启用），本地 AI 生成回传通道保留为备用出口，两条通道并存、人工行受保护；§20.1 改为「不改变 AI 总开关的取值（`AI_ENABLED` 由 `.env.prod` 运维侧配置，本功能不切换它）」。
+
+**原因**：生产 `.env.prod` 当前为 `AI_ENABLED=1`，journal 自 2026-10-26 05:28 起可见每日 AI 段汇总行（更早的 radar 日志已不在 journal 保留窗口内，现存最早条目为 2026-10-26 05:10，故恢复的具体时点不可考、也未留痕），而文档自 2026-10-22 提交起仍写"停用"，属文档漂移。2026-11-01 轮换 AI API key 后复核可用，一并纠正。
+
+**附带**：同一批把《任务拆解表》T-044 的「尚未部署生产」纠正为「已部署生产」（2026-11-01 复核生产可部署文件与本地 HEAD 185 个 sha256 全等；最近一次全量部署 2026-10-29）——任务记录归任务表本体，不在此重复。
+
+**验证**：证据见 `data/_deploy_20261101_ai_key_verify.log`；本轮为纯文档改动，`git diff --check` ＋ `tools/verify.ps1` 全量一次跑绿。
