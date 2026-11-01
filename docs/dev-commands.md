@@ -12,7 +12,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1 -Fast  
 
 - 三段：`ruff check app tests` → `python tools/check_spec_text.py` → `pytest -q`；任一段非 0 即整体失败。
 - 两档（本人 2026-10-18 拍板）：不带参数＝**收口档**（全量 pytest，一个批次只跑一次）；`-Fast`＝**过程验证档（不构成收口）**，供开发/修复/评审中间轮次使用——按改动文件同名映射只跑 `tests/test_<同名>.py` 命中的测试（**近似受影响面、非依赖闭包**，脚本会打印「源码→测试」对照）；改动含源码（`*.py` 与前端静态资源/模板）但有一条没映射到同名测试、或含 `tests/conftest.py` 时自动回落全量，不给「零测试的绿」；纯文档/静态无关文件才只跑 ruff＋规范文本复扫。实测同一棵树：≈68 passed / 12~13s vs 全量 812 passed / ≈2 分钟（耗时随机器负载浮动，只作量级参考）。
-- CI 同源门禁（2026-11-01 接入）：`.github/workflows/verify.yml` 在 push 到 master、PR 与手动触发时，用 `windows-latest` ＋ Python 3.12 建 `.venv` 后复跑本入口（收口档）；CI 与本地共用同一脚本，不得为省时另写一套步骤。CI 固定 Python 3.12（＝pyproject 下界/生产版本；本机 `.venv` 可为 3.14，复现 CI 用 `uv venv --python 3.12 .venv`）；目前未接分支保护，直推 master 时该门禁是流程约定（红叉不阻断推送）。
+- CI 同源门禁（2026-11-01 接入）：`.github/workflows/verify.yml` 在 push 到 master、PR 与手动触发时，用 `windows-latest` ＋ Python 3.12 建 `.venv` 后复跑本入口（收口档）；CI 与本地共用同一脚本，不得为省时另写一套步骤。依赖由 `uv.lock` 锁定（`uv sync --locked`，见 §3），锁文件过期 CI 直接失败。CI 固定 Python 3.12（＝pyproject 下界/生产版本；本机 `.venv` 可为 3.14，复现 CI 用 `uv sync --locked --python 3.12 --extra dev`）；目前未接分支保护，直推 master 时该门禁是流程约定（红叉不阻断推送）。
 - `tools/check_spec_text.py`（2026-10-18 新增，T-044 评审实证后落成门禁）：扫 `openspec/specs/**/spec.md` 的 requirement 正文，查三类别处——拆条腰斩（正文以标点开头）、残句（末行缺句末标点且非"冒号＋列表"）、重复分句（≥15 字，抓"把移动写成复制"这类假完成）。`openspec validate --strict` 对这三类**不报**，故单列一段机器检查。
 - 单独跑某一段：`.venv\Scripts\python.exe tools\check_spec_text.py`（exit 0 = 无命中，1 = 有命中，逐条打印 文件:行号）。
 
@@ -22,14 +22,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1 -Fast  
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
 ```
 
-## 3. 依赖安装
+## 3. 依赖安装（uv.lock 锁定）
 
 ```bash
-uv venv .venv && uv pip install -r pyproject.toml --extra dev
+uv sync --locked --extra dev     # 装依赖（本地/CI 同口径；按仓库内 uv.lock 锁定版本）
+uv lock                          # 新增/升级依赖后刷新锁文件（会改 uv.lock，需随改动一并提交）
 ```
 
+> 锁定口径（2026-11-01）：`uv.lock` 入库，CI 与本地都用 `uv sync --locked --extra dev`——同一 commit 装到同一组版本；改了 `pyproject.toml` 却没 `uv lock` 时 `--locked` 直接报错（不再静默解析新版本）。本机 `.venv` 已存在则沿用其解释器；CI 固定 `--python 3.12`（见 §1 CI 门禁）。无 `.venv` 时 `uv sync` 会自动创建。**`uv lock` 不要带 `UV_INDEX_URL`**（否则镜像地址会写进锁文件、CI 跟着改源）；镜像只用于临时单包安装，装完再用 `uv sync --locked` 拉回锁版本。
+
 > 踩坑记录（2026-08-20）：`&&` 连写是 bash 语法，**Windows PowerShell 5.1 不支持**（报"标记 && 不是此版本中的有效语句分隔符"）。
-> PowerShell 下拆两行跑：`uv venv .venv` 然后 `uv pip install -r pyproject.toml --extra dev`；或直接用 Git Bash 跑原命令。
+> PowerShell 下拆两行跑：`uv venv .venv` 然后 `uv pip install -r pyproject.toml --extra dev`（历史命令，现用上方 `uv sync --locked --extra dev`）；或直接用 Git Bash 跑原命令。
 > 本手册所有 `&&` 连写同理（本地命令默认 Git Bash 环境）。
 
 > 踩坑记录（2026-10-14）：本机 PyPI 直连会卡死，单包安装/更新走国内源——
@@ -85,6 +88,8 @@ systemctl is-active radar                 # 必须 active
 依赖有变更（pyproject.toml 动了）时，重启前加一步（否则跳过）：
 `sudo -u radar -H bash -c 'cd /opt/radar && export PATH="$HOME/.local/bin:$PATH" && uv pip install --python .venv/bin/python -r pyproject.toml'`
 （PyPI 直连若超时，加 `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`，T-012 踩过。）
+
+> 已知边界（2026-11-01）：生产这一步仍按 `pyproject.toml` 的 `>=` 范围解析安装，不读 `uv.lock`（锁目前只覆盖本地与 CI）；生产依赖统一到锁定安装待后续单列任务。
 
 ### 4.3 验证（三道）
 

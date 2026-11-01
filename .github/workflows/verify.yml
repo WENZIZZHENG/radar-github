@@ -2,6 +2,7 @@
 # 与本地同一脚本、同一口径：ruff → 规范文本复扫 → 全量 pytest；任一段非 0 即 CI 失败。
 # CI 只跑收口档（不带参数）：浅克隆下 tools/verify.ps1 -Fast 会因 git diff 为空而零测试假绿，禁止使用。
 # 为什么是 windows-latest：verify.ps1 按本地形态固定使用 .venv\Scripts\python.exe，换 Linux 就得另写一套步骤，违反「单点展开」。
+# 依赖由仓库内 uv.lock 锁定（uv sync --locked）；改 pyproject.toml 后须先 uv lock 并提交，否则 CI 因锁文件过期直接失败。
 # 注：本门禁目前是流程约定（未接分支保护/ruleset），直推 master 不会被阻断，红叉用于第一时间发现收口不通过。
 name: 统一质量门禁
 
@@ -40,11 +41,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      - name: 建虚拟环境（docs/dev-commands.md §3 同口径）
-        run: uv venv --python 3.12 .venv
-
-      - name: 安装依赖（docs/dev-commands.md §3 同口径）
-        run: uv pip install --python .venv\Scripts\python.exe -r pyproject.toml --extra dev
+      - name: 同步依赖（uv sync --locked，docs/dev-commands.md §3 同口径）
+        run: uv sync --locked --python 3.12 --extra dev
 
       - name: 核对解释器版本
         run: .venv\Scripts\python.exe --version

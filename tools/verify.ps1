@@ -12,7 +12,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 $Py = Join-Path $Root ".venv\Scripts\python.exe"
 if (-not (Test-Path $Py)) {
-    throw "未找到 .venv，先执行: uv venv .venv && uv pip install -r pyproject.toml --extra dev"
+    throw "未找到 .venv，先执行: uv sync --locked --extra dev"
 }
 
 & $Py -m ruff check app tests

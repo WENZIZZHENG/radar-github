@@ -37,7 +37,7 @@ docs/dev-commands.md  # 日常开发与验证命令唯一登记处（含 §4 生
 ## 本地开发
 
 ```bash
-uv venv .venv && uv pip install -r pyproject.toml --extra dev   # 装依赖
+uv sync --locked --extra dev   # 装依赖（按 uv.lock 锁定；改 pyproject 后先 uv lock 再一起提交）
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000    # 起服务（Windows）
 ```
 
