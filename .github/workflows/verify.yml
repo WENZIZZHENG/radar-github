@@ -1,0 +1,54 @@
+# 统一质量门禁：在 GitHub 上复跑本地统一验证入口（tools/verify.ps1，收口档）。
+# 与本地同一脚本、同一口径：ruff → 规范文本复扫 → 全量 pytest；任一段非 0 即 CI 失败。
+# CI 只跑收口档（不带参数）：浅克隆下 tools/verify.ps1 -Fast 会因 git diff 为空而零测试假绿，禁止使用。
+# 为什么是 windows-latest：verify.ps1 按本地形态固定使用 .venv\Scripts\python.exe，换 Linux 就得另写一套步骤，违反「单点展开」。
+# 注：本门禁目前是流程约定（未接分支保护/ruleset），直推 master 不会被阻断，红叉用于第一时间发现收口不通过。
+name: 统一质量门禁
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# 只读即可：本门禁只校验，不改仓库。
+permissions:
+  contents: read
+
+# 同一分支的新提交会取消尚未跑完的旧任务，避免排队烧时长。
+concurrency:
+  group: quality-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: 统一验证入口（verify.ps1 收口档）
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      # 两个 action 均按 commit SHA 钉死并注释版本（供应链防漂移）；升级需同时改 SHA 与注释。
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1（node24）
+        with:
+          persist-credentials: false
+
+      - name: 安装 uv（与本地依赖安装同一工具链）
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          # 与本地实测版本对齐，避免 uv 行为漂移；升级需在 docs/dev-commands.md 留痕。
+          version: "0.11.27"
+          python-version: "3.12"
+          enable-cache: true
+          cache-python: true
+
+      - name: 建虚拟环境（docs/dev-commands.md §3 同口径）
+        run: uv venv --python 3.12 .venv
+
+      - name: 安装依赖（docs/dev-commands.md §3 同口径）
+        run: uv pip install --python .venv\Scripts\python.exe -r pyproject.toml --extra dev
+
+      - name: 核对解释器版本
+        run: .venv\Scripts\python.exe --version
+
+      - name: 跑统一验证入口（收口档）
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1

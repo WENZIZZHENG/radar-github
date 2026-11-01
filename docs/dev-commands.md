@@ -12,6 +12,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1 -Fast  
 
 - 三段：`ruff check app tests` → `python tools/check_spec_text.py` → `pytest -q`；任一段非 0 即整体失败。
 - 两档（本人 2026-10-18 拍板）：不带参数＝**收口档**（全量 pytest，一个批次只跑一次）；`-Fast`＝**过程验证档（不构成收口）**，供开发/修复/评审中间轮次使用——按改动文件同名映射只跑 `tests/test_<同名>.py` 命中的测试（**近似受影响面、非依赖闭包**，脚本会打印「源码→测试」对照）；改动含源码（`*.py` 与前端静态资源/模板）但有一条没映射到同名测试、或含 `tests/conftest.py` 时自动回落全量，不给「零测试的绿」；纯文档/静态无关文件才只跑 ruff＋规范文本复扫。实测同一棵树：≈68 passed / 12~13s vs 全量 812 passed / ≈2 分钟（耗时随机器负载浮动，只作量级参考）。
+- CI 同源门禁（2026-11-01 接入）：`.github/workflows/verify.yml` 在 push 到 master、PR 与手动触发时，用 `windows-latest` ＋ Python 3.12 建 `.venv` 后复跑本入口（收口档）；CI 与本地共用同一脚本，不得为省时另写一套步骤。CI 固定 Python 3.12（＝pyproject 下界/生产版本；本机 `.venv` 可为 3.14，复现 CI 用 `uv venv --python 3.12 .venv`）；目前未接分支保护，直推 master 时该门禁是流程约定（红叉不阻断推送）。
 - `tools/check_spec_text.py`（2026-10-18 新增，T-044 评审实证后落成门禁）：扫 `openspec/specs/**/spec.md` 的 requirement 正文，查三类别处——拆条腰斩（正文以标点开头）、残句（末行缺句末标点且非"冒号＋列表"）、重复分句（≥15 字，抓"把移动写成复制"这类假完成）。`openspec validate --strict` 对这三类**不报**，故单列一段机器检查。
 - 单独跑某一段：`.venv\Scripts\python.exe tools\check_spec_text.py`（exit 0 = 无命中，1 = 有命中，逐条打印 文件:行号）。
 

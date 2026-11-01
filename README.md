@@ -41,11 +41,13 @@ uv venv .venv && uv pip install -r pyproject.toml --extra dev   # 装依赖
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000    # 起服务（Windows）
 ```
 
-统一验证入口（收口只认它一次跑绿：ruff + pytest）：
+统一验证入口（收口只认它一次跑绿：ruff + 规范文本复扫 + pytest）：
 
 ```bash
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
 ```
+
+GitHub Actions 在 push 到 master、PR 与手动触发时用 `windows-latest` + Python 3.12 复跑同一入口（`.github/workflows/verify.yml`），CI 红叉即收口不通过。
 
 环境变量：git 只维护 `.env.example` 一套模板——本地复制为 `.env.dev`（应用代码只读它），生产复制为 `.env.prod`（放服务器 `/opt/radar/`，由 `radar.service` 的 EnvironmentFile 注入；两文件都不落仓）。模板默认姿态＝本地安全（`AI_ENABLED=0`、`RADAR_JOBS_ENABLED=0` 已写成实值），**生产实例化时删掉这两行 =0**。键位：`GITHUB_TOKEN`、`AI_API_KEY`（AI 提供方 key，兼容回退旧键 `DEEPSEEK_API_KEY`；缺失时 AI 功能降级、不阻塞出榜）、`AI_BASE_URL`/`AI_MODEL`（换 OpenAI 兼容提供方时改，缺省 DeepSeek）、`RADAR_DB_PATH`（缺省 `data/radar.db`）；逐键说明见 `.env.example` 注释。
 
